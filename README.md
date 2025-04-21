@@ -31,6 +31,8 @@ A collection of Python scripts and data to build a high‑quality Danish Anki de
    python download_audio_and_map.py
    ```
 
+*Joke:* Actually, I’ve already done steps 1–3 for you. To avoid hammering DDO’s servers, feel free to skip directly to step 4.
+
 4. **Translate metadata**  
 
     Please edit the TARGET_LANG = "" in the translate scripts to your desired target language. Fx. TARGET_LANG = "English" or TARGET_LANG = "Chinese".
