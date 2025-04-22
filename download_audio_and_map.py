@@ -1,4 +1,6 @@
-# Download audio files and save a mapping of URLs to local paths
+# NOTE: This script does not include any Den Danske Ordbog content.
+# You must download HTML pages manually and comply with their terms of use.
+
 
 import os
 import json

@@ -1,5 +1,7 @@
 # Fetch a list of 5000 Danish words from Wiktionary
-# Download Danish word HTML pages from Den Danske Ordbog (DDO)
+# NOTE: This script does not include any Den Danske Ordbog content.
+# You must download HTML pages manually and comply with their terms of use.
+
 
 import os
 import time

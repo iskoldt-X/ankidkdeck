@@ -1,6 +1,6 @@
 # ankidkdeck
 
-A collection of Python scripts and data to build a high‑quality Danish Anki deck (core ~3 000 words) with audio, definitions, example sentences, fixed expressions, and translations. Data is sourced from Wiktionary (frequency lists) and Den Danske Ordbog, and translations are powered by a local LLM via Ollama.
+A collection of Python scripts to build a high‑quality Danish Anki deck (core ~3 000 words) with audio, definitions, example sentences, fixed expressions, and translations. Data is sourced from Wiktionary (frequency lists) and downloaded by yourself from Den Danske Ordbog, and translations are powered by a local LLM via Ollama.
 
 ## Prerequisites
 
@@ -13,6 +13,8 @@ A collection of Python scripts and data to build a high‑quality Danish Anki de
 
 
 ## Usage
+
+Before downloading content from Den Danske Ordbog, please ensure you have read and understood their [terms of use](https://ordnet.dk/copyright).
 
 1. **Download & update raw HTML**  
    ```bash
@@ -30,8 +32,6 @@ A collection of Python scripts and data to build a high‑quality Danish Anki de
    ```bash
    python download_audio_and_map.py
    ```
-
-*Joke:* Actually, I’ve already done steps 1–3 for you. To avoid hammering DDO’s servers, feel free to skip directly to step 4.
 
 4. **Translate metadata**  
 
@@ -67,6 +67,23 @@ A collection of Python scripts and data to build a high‑quality Danish Anki de
    ```
 
 After running step 5, you’ll have an `.apkg` file ready to import into Anki, along with all audio and mapping files.
+
+## 📌 Disclaimer
+
+```text
+This project does not include or distribute any copyrighted content from 
+Den Danske Ordbog (DDO). 
+
+It only provides Python scripts to parse locally saved HTML files and use a 
+local LLM to assist in building Anki decks for language learners.
+
+If you wish to use data from Den Danske Ordbog (e.g., definitions, examples, 
+audio), you must download it yourself and ensure that your use complies with 
+their official terms of use: https://ordnet.dk/copyright
+
+The scripts are provided for personal, educational use only.
+```
+
 
 ## License
 
