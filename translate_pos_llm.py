@@ -10,8 +10,8 @@ from collections import defaultdict, Counter
 import ollama
 
 # Configuration
-MODEL_NAME = "gemma3:12b"
 TARGET_LANG = ""
+MODEL_NAME = "gemma3:12b-it-q8_0"
 MAX_RETRIES = 5
 BASE_DELAY = 2
 INPUT_JSON = "ddo_entries_unique.json"

@@ -3,8 +3,8 @@ from collections import OrderedDict
 import ollama
 
 # Configuration
-MODEL_NAME = "gemma3:12b"
 TARGET_LANG = ""
+MODEL_NAME = "gemma3:12b-it-q8_0"
 INPUT = "ddo_entries_unique.json"
 OUTPUT = f"definition_translations_lemma_gloss_{TARGET_LANG}.json"
 MAX_RETRIES = 10

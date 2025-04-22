@@ -3,10 +3,11 @@ from pathlib import Path
 from random import randrange
 import genanki
 import requests
+import datetime
 from bs4 import BeautifulSoup
 from urllib.parse import quote
 
-
+current_year = datetime.datetime.now().year
 # Configuration
 json_path = "ddo_entries_unique.json"
 audio_map_path = "audio_map.json"
@@ -17,6 +18,56 @@ pos_translation_path = f"pos_translations_{TARGET_LANG}.json"
 output_apkg = f"danish_{TARGET_LANG}.apkg"
 limit = None
 ENABLE_DEBUG_PRINTING = True
+
+if TARGET_LANG.lower() == "chinese":
+    COPYRIGHT_HTML = f"""
+    <div class="copyright-info" style="font-size: 0.8em; color: #777; margin-top: 20px; text-align: center; border-top: 1px solid #eee; padding-top: 10px;">
+        <small>
+            使用 <a href="https://github.com/iskoldt-X/ankidkdeck" style="color: #55a;">ankidkdeck</a> 生成<br>
+            Copyright © {current_year} iskoldt-X<br>
+            如果您喜欢这个牌组，请考虑⭐本项目或捐赠
+        </small>
+    </div>
+    """
+else:  # 默认使用英文或其他语言
+    COPYRIGHT_HTML = f"""
+    <div class="copyright-info" style="font-size: 0.8em; color: #777; margin-top: 20px; text-align: center; border-top: 1px solid #eee; padding-top: 10px;">
+        <small>
+            Generated using <a href="https://github.com/iskoldt-X/ankidkdeck" style="color: #55a;">ankidkdeck</a><br>
+            Copyright © {current_year} iskoldt-X<br>
+            If you like this deck, please consider ⭐ the project or donating
+        </small>
+    </div>
+    """
+
+# 非常紧凑的版本 (代码可读性差)
+deck_description_zh = f"""<p>本牌组是基于丹麦语词频列表生成的 Anki 卡片。</p><p><b>数据来源说明:</b></p><ul><li>词频列表主要参考: <a href="https://en.wiktionary.org/wiki/Wiktionary:Frequency_lists/Danish_wordlist">Wiktionary Danish Frequency List</a></li><li>如果您从Den Danske Ordbog 获取单词定义、发音、例句等数据部分，请注意遵守 DDO 的使用条款，仅供您个人使用，切勿分享。</li><li>部分翻译由机器辅助生成，仅供参考。</li></ul><p><b>版权与许可:</b></p><ul><li>Wiktionary 内容遵循 CC BY-SA 3.0 许可。</li><li>本 Anki 牌组生成脚本及牌组结构由 iskoldt-X 创建 (© {current_year})。</li></ul><p><b>项目代码仓库:</b></p><p><a href="https://github.com/iskoldt-X/ankidkdeck">https://github.com/iskoldt-X/ankidkdeck</a></p><p>如果您觉得这个牌组有用，欢迎⭐️项目或捐赠，欢迎提出改进建议！</p>"""
+
+deck_description = f"""
+<p>This deck is generated from a Danish frequency list as Anki cards.</p>
+<p><b>Data Sources:</b></p>
+<ul>
+  <li>Frequency list primarily based on: <a href="https://en.wiktionary.org/wiki/Wiktionary:Frequency_lists/Danish_wordlist">Wiktionary Danish Frequency List</a></li>
+  <li>If you get the word definitions, pronunciation, examples, etc. from Den Danske Ordbog (DDO). Please respect DDO’s terms of use—for personal study only, do not redistribute.</li>
+  <li>Translations are machine‑aided and provided for reference only.</li>
+</ul>
+<p><b>Copyright &amp; License:</b></p>
+<ul>
+  <li>Wiktionary content is available under CC BY‑SA 3.0.</li>
+  <li>This Anki deck generation script and deck structure were created by iskoldt‑X (© {current_year}).</li>
+</ul>
+<p><b>Project Repository:</b></p>
+<p><a href="https://github.com/iskoldt-X/ankidkdeck">https://github.com/iskoldt-X/ankidkdeck</a></p>
+<p>If you find this deck useful, please feel free to ⭐ the project or open issues/suggestions!</p>
+"""
+
+deck_name_zh = "丹麦语要你命3000词"
+deck_name = "Avadanskedavra: 3000 Words to Slay"
+
+if TARGET_LANG.lower() == "chinese":
+    deck_description = deck_description_zh
+    deck_name = deck_name_zh
+
 
 # --- Wiktionary URL ---
 WIKTIONARY_URL = (
@@ -72,7 +123,8 @@ QFMT = """
 """
 
 # Answer format includes frequency rank at bottom
-AFMT = """
+AFMT = (
+    """
 {{FrontSide}}
 <hr>
 <div class="core-section">{{Definition}}</div>
@@ -84,6 +136,10 @@ AFMT = """
 {{#Etymology}}<div class="small-section"><b>Etymology:</b> {{Etymology}}</div>{{/Etymology}}
 {{#FrequencyRank}}<div class="freq-rank">Freq Rank: {{FrequencyRank}}</div>{{/FrequencyRank}}
 """
+    + COPYRIGHT_HTML
+    + """
+"""
+)
 
 MODEL = genanki.Model(
     MODEL_ID,
@@ -230,10 +286,6 @@ def extract_collocations_with_translation(entry, headword_key, expr_translations
 
     if entry_expr_data and isinstance(entry_expr_data.get("fixed_expressions"), dict):
         entry_expr_translations = entry_expr_data["fixed_expressions"]
-    # elif ENABLE_DEBUG_PRINTING and headword_key: #
-    #     if headword_key not in expr_translations:
-    #          print(f"[DEBUG EXPR] Headword key not found in expression translations: '{headword_key}'")
-    #     #
 
     for fx in entry.get("fixed_expressions", []):
         expression_text = fx.get("expression", "")
@@ -368,7 +420,8 @@ if __name__ == "__main__":
         for entry in final_sorted_entries:
             entry["frequency_rank"] = None
 
-    deck = genanki.Deck(DECK_ID, f"丹麦要你命3000词")
+    deck = genanki.Deck(DECK_ID, deck_name, description=deck_description)
+
     media_files = set()
 
     print(f"Generating Anki notes for {len(final_sorted_entries)} entries...")
