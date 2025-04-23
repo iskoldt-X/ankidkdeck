@@ -1,4 +1,5 @@
 import json
+import zlib
 from pathlib import Path
 from random import randrange
 import genanki
@@ -18,6 +19,9 @@ pos_translation_path = f"pos_translations_{TARGET_LANG}.json"
 output_apkg = f"danish_{TARGET_LANG}.apkg"
 limit = None
 ENABLE_DEBUG_PRINTING = True
+LANG_HASH = zlib.adler32(TARGET_LANG.encode("utf-8")) & 0x7FFFFFFF
+DECK_ID = 0x10000000 + LANG_HASH
+MODEL_ID = 0x20000000 + LANG_HASH
 
 if TARGET_LANG.lower() == "chinese":
     COPYRIGHT_HTML = f"""
@@ -62,7 +66,7 @@ deck_description = f"""
 """
 
 deck_name_zh = "丹麦语要你命3000词"
-deck_name = "Avadanskedavra: 3000 Words to Slay"
+deck_name = f"Avadanskedavra: 3000 Words to Slay {TARGET_LANG}"
 
 if TARGET_LANG.lower() == "chinese":
     deck_description = deck_description_zh
@@ -143,7 +147,7 @@ AFMT = (
 
 MODEL = genanki.Model(
     MODEL_ID,
-    "DDO Danish 3000",
+    f"DDO Danish 3000 ({TARGET_LANG})",
     fields=FIELDS,
     templates=[{"name": "Card 1", "qfmt": QFMT, "afmt": AFMT}],
     css=CSS,
@@ -495,8 +499,9 @@ if __name__ == "__main__":
             else sanitize(raw_ety)
         )
 
-        guid_base_hw = sanitize(entry.get("headword", ""))
-        guid_for_note = genanki.guid_for(guid_base_hw, pos_original)
+        guid_for_note = genanki.guid_for(
+            sanitize(entry.get("headword", "")), f"{pos_original}-{TARGET_LANG.lower()}"
+        )
 
         note = genanki.Note(
             model=MODEL,
