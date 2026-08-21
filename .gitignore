@@ -1,4 +1,18 @@
+# DDO-derived content and pipeline outputs must never be committed.
 *.html
 *.mp3
 *.json
 *.apkg
+*.anki2
+*.log
+wiktionary_danish_wordlist.txt
+
+# Corpus and media directories (keep the placeholder files only)
+audio/*
+!audio/.gitkeep
+ddo_html_all_versions/*
+!ddo_html_all_versions/.gitkeep
+
+# Python / OS noise
+__pycache__/
+.DS_Store
