@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ankidkdeck"
+version = "3.0.0a0"
+description = "Build Danish frequency Anki decks from Den Danske Ordbog (DDO) with AI-assisted translations"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "iskoldt-X" }]
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.31",
+    "beautifulsoup4>=4.12",
+    "genanki>=0.13.1",
+]
+
+[project.optional-dependencies]
+# LLM stages (translate / rank) are optional at install time: the crawl and
+# build stages must work without any Gemini dependency present.
+llm = ["google-genai>=1.0"]
+dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/iskoldt-X/ankidkdeck"
+
+[project.scripts]
+ankidkdeck = "ankidkdeck.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ankidkdeck"]

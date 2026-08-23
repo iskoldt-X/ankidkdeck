@@ -1,0 +1,15 @@
+{
+  "empty_rate_baseline_pct": {
+    "Content": 1.10,
+    "Collocations": 33.86,
+    "Variants": 10.96,
+    "Derivatives": 20.73,
+    "Etymology": 21.07
+  },
+  "empty_rate_tolerance_pp": 1.0,
+  "note_count_range": [2800, 3100],
+  "media_floor": 4629,
+  "affix_count_range": [150, 400],
+  "pilot_max_error_rate": 0.01,
+  "sitemap_shortfall_max_rate": 0.01
+}

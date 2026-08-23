@@ -1,0 +1,5 @@
+{
+  "sb.|3": ["definite singular", "indefinite plural", "definite plural"],
+  "vb.|3": ["present tense", "past tense", "past participle"],
+  "adj.|2,2": ["neuter form", "plural / definite form", "comparative", "superlative"]
+}
