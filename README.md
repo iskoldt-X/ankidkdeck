@@ -134,6 +134,21 @@ once: bare untranslated cards (`G-COV`), an unreproducible media order
 prints the standing record. Two gates are human: reading
 `work/review/rejected.json` and the Anki import smoke test.
 
+Gate thresholds are data, not code: they live in
+`src/ankidkdeck/registry/gates.json`. A run may override any of them by dropping
+a partial `work/registry/gates.json` with just the keys it wants changed -- the
+two are merged, packaged defaults first. That is what makes a **partial build**
+possible without editing the checked-in baselines: building 200 words instead of
+5,000 legitimately fails `G-NOTE` (`note_count_range`) and `G-MEDIA`
+(`media_floor`), so a dev overlay such as
+
+```json
+{ "note_count_range": [1, 100000], "media_floor": 0 }
+```
+
+lets the rest of the gates do their job. The overlay lives under `work/`, which
+is gitignored, so it can never be mistaken for a released baseline.
+
 ## Tests
 
 ```bash

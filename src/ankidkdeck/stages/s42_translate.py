@@ -39,12 +39,8 @@ import os
 import time
 
 from ..config import Config
-from ..gates import Gate, run_gates
+from ..gates import G_ORPH, Gate, run_gates
 from ..util import NFC, FatalError, read_json, sha256_str, write_json
-
-# Gate ids from the final guide's table (section 4.12) that segment 2's
-# gates.py does not declare. Same spelling as the guide.
-G_ORPH = "G-ORPH"
 
 MAX_DEFS_PER_BATCH = 20        # 05: one call per entry, capped
 MAX_EXPR_PER_BATCH = 20        # 06: MAX_EXPR_PER_BATCH
@@ -77,11 +73,15 @@ def expression_key(expr: dict) -> str:
 
 
 def expression_src_sha(expr: dict) -> str:
-    """Same rule stage 41 used when it bound legacy rows, so a migrated cell is
-    never mistaken for a changed one."""
-    senses = expr.get("senses") or []
-    if senses and senses[0].get("src_sha"):
-        return senses[0]["src_sha"]
+    """sha256(NFC(expression text)) -- the string the translator is actually
+    given (`expr`; the definition is only an optional `hint`).
+
+    It used to prefer the first SENSE's src_sha, i.e. the sha of the idiom's
+    DEFINITION, which is also what stage 41 was writing. That disabled the one
+    retranslation trigger the design has: editing an idiom never retranslated it
+    and editing its definition retranslated it for nothing. Stage 41 now stores
+    this same formula, so a migrated cell is never mistaken for a changed one.
+    """
     return sha256_str(NFC(expr.get("expression") or ""))
 
 
@@ -226,11 +226,15 @@ def bill_row(todo: list, pos_todo: list) -> dict:
     }
 
 
-def print_bill(bill: dict, model: str) -> None:
+def print_bill(bill: dict, model: str, expr_model: str | None = None) -> None:
     """ALWAYS runs. No price is asserted: the per-token rate is a decision for
     the human at the moment of spending, and a made-up number in a log is worse
     than none."""
-    print("--- translation bill (model: %s) ---" % model)
+    if expr_model and expr_model != model:
+        print("--- translation bill (definitions: %s | expressions + pos: %s) ---"
+              % (model, expr_model))
+    else:
+        print("--- translation bill (model: %s) ---" % model)
     total = 0
     for lang in sorted(bill):
         r = bill[lang]
@@ -704,6 +708,7 @@ def run(cfg: Config, registry=None, lang: str | None = None,
 
     report: dict = {"languages": {}, "scope": scope_note, "confirmed": bool(confirm),
                     "model": cfg.gemini_model,
+                    "model_expressions": cfg.expressions_model,
                     "drift": _drift_report(cfg, entries)}
     bill: dict = {}
     gc_stats: dict = {}
@@ -726,12 +731,14 @@ def run(cfg: Config, registry=None, lang: str | None = None,
                      "todo": todo, "pos_todo": pos_todo}
         bill[lg] = bill_row(todo, pos_todo)
         write_json(cfg.report_dir / ("translate_bill_%s.json" % lg),
-                   {"language": lg, "model": cfg.gemini_model, "scope": scope_note,
+                   {"language": lg, "model": cfg.gemini_model,
+                    "model_expressions": cfg.expressions_model,
+                    "scope": scope_note,
                     **bill[lg],
                     "cells": [{k: v for k, v in r.items() if k != "hint"}
                               for r in todo]})
 
-    print_bill(bill, cfg.gemini_model)
+    print_bill(bill, cfg.gemini_model, cfg.expressions_model)
     report["bill"] = bill
     if gc_stats:
         report["gc"] = {lg: {k: v for k, v in g.items() if k != "orphans_remaining"}
@@ -749,7 +756,11 @@ def run(cfg: Config, registry=None, lang: str | None = None,
     # ---------------- past this line, money is spent ----------------
     pool = _pool_from_env()
     model = cfg.gemini_model
+    # Expressions, the POS table (and stage 50's ranking) may run on their own
+    # model: short outputs whose failure mode is contamination, not truncation.
+    expr_model = cfg.expressions_model
     prov = _provenance(model)
+    prov_expr = _provenance(expr_model)
     for lg in langs:
         st = state[lg]
         tdir, defs, exprs = st["dir"], st["defs"], st["exprs"]
@@ -764,10 +775,13 @@ def run(cfg: Config, registry=None, lang: str | None = None,
             write_json(tdir / "definitions.json", defs)  # checkpoint after EVERY entry
         for eid, rows in _group_by_entry(st["todo"], "expression", MAX_EXPR_PER_BATCH):
             label = "%s %s" % (rows[0]["lemma"], rows[0]["pos_text"])
-            got = _translate_expression_batch(pool, model, lg, label.strip(), rows)
+            got = _translate_expression_batch(pool, expr_model, lg, label.strip(), rows)
             for row, obj in zip(rows, got):
+                # row["src_sha"] is sha256(NFC(expression text)) -- the same
+                # formula stage 41 stored, so a migrated row and a fresh one are
+                # indistinguishable to the next drift check.
                 exprs[row["key"]] = {"lemma": obj.get("lemma"), "gloss": obj.get("gloss"),
-                                     "src_sha": row["src_sha"], "provenance": prov}
+                                     "src_sha": row["src_sha"], "provenance": prov_expr}
                 written["expressions"] += 1
             write_json(tdir / "expressions.json", exprs)
         if st["pos_todo"]:
@@ -777,7 +791,7 @@ def run(cfg: Config, registry=None, lang: str | None = None,
             # MISSING keys are written: the card front is grouped by these
             # strings, so re-wording a key that already shipped would reshuffle
             # every card front for no reason.
-            mapping = _translate_pos(pool, model, lg, list(pos_wanted))
+            mapping = _translate_pos(pool, expr_model, lg, list(pos_wanted))
             merged = dict(st["pos"])
             for key in st["pos_todo"]:
                 merged[key] = mapping[key]
@@ -788,6 +802,7 @@ def run(cfg: Config, registry=None, lang: str | None = None,
             "pos_keys_written": len(st["pos_todo"]),
             "definition_rows": len(defs), "expression_rows": len(exprs),
             "pos_rows": len(st["pos"]), "provenance": prov,
+            "provenance_expressions": prov_expr,
         }
     report["api"] = {"requests": pool.total_requests, "key_rotations": pool.rotations,
                      "keys_in_pool": len(pool.keys)}

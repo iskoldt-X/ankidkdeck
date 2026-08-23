@@ -30,3 +30,9 @@ ankidkdeck = "ankidkdeck.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ankidkdeck"]
+
+[tool.pytest.ini_options]
+# `pytest` with no argument must mean the same thing as `pytest tests`: without
+# this it also walks tools/ and work/, and a fixture directory full of saved DDO
+# pages is not a test suite.
+testpaths = ["tests"]

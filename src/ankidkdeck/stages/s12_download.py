@@ -11,17 +11,27 @@ Design constraints, all measured:
   filename (case-insensitive filesystems, spaces, dots).
 """
 
+import datetime
 import re
 
 from bs4 import BeautifulSoup
 
 from ..config import Config
+from ..gates import sitemap_shortfall
 from ..net import Net
 from ..urls import word_url
-from ..util import NFC, FatalError, atomic_write_text, read_json, sha1_hex, sha256_str, write_json
+from ..util import (NFC, FatalError, atomic_write_text, nk, read_json, sha1_hex,
+                    sha256_str, write_json)
 
 NOHIT_MARKER = "matcher ingen opslag i ordbogen"
 RESULTS_RE = re.compile(r"^(\d+) resultater$")
+
+
+def _now() -> str:
+    """Wall clock is allowed HERE and nowhere else in the pipeline: the ledger is
+    crawl provenance, not a build output, and a 5-hour crawl with no timeline is
+    an attempts ledger that cannot answer the one question it exists for."""
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
 
 def raw_path(cfg: Config, word: str):
@@ -64,15 +74,30 @@ def fetch(cfg: Config, net: Net, ledger: Ledger, word: str, phase: str,
     if led and led.get("status") in ("ok", "nohit"):
         return led
     rec = ledger.data.setdefault(word, {"attempts": 0, "phase": phase})
+    rec.setdefault("first_at", _now())
     rec["attempts"] += 1
+    rec["last_at"] = _now()
+    rec.setdefault("status", "attempted")
     u = url or word_url(word)
-    r = net.get(u)
+    rec["url"] = u
+    # Checkpoint BEFORE the request as well as after. The WAF stop is fatal and
+    # never retried, so without this the word that triggered it left no record
+    # that it had been attempted at all -- and `attempts` was a counter that
+    # could only ever be incremented by a success.
+    ledger.save()
+    try:
+        r = net.get(u)
+    except FatalError as exc:
+        if "WAF" in str(exc):
+            rec.update(status="waf", waf=True, last_at=_now())
+            ledger.save()
+        raise
     body = r.text
     atomic_write_text(raw_path(cfg, word), body)
     status, label, n = verdict_of(body)
     rec.update(status=status, url=u, http=r.status_code, bytes=len(body),
                redirects=len(r.history), body_sha256=sha256_str(body),
-               results_label=label, article_count=n)
+               results_label=label, article_count=n, last_at=_now())
     ledger.save()  # checkpoint after EVERY request
     return rec
 
@@ -108,10 +133,13 @@ def run_phase_b(cfg: Config, net: Net, lemmas_needed: set[str]) -> dict:
     page is the one that carries the full homograph set and flex tables."""
     ledger = Ledger(cfg)
     wordset = {w["word"] for w in read_json(cfg.json_dir / "wordlist.json")["words"]}
+    nk_wordset = {nk(w) for w in wordset}
     fetched = []
     for lemma in sorted(lemmas_needed):
         lemma = NFC(lemma)
-        if lemma in wordset or ledger.get(lemma):
+        # nk(), as the guide specifies: an exact string match re-fetches a
+        # case-differing lemma we already have.
+        if nk(lemma) in nk_wordset or ledger.get(lemma):
             continue
         fetch(cfg, net, ledger, lemma, "B")
         fetched.append(lemma)
@@ -121,12 +149,31 @@ def run_phase_b(cfg: Config, net: Net, lemmas_needed: set[str]) -> dict:
 def run_phase_c(cfg: Config, net: Net, registry) -> dict:
     ledger = Ledger(cfg)
     fetched = []
+    wordset = {w["word"] for w in read_json(cfg.json_dir / "wordlist.json",
+                                            default={"words": []})["words"]}
+    nk_wordset = {nk(w) for w in wordset}
     for form, lemma in registry.form_to_lemma.items():
         lemma = NFC(lemma)
-        if not ledger.get(lemma):
-            fetch(cfg, net, ledger, lemma, "C")
-            fetched.append(lemma)
-    return {"phase_c_fetched": len(fetched)}
+        # nk() comparison, as the guide specifies: an exact string match costs an
+        # extra request for a case-differing lemma.
+        if nk(lemma) in nk_wordset or ledger.get(lemma):
+            continue
+        fetch(cfg, net, ledger, lemma, "C")
+        fetched.append(lemma)
+    out = {"phase_c_fetched": len(fetched)}
+    # Report-only here: this is the last stage that COULD remedy a shortfall with
+    # a fetch, so it is where the number is worth printing. The gate itself is
+    # enforced at export (guide 4.12); stage 30 only measures it.
+    sf = read_json(cfg.json_dir / "sitemap_shortfall.json",
+                   default={"rows": [], "n_families": 0})
+    ok, detail = sitemap_shortfall(
+        sf.get("rows") or [], sf.get("n_families") or 0,
+        float(registry.gates.get("sitemap_shortfall_max_rate", 0.01)))
+    out["sitemap_shortfall"] = {"within_max_rate": ok,
+                                "families_short": detail["families_short"],
+                                "rate": detail["rate"],
+                                "max_rate": detail["max_rate"]}
+    return out
 
 
 def _stats(ledger: Ledger, words: set[str]) -> dict:
@@ -137,7 +184,10 @@ def _stats(ledger: Ledger, words: set[str]) -> dict:
         "n": n,
         "ok": sum(1 for r in rows if r.get("status") == "ok"),
         "nohit": sum(1 for r in rows if r.get("status") == "nohit"),
+        "attempted": sum(1 for r in rows if r.get("status") == "attempted"),
         "errors": err,
         "error_rate": err / n if n else 0.0,
-        "waf": 0,  # a WAF challenge is fatal before it could be recorded
+        # From the records. A WAF stop is fatal, so a clean run legitimately
+        # reports 0 -- but it is measured, not asserted.
+        "waf": sum(1 for r in rows if r.get("waf")),
     }

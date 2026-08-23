@@ -7,10 +7,15 @@ pairs differ only by case with ('Er','er') at rank 1, so this is not a
 hypothetical failure mode.
 """
 
+import re
+
 import pytest
 
 from ankidkdeck.registry import FILES, Registry
 from ankidkdeck.util import FatalError, read_json, write_json
+
+# PEP 440 pre-release / dev suffixes: a1, b2, rc1, .dev0
+PRE_RELEASE = re.compile(r"(a|b|rc)\d+$|\.dev\d+$")
 
 
 def test_all_registry_files_ship_as_package_data(registry):
@@ -75,6 +80,40 @@ def test_local_overlay_appends_to_the_packaged_list(cfg):
     reg = Registry(cfg)
     assert "hilarious" in reg.demoted_pos_keys
     assert "symbol" in reg.demoted_pos_keys      # default preserved
+
+
+def test_no_frozen_row_claims_a_pre_release_version(cfg, registry):
+    """`since` is written once and never rewritten -- correctly, the file is
+    append-only. Stamping it from __version__ ("3.0.0a0") would therefore brand
+    every v3.0 family with a dev pre-release forever, in the file whose
+    human-reviewed diff IS the release artifact. It comes from
+    cfg.registry_version instead.
+    """
+    assert cfg.registry_version == "3.0"
+    assert not PRE_RELEASE.search(cfg.registry_version)
+
+    from conftest import make_entry, make_sense, write_workspace
+    from ankidkdeck.stages.s30_merge import run as merge_run
+    e = make_entry("11000400", "hus", pos_key="sb.",
+                   senses=[make_sense("21000050", "bygning")],
+                   source_words=["hus"])
+    write_workspace(cfg, {"11000400": e}, [(1, "hus")],
+                    classification={"hus": {"members": [
+                        {"entry_id": "11000400", "bucket": "exact_cs",
+                         "demoted": False}],
+                        "xrefs": [], "rejected": [],
+                        "resolved_by": "forward"}},
+                    v2_querywords={"hus": 1})
+    merge_run(cfg, registry)
+    rows = read_json(cfg.registry_local / "card_keys.json")
+    assert rows["11000400"]["since"] == "3.0"
+    for fid, row in rows.items():
+        assert not PRE_RELEASE.search(str(row.get("since", ""))), (fid, row)
+
+
+def test_the_shipped_registry_carries_no_pre_release_since(registry):
+    for fid, row in registry.card_keys.items():
+        assert not PRE_RELEASE.search(str(row.get("since", ""))), (fid, row)
 
 
 def test_paradigm_labels_only_for_recognised_shapes(registry):

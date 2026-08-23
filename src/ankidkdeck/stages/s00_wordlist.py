@@ -32,10 +32,21 @@ def run(cfg: Config, accept_new: bool = False) -> dict:
     if not 4900 <= len(words) <= 5100:
         raise FatalError(f"wordlist has {len(words)} words; expected ~5000")
     sha = sha256_str(canonical_json([w["word"] for w in words]))
-    if cfg.wordlist_sha256 and sha != cfg.wordlist_sha256 and not accept_new:
+    if not cfg.wordlist_sha256:
+        # An unpinned config accepts any wordlist without a word, which is the
+        # inverse of the rule this stage exists for. Not fatal (a first run has
+        # nothing to pin against) but it must be impossible to miss.
+        print("*" * 72)
+        print("WARNING: wordlist_sha256 is NOT PINNED. Every GUID in the deck")
+        print("depends on this word set; an unnoticed wordlist change re-ranks")
+        print("the whole deck. Pin it by adding to ankidkdeck.toml:")
+        print('    wordlist_sha256 = "%s"' % sha)
+        print("*" * 72)
+    elif sha != cfg.wordlist_sha256 and not accept_new:
         raise FatalError(
-            "wordlist changed vs the pinned sha256 -- the whole deck would "
-            "silently re-rank. Re-run with --accept-new-wordlist to confirm."
+            "wordlist changed vs the pinned sha256 (%s != %s) -- the whole deck "
+            "would silently re-rank. Re-run with --accept-new-wordlist to "
+            "confirm." % (sha, cfg.wordlist_sha256)
         )
     out = {"source": str(cfg.wordlist_file), "sha256": sha, "words": words}
     write_json(cfg.json_dir / "wordlist.json", out)

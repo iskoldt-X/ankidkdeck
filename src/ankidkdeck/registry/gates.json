@@ -9,7 +9,9 @@
   "empty_rate_tolerance_pp": 1.0,
   "note_count_range": [2800, 3100],
   "media_floor": 4629,
-  "affix_count_range": [150, 400],
+  "affix_count_range": [150, 600],
   "pilot_max_error_rate": 0.01,
-  "sitemap_shortfall_max_rate": 0.01
+  "sitemap_shortfall_max_rate": 0.01,
+  "all_demoted_families_max": 40,
+  "tie_break_byte_order_max": 3
 }

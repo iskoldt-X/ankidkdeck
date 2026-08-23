@@ -11,11 +11,29 @@ import re
 
 from bs4 import BeautifulSoup
 
+from .. import extract
 from ..config import Config
-from ..extract import cell_alternatives, is_tag, xt
+from ..extract import cell_alternatives, is_tag
 from ..util import (FatalError, NFC, canonical_json, collapse_ws, nk,
                     read_json, sha256_str, write_json)
 from .s12_download import Ledger, raw_path
+
+
+def xt(node, field: str) -> str:
+    """extract.xt, NFC-normalised at the point of extraction.
+
+    src_sha hashes NFC(text) while stage 41 binds legacy rows by RAW byte
+    equality, so a single NFD page would silently drop translations instead of
+    failing loudly. Normalising here makes every stored field, key and hash
+    agree. extract.SEP is still read at call time, which is what lets
+    test_separators.py monkeypatch the table.
+    """
+    return NFC(extract.xt(node, field))
+
+
+def _label(node) -> str:
+    """A DDO display label used as a dict key (onym / orddannelse headings)."""
+    return NFC(node.get_text(strip=True))
 
 # The character class excludes " and > only. An apostrophe-excluding form loses
 # the witness for every apostrophe headword, because the fejlrapport subject
@@ -42,6 +60,20 @@ KNOWN_POS_KEYS = {
 }
 
 DIGITS_TRAIL_RE = re.compile(r"\d+$")
+
+# orddannelser is stored under FIXED schema keys, never under raw DDO display
+# text: the section 1.11h "Oevrige into Derivatives" ruling must not become a
+# downstream string match against whatever DDO renders. Unknown labels are
+# logged to the parse report the same way unmapped onym labels are.
+ORDDANNELSE_MAP = {
+    "Afledninger": "Afledninger",
+    "Afledning": "Afledninger",
+    "Sammensætninger": "Sammensætninger",
+    "Sammensætning": "Sammensætninger",
+    "Sammensaetninger": "Sammensætninger",
+    "Øvrige": "Øvrige",
+    "Ovrige": "Øvrige",
+}
 
 
 def slice_articles(soup):
@@ -77,7 +109,7 @@ def entry_id_of(art, scope) -> str:
 def _labelled_col(blk, label_text):
     for lc in blk.select("div.modern-label-cols"):
         h = lc.select_one("h3.modern-label") or lc.select_one("span.modern-label")
-        if h and h.get_text(strip=True) == label_text:
+        if h and _label(h) == NFC(label_text):
             return lc
     return None
 
@@ -102,25 +134,40 @@ def _preceding_diskret(kids):
     return None
 
 
+def _is_form_shaped(f: str) -> bool:
+    """A candidate alternative spelling must look like a word.
+
+    Without this the prose row of `en` yields {"form": "1", "official": true},
+    which then enters form_index and searchable_forms as a real alternative.
+    """
+    return len(f) > 1 and not f.isdigit()
+
+
 def _parse_alt_spellings(art):
     """The bare div.modern-row > span.tekst prose row: 'ogsaa i formen'/
     'stavemaade' lines. span.match = official alternative; span.diskret =
-    deprecated spelling."""
+    deprecated spelling.
+
+    The official flag is load-bearing, not decoration: `khan` carries the
+    deprecated spelling `kan`, and letting it count as classification evidence
+    is what put the Mongol ruler on the rank-23 `kunne` card. Deprecated forms
+    reach searchable_forms only -- never form_index, never variant matching.
+    """
     out = []
     for row in art.select("div.modern-row"):
         tekst = row.select_one(":scope > span.tekst")
         if tekst is None:
             continue
-        prose = tekst.get_text(" ", strip=True)
+        prose = NFC(tekst.get_text(" ", strip=True))
         if "stavemåde" not in prose and "også i formen" not in prose:
             continue
         for m in tekst.select("span.match"):
             f = collapse_ws(xt(m, "headword"))
-            if f:
+            if _is_form_shaped(f):
                 out.append({"form": f, "official": True})
         for d in tekst.select("span.diskret"):
             f = collapse_ws(xt(d, "headword"))
-            if f and len(f) > 1:
+            if _is_form_shaped(f):
                 out.append({"form": f, "official": False})
     return out
 
@@ -152,18 +199,27 @@ def parse_article(eid: str, scope, art, registry, report: dict) -> dict:
     h = art.select_one("div.modern-top-row h1.modern-match")
     if h is None:
         raise FatalError(f"no h1.modern-match in article slice {eid}")
-    e["display_headword"] = xt(h, "headword")
     sup = h.select_one("span.super")
     e["super"] = xt(sup, "headword") if sup else None
     h2 = copymod.copy(h)
     for s in h2.select("span.super"):
         s.decompose()  # decompose the homograph index; never regex trailing digits
-    e["lemma"] = NFC(xt(h2, "headword"))
+    e["lemma"] = xt(h2, "headword")
     e["lemma_key"] = nk(e["lemma"])
+    # display_headword is the LEMMA, and `super` stays in its own field.
+    # xt(h, "headword") glues them ("al2", "udenfor1", "i5" -- 45 of 134 entries
+    # on the fixture set), which is not what DDO shows (a superscript) and which
+    # leaked into searchable_forms as a junk Anki search token. Stage 70 renders
+    # the superscript from `super`.
+    e["display_headword"] = e["lemma"]
+    e["headword_glued"] = xt(h, "headword")  # provenance only; never rendered
     pt = art.select_one("div.modern-top-row span.text-large")
     e["pos_text"] = collapse_ws(xt(pt, "pos_text")) if pt else None
     pk = art.select_one("[data-pos-key]")
-    e["pos_key"] = pk["data-pos-key"] if pk else None
+    # NFC: pos_key is a dict key in the demotion registry, the POS translation
+    # table and the export's front-side grouping. 'foersteled' carries an
+    # o-slash and an NFD attribute would silently miss every lookup.
+    e["pos_key"] = NFC(pk["data-pos-key"]) if pk else None
     if e["pos_key"] and e["pos_key"] not in KNOWN_POS_KEYS:
         # The pos_key vocabulary is OPEN ('formelt subjekt' was in nobody's
         # list); log and continue, never reject on unknown.
@@ -182,15 +238,31 @@ def parse_article(eid: str, scope, art, registry, report: dict) -> dict:
             e["paradigm"]["short"] = short if short.lstrip().startswith("-") else None
         for t, tbl in enumerate(boj.select("table.flex-table")):
             for r_i, tr in enumerate(tbl.select("tbody tr")):
-                cells = [c for td in tr.select("td") for c in cell_alternatives(td)]
+                cells = [NFC(c) for td in tr.select("td")
+                         for c in cell_alternatives(td)]
                 cells = list(dict.fromkeys(cells))
                 if cells:
                     e["paradigm"]["rows"].append({"table": t, "row": r_i, "cells": cells})
     e["alt_spellings"] = _parse_alt_spellings(art)
+    # TWO indexes, and the difference is the whole classifier:
+    #
+    #   paradigm_index  real inflection cells ONLY. This is bucket 2's evidence
+    #                   ("the word is in this article's own flex table"). It
+    #                   deliberately excludes nk(lemma): a case-only pair such
+    #                   as er/Er matched form_index through the lemma key, which
+    #                   made exact_ci and case_only_demoted_pos unreachable for
+    #                   every possible input -- erbium became an inflection of
+    #                   `er`.
+    #   form_index      cells + lemma + OFFICIAL alternative spellings. This is
+    #                   stage 21's reverse index, which WANTS the lemma key --
+    #                   that is how an override or a lemma_key lookup finds an
+    #                   article. Deprecated spellings are excluded (khan/kan).
+    e["paradigm_index"] = sorted(
+        {nk(c) for row in e["paradigm"]["rows"] for c in row["cells"]})
     e["form_index"] = sorted(
-        {nk(c) for row in e["paradigm"]["rows"] for c in row["cells"]}
+        set(e["paradigm_index"])
         | {nk(e["lemma"])}
-        | {nk(a["form"]) for a in e["alt_spellings"]}
+        | {nk(a["form"]) for a in e["alt_spellings"] if a.get("official")}
     )
     shape = tuple(
         sum(1 for r in e["paradigm"]["rows"] if r["table"] == t)
@@ -254,11 +326,11 @@ def parse_article(eid: str, scope, art, registry, report: dict) -> dict:
             ul = on.select_one("ul.modern-inline")
             if lab is None or ul is None:
                 continue
-            key = ONYM_MAP.get(lab.get_text(strip=True))
+            label = _label(lab)
+            key = ONYM_MAP.get(label)
             if key is None:
-                report.setdefault("unmapped_onym_labels", {}).setdefault(
-                    lab.get_text(strip=True), 0)
-                report["unmapped_onym_labels"][lab.get_text(strip=True)] += 1
+                report.setdefault("unmapped_onym_labels", {}).setdefault(label, 0)
+                report["unmapped_onym_labels"][label] += 1
                 continue
             onyms[key].extend(_clean_links(ul))
         related_col = _labelled_col(blk, "Ord i nærheden")
@@ -336,11 +408,23 @@ def parse_article(eid: str, scope, art, registry, report: dict) -> dict:
                     if pos is not None:
                         txt = (txt + " " + xt(pos, "orddannelse")).strip()
                     items.append(txt)
-            e["orddannelser"][lab.get_text(strip=True)] = items
+            label = _label(lab)
+            key = ORDDANNELSE_MAP.get(label)
+            if key is None:
+                report.setdefault("unmapped_orddannelse_labels", {}).setdefault(
+                    label, 0)
+                report["unmapped_orddannelse_labels"][label] += 1
+                continue
+            # MERGED, not overwritten: a second row carrying the same label used
+            # to silently replace the first one's items.
+            bucket = e["orddannelser"].setdefault(key, [])
+            for txt in items:
+                if txt not in bucket:
+                    bucket.append(txt)
 
     e["empty"] = not e["senses"] and not e["expressions"]
     # 0-sense articles are real (godte2, vinge2); kept, marked, never rendered.
-    e["article_sha"] = sha256_str(canonical_json({k: v for k, v in e.items()}))
+    e["article_sha"] = sha256_str(canonical_json(e))
     return e
 
 

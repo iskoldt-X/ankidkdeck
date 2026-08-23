@@ -40,25 +40,18 @@ import zlib
 from pathlib import Path
 
 from ..config import Config
-from ..gates import (G_RANK, G_SEED, Gate, dense_unique_ranks,
-                     registry_seed_bytes, run_gates)
+from ..gates import (G_COV, G_DET, G_EMPTY_C, G_GUID, G_MEDIA, G_NOTE, G_RANK,
+                     G_RATE, G_SEED, G_SITEMAP, Gate, dense_unique_ranks,
+                     registry_seed_bytes, run_gates, sitemap_shortfall)
 from ..util import NFC, FatalError, canonical_json, read_json, write_json
-
-# Gate ids from the final guide's table (section 4.12) that gates.py does not
-# declare; spelled exactly as in the guide.
-G_EMPTY_C = "G-EMPTY-C"
-G_RATE = "G-RATE"
-G_COV = "G-COV"
-G_GUID = "G-GUID"
-G_MEDIA = "G-MEDIA"
-G_NOTE = "G-NOTE"
-G_DET = "G-DET"
 
 FIELD_NAMES = ["QueryWord", "FrontSideSummary", "Content", "Collocations",
                "Variants", "Derivatives", "Etymology", "FrequencyRank"]
 SORT_FIELD_INDEX = 7
 DEFAULT_POS_KEY = "Uncategorized"       # v2.1's default_pos_key, unchanged
-DERIVATIVE_LABELS = ("Afledninger", "Sammensætninger", "Sammensaetninger")
+# The stage-20 schema keys, not raw DDO display text. Oevrige is parsed but not
+# rendered (owner deferred that change, 2026-08-24).
+DERIVATIVE_LABELS = ("Afledninger", "Sammensætninger")
 
 
 # --------------------------------------------------------------------------
@@ -196,9 +189,11 @@ details > summary::-webkit-details-marker { display: none; }
 .paradigm-label { color: #888; }
 .alt-forms { margin-top: 4px; }
 .searchable-forms { display: none; }
+.super { font-size: 0.65em; vertical-align: super; color: #666; margin-left: 1px; }
 .night_mode .boejning-row { color: #bbb; }
 .night_mode .paradigm-head { color: #aaa; }
 .night_mode .paradigm-label { color: #999; }
+.night_mode .super { color: #aaa; }
 """
 
 QFMT = """
@@ -296,6 +291,21 @@ def sanitize(text) -> str:
     return str(text).strip() if text is not None else ""
 
 
+def headword_html(entry: dict) -> str:
+    """The lemma, with DDO's homograph index rendered as a SUPERSCRIPT.
+
+    Stage 20 used to store the glued form (`al2`, `udenfor1`, `i5` -- 45 of 134
+    entries on the fixture set) as display_headword, which is not what DDO shows
+    and which also became an Anki search token. lemma and super are separate
+    fields; the markup is assembled here, where it belongs.
+    """
+    hw = sanitize(entry.get("lemma") or entry.get("display_headword"))
+    sup = sanitize(entry.get("super"))
+    if sup:
+        return '%s<span class="super">%s</span>' % (hw, sup)
+    return hw
+
+
 class Media:
     """The audio cache as the exporter sees it: url -> ([sound:] tag, path).
 
@@ -340,22 +350,35 @@ class Media:
 
 def pron_html_for_group(ents: list, media: Media) -> str:
     """v2.1 build_pronunciations_html_for_group, unchanged except that the audio
-    URL is resolved through the manifest instead of audio_map.json. IPA dedup is
-    per group, by IPA text."""
-    seen_ipas, rows = set(), []
+    URL is resolved through the manifest instead of audio_map.json.
+
+    IPA dedup is per group. The key is the IPA TEXT when there is one, and the
+    audio slot otherwise: 21 udtale rows (all multiword compounds --
+    `alle sammen`, `dag til dag-service`) carry an empty ipa with a valid
+    audio_url, and deduping on the empty string collapsed them into one row,
+    losing every [sound:] tag but the first. A row with neither IPA nor audio is
+    still nothing to render.
+    """
+    seen, rows = set(), []
     for e in ents:
         for u in e.get("udtale", []):
             ipa_raw = sanitize(u.get("ipa")).strip("[]").strip()
-            if not ipa_raw or ipa_raw in seen_ipas:
+            audio_url = u.get("audio_url")
+            if not ipa_raw and not audio_url:
                 continue
-            seen_ipas.add(ipa_raw)
+            slot = u.get("slot_n")
+            key = ipa_raw or ("\x00audio\x00%s\x00%s"
+                             % (e["entry_id"], slot if slot is not None else audio_url))
+            if key in seen:
+                continue
+            seen.add(key)
             label_html = (f'<span class="ipa-label">({sanitize(u.get("label"))})</span>'
                           if u.get("label") else "")
             sound_tag = ""
-            if u.get("audio_url"):
-                sound_tag = media.sound_tag(u["audio_url"], e["entry_id"],
-                                            u.get("slot_n"))
-            rows.append(f'<div class="ipa-row">[{ipa_raw}] {label_html} {sound_tag}</div>')
+            if audio_url:
+                sound_tag = media.sound_tag(audio_url, e["entry_id"], slot)
+            ipa_html = f"[{ipa_raw}] " if ipa_raw else ""
+            rows.append(f'<div class="ipa-row">{ipa_html}{label_html} {sound_tag}</div>')
     return "".join(rows)
 
 
@@ -460,8 +483,7 @@ def meaning_block(entry: dict, defs_trans: dict, misses: list,
         return ""
     pos_html = (f'<span class="pos">{sanitize(entry.get("pos_text"))}</span>'
                 if entry.get("pos_text") else "")
-    headword = sanitize(entry.get("display_headword") or entry.get("lemma"))
-    header = f'<div class="meaning-header">{headword} {pos_html}</div>'
+    header = f'<div class="meaning-header">{headword_html(entry)} {pos_html}</div>'
     visible = "".join(items[:2])
     folded = "".join(items[2:])
     details = ""
@@ -555,9 +577,8 @@ def paradigm_block_html(ents: list) -> str:
             continue
         head = ""
         if len(with_rows) > 1:
-            hw = sanitize(e.get("display_headword") or e.get("lemma"))
             pos = sanitize(e.get("pos_text"))
-            label = ("%s %s" % (hw, pos)).strip()
+            label = ("%s %s" % (headword_html(e), pos)).strip()
             head = f'<div class="paradigm-head">{label}</div>'
         blocks.append(f'<div class="paradigm-block">{head}{"".join(lines)}</div>')
     return "".join(blocks)
@@ -899,8 +920,7 @@ def read_package(path: Path) -> dict:
 # --------------------------------------------------------------------------
 
 def apkg_path(cfg: Config, lang: str) -> Path:
-    dist = getattr(cfg, "dist_dir", None) or Path("dist")
-    return Path(dist) / ("DDO_Danish_Frequency_Deck_%s.apkg" % lang)
+    return Path(cfg.dist_dir) / ("DDO_Danish_Frequency_Deck_%s.apkg" % lang)
 
 
 def run(cfg: Config, registry, lang: str, check_determinism: bool = False) -> dict:
@@ -919,6 +939,11 @@ def run(cfg: Config, registry, lang: str, check_determinism: bool = False) -> di
 
     v2_querywords = read_json(cfg.json_dir / "legacy" / "v2_querywords.json",
                               default={})
+    # Written by stage 30, enforced here: the guide puts the retry in stage 12
+    # phase C and the gate at export, because a shortfall at merge time has no
+    # remedy the merge can apply.
+    shortfall = read_json(cfg.json_dir / "sitemap_shortfall.json",
+                          default={"rows": [], "n_families": 0})
     counts = {"notes": len(notes),
               "senses_rendered": built["stats"].get("senses_rendered", 0),
               "expressions_rendered": built["stats"].get("expressions_rendered", 0),
@@ -958,6 +983,13 @@ def run(cfg: Config, registry, lang: str, check_determinism: bool = False) -> di
                                 sound_names), stage="70"),
         Gate(G_NOTE, "the note count is inside the declared range",
              lambda: note_count_gate(notes, gates_cfg.get("note_count_range")),
+             stage="70"),
+        Gate(G_SITEMAP, "the per-family homograph shortfall against the sitemap "
+                        "inventory is under the declared rate",
+             lambda: sitemap_shortfall(
+                 shortfall.get("rows") or [],
+                 shortfall.get("n_families") or len(notes),
+                 float(gates_cfg.get("sitemap_shortfall_max_rate", 0.01))),
              stage="70"),
     ]
     if check_determinism:

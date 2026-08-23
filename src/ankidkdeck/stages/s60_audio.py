@@ -23,13 +23,13 @@ import shutil
 from pathlib import Path
 
 from ..config import Config
-from ..gates import Gate, run_gates
+from ..gates import G_MEDIA, Gate, run_gates
 from ..util import FatalError, read_json, sha256_bytes, write_json
 
-# The guide's gate id. Stage 70 re-runs G-MEDIA over the notes that were
-# actually written; this run of it covers the cache itself, and the merged gate
-# report keeps the later result.
-G_MEDIA = "G-MEDIA"
+# G_MEDIA comes from gates.py. Stage 70 re-runs the same gate over the notes
+# that were actually written; this run covers the cache itself and the merged
+# report keeps the later result. Two local copies of a gate id is how a typo
+# creates a second, invisible gate.
 
 AUDIO_URL_RE = re.compile(
     r"^https://static\.ordnet\.dk/mp3/(\d{5})/(\d{6,})_(\d+)\.mp3$")

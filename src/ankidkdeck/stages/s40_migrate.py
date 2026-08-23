@@ -228,10 +228,15 @@ def rekey(old: dict, files_by_eid: dict, keyfn) -> tuple[dict, list, dict]:
             conflict = len({(v.get("lemma"), v.get("gloss")) for _, v in hits}) > 1
             if conflict:
                 stats["conflicts"] += 1
-                if keyfn(hits[0][0]) == keyfn(hits[1][0]):
-                    # Two candidates the written rule cannot separate. This is
-                    # what G-TIE forbids; filenames are unique so it is
-                    # unreachable, and the check is what proves that.
+                # Compare the key WITHOUT its filename component. With the
+                # filename in it the comparison was a tautology -- filenames are
+                # unique, so unresolved_conflicts was structurally 0 and G-TIE
+                # could not fail. What this now measures is "the written rule
+                # (own-lemma file, then frequency) could not separate these two
+                # candidates and the winner came from byte order". Byte order is
+                # still reproducible, so the count is baselined in
+                # registry/gates.json rather than forbidden outright.
+                if keyfn(hits[0][0])[:-1] == keyfn(hits[1][0])[:-1]:
                     stats["unresolved_conflicts"] += 1
             discarded.append({
                 "entry_id": eid, "key": text, "winner_file": winner_file,
@@ -329,10 +334,21 @@ def run(cfg: Config, registry=None) -> dict:
                                 EXPECTED_CONFLICTS["expressions"].get(lang)},
         }
 
+    # Measured on the full 2025 corpus with the filename removed from the key:
+    # Chinese 3, English 3, German 1, Spanish 1. Every one is a same-word
+    # re-download (hiv__0/hiv__3, gloria__b/gloria__c -- the 4 keys stage 50 also
+    # collapses): identical query_word, identical query_rank, and two glosses
+    # that paraphrase each other. No further written rule can separate them, so
+    # byte order is the honest answer and the POPULATION is what the gate
+    # watches. registry/gates.json:tie_break_byte_order_max = 3.
+    gates_cfg = getattr(registry, "gates", {}) if registry is not None else {}
+    byte_order_max = int(gates_cfg.get("tie_break_byte_order_max", 0))
     run_gates([
         Gate(G_TIE, "every multi-candidate migration cell was resolved by the "
-                    "written tie-break and every loser was written out",
-             lambda: tie_break_resolved(per_lang_tie), stage="40"),
+                    "written tie-break (own-lemma file, then frequency) and "
+                    "every loser was written out",
+             lambda: tie_break_resolved(per_lang_tie, byte_order_max),
+             stage="40"),
     ], cfg, stage="40")
 
     write_json(cfg.report_dir / "migrate_report.json", report)

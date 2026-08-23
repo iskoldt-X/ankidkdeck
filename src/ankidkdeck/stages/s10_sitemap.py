@@ -27,10 +27,53 @@ def _shard_urls(xml: str) -> list[tuple[str, str | None]]:
     return list(zip(locs, mods + [None] * (len(locs) - len(mods))))
 
 
+def robots_forbids_ddo(robots: str) -> str | None:
+    """The offending directive, or None.
+
+    A blanket `Disallow: /` under `User-agent: *` is the same governance stop as
+    an explicit /ddo rule -- checking only for /ddo let the strictest possible
+    robots.txt pass the gate.
+    """
+    if re.search(r"^Disallow:\s*/ddo\b", robots, re.M):
+        return "Disallow: /ddo"
+    agent = None
+    for raw in robots.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        key, val = key.strip().lower(), val.strip()
+        if key == "user-agent":
+            agent = val
+        elif key == "disallow" and agent == "*" and val == "/":
+            return "User-agent: * + Disallow: /"
+    return None
+
+
+def _shard_xml(su: str, r) -> str:
+    """Gunzip on the MAGIC BYTES only, never on the .gz suffix.
+
+    CloudFront serves these objects with `content-encoding: br` and
+    `vary: Accept-Encoding`, so what requests hands back depends on whether
+    brotli is installed, and any decoding proxy produces plain XML at a .gz URL.
+    Trusting the suffix raised a bare BadGzipFile traceback.
+    """
+    if r.content[:2] != b"\x1f\x8b":
+        return r.text
+    try:
+        return gzip.GzipFile(fileobj=io.BytesIO(r.content)).read().decode("utf-8")
+    except (OSError, EOFError, UnicodeDecodeError) as exc:
+        raise FatalError(
+            "sitemap shard %s claims gzip but could not be decompressed (%s); "
+            "first bytes %r" % (su, exc, r.content[:16])) from exc
+
+
 def run(cfg: Config, net: Net, gates: dict) -> dict:
     robots = net.get("https://ordnet.dk/robots.txt").text
-    if re.search(r"^Disallow:\s*/ddo\b", robots, re.M):
-        raise FatalError("robots.txt now disallows /ddo -- governance stop")
+    forbidden = robots_forbids_ddo(robots)
+    if forbidden:
+        raise FatalError(
+            "robots.txt now forbids the crawl (%s) -- governance stop" % forbidden)
     if "/sitemaps/ddo/index.xml" not in robots:
         raise FatalError("robots.txt no longer advertises the DDO sitemap index")
     (cfg.report_dir).mkdir(parents=True, exist_ok=True)
@@ -42,14 +85,15 @@ def run(cfg: Config, net: Net, gates: dict) -> dict:
         raise FatalError(f"unexpected sitemap shard count: {len(shard_urls)}")
 
     lemmas: dict[str, dict] = {}
-    affix_slugs: list[str] = []
+    # A SET: a lemma with homograph URLs (-hed_1, -hed_2) is one affix slug, and
+    # counting it twice made the gate compare a duplicate-inflated number
+    # against a range derived from unique slugs.
+    affix_slugs: set[str] = set()
     lastmods_per_shard: dict[str, set] = {}
     total = 0
     for su in shard_urls:
         r = net.get(su)
-        xml = r.text
-        if su.endswith(".gz") or r.content[:2] == b"\x1f\x8b":
-            xml = gzip.GzipFile(fileobj=io.BytesIO(r.content)).read().decode("utf-8")
+        xml = _shard_xml(su, r)
         mods = set()
         for loc, mod in _shard_urls(xml):
             total += 1
@@ -64,23 +108,28 @@ def run(cfg: Config, net: Net, gates: dict) -> dict:
             # Affix detection is by SHAPE, never by shard: the 'other' shard is
             # 82% ordinary ae/oe/digit-initial words, not an affix inventory.
             if base.startswith("-") or base.endswith("-"):
-                affix_slugs.append(base)
+                affix_slugs.add(base)
         lastmods_per_shard[su] = mods
 
     if total < 80_000:
         raise FatalError(f"sitemap total {total} URLs; expected > 80k -- site changed?")
-    lo, hi = gates.get("affix_count_range", [150, 400])
+    # Range re-baselined from a 4-shard measurement (285 unique affix slugs over
+    # a_d/e_h/other/u_z) plus the trailing-hyphen population scaled to the three
+    # unmeasured shards: the old [150, 400] ceiling was derived from TWO shards
+    # and would have hard-stopped the first real run.
+    lo, hi = gates.get("affix_count_range", [150, 600])
     if not lo <= len(affix_slugs) <= hi:
-        raise FatalError(f"affix slug count {len(affix_slugs)} outside [{lo},{hi}]")
+        raise FatalError(
+            f"unique affix slug count {len(affix_slugs)} outside [{lo},{hi}]")
 
     out = {
         "total_urls": total,
         "n_lemmas": len(lemmas),
         "lemmas": lemmas,
-        "affix_slugs": sorted(set(affix_slugs)),
+        "affix_slugs": sorted(affix_slugs),
         "lastmod_note": "uniform per shard; provenance only, never a skip condition",
         "lastmod_distinct_per_shard": {k: sorted(x for x in v if x) for k, v in lastmods_per_shard.items()},
     }
     write_json(cfg.json_dir / "sitemap.json", out)
-    return {"total_urls": total, "n_lemmas": len(lemmas), "n_affix": len(set(affix_slugs)),
+    return {"total_urls": total, "n_lemmas": len(lemmas), "n_affix": len(affix_slugs),
             "requests": net.request_count}

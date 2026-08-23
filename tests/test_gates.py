@@ -78,6 +78,54 @@ def test_anchors_not_demoted_or_affix():
     all_demoted = {"f4": {"anchor_entry_id": "3", "entry_ids": ["3"]}}
     ok, detail = G.anchors_not_demoted_or_affix(all_demoted, entries, demoted)
     assert ok is True and detail["all_demoted_families"] == 1
+    # ...but the POPULATION is baselined, so the softening cannot grow silently
+    ok, detail = G.anchors_not_demoted_or_affix(all_demoted, entries, demoted,
+                                                all_demoted_max=0)
+    assert ok is False and detail["all_demoted_over_baseline"] is True
+    assert G.anchors_not_demoted_or_affix(all_demoted, entries, demoted,
+                                          all_demoted_max=1)[0] is True
+
+
+def test_no_affix_members():
+    """The affix check used to be a bare AssertionError AFTER the outputs were
+    written, so G-AFFIX never appeared in gates_report.json."""
+    entries = {"1": make_entry("1", "kvinde", pos_key="sb."),
+               "2": make_entry("2", "-kvinde", pos_key="sidsteled"),
+               "3": make_entry("3", "for-", pos_key="sb.")}
+    clean = {"kvinder": {"members": [{"entry_id": "1", "bucket": "form"}]}}
+    assert G.no_affix_members(clean, entries)[0] is True
+    # rejected is fine; a MEMBER is not
+    with_reject = {"kvinder": {"members": [{"entry_id": "1", "bucket": "form"}],
+                               "rejected": [{"entry_id": "2"}]}}
+    assert G.no_affix_members(with_reject, entries)[0] is True
+    by_pos = {"kvinder": {"members": [{"entry_id": "2", "bucket": "form"}]}}
+    ok, detail = G.no_affix_members(by_pos, entries)
+    assert ok is False and detail["sample"][0]["lemma"] == "-kvinde"
+    # detected by SHAPE too, not only by data-pos-key
+    by_shape = {"foran": {"members": [{"entry_id": "3", "bucket": "form"}]}}
+    assert G.no_affix_members(by_shape, entries)[0] is False
+
+
+def test_registry_family_ids():
+    """`11028611#kunne` put a wordlist form into the registry whose whole point
+    is to make wordlist changes GUID-neutral."""
+    assert G.registry_family_ids({"11028611": {}, "11021722": {}})[0] is True
+    ok, detail = G.registry_family_ids({"11028611#kunne": {}})
+    assert ok is False and detail["sample"] == ["11028611#kunne"]
+    assert G.registry_family_ids({"11028611/deadbeef": {}})[0] is False
+    assert G.registry_family_ids({"12345": {}})[0] is False        # too short
+    assert G.registry_family_ids({})[0] is True
+
+
+def test_tie_break_gate_can_actually_fail_and_has_a_baseline():
+    """With the filename in the comparison key the count was structurally 0 --
+    filenames are unique -- so G-TIE proved a tautology. Without it the number
+    means "the written rule fell through to byte order", which is reproducible
+    but worth watching, so it is baselined rather than forbidden."""
+    two = {"En": {"unresolved_conflicts": 2, "discard_file_written": True}}
+    assert G.tie_break_resolved(two)[0] is False
+    assert G.tie_break_resolved(two, byte_order_max=2)[0] is True
+    assert G.tie_break_resolved(two, byte_order_max=1)[0] is False
 
 
 def test_bind_accounting():
@@ -246,3 +294,88 @@ def test_dedupe_keep_first_collapses_the_re_downloads():
 def test_anchor_first_survives_ranking():
     assert S50.anchor_first("11000011", ["11000010", "11000011"]) == [
         "11000011", "11000010"]
+
+
+# --------------------------------------------- stage 70 rendering regressions
+
+def test_the_homograph_index_is_rendered_as_a_superscript():
+    """`al2` / `udenfor1` / `i5` is not what DDO shows (a superscript) and it
+    also became an Anki search token. lemma and super are separate fields; the
+    markup is assembled at render time."""
+    e = make_entry("11001153", "al", super_="2", pos_key="pron.")
+    assert S70.headword_html(e) == 'al<span class="super">2</span>'
+    plain = make_entry("11021722", "hus", pos_key="sb.")
+    assert S70.headword_html(plain) == "hus"
+    # and the glued form never reaches the card face
+    assert "al2" not in S70.headword_html(e)
+
+
+def test_ipa_dedup_keeps_rows_that_have_audio_but_no_ipa(cfg):
+    """21 udtale rows (all multiword compounds -- `alle sammen`,
+    `dag til dag-service`) carry ipa: "" with a valid audio_url. Deduping on the
+    empty IPA string collapsed them into one row and lost every [sound:] tag but
+    the first."""
+    from ankidkdeck.util import write_json
+    urls, manifest = [], {}
+    for slot in (1, 2):
+        name = "11000900_%d.mp3" % slot
+        (cfg.audio_dir / name).write_bytes(b"id3")
+        url = "https://static.ordnet.dk/mp3/11000/%s" % name
+        urls.append((url, slot))
+        manifest[url] = {"file": name}
+    write_json(cfg.audio_dir / "manifest.json", manifest)
+    media = S70.Media(cfg)
+    e = make_entry("11000900", "alle sammen", pos_key="sb.",
+                   udtale=[{"ipa": "", "label": None, "audio_url": u,
+                            "slot_n": s} for u, s in urls])
+    html = S70.pron_html_for_group([e], media)
+    assert html.count("[sound:") == 2
+    assert "[]" not in html                    # no empty IPA brackets rendered
+    # a row with neither IPA nor audio is still nothing to render
+    empty = make_entry("11000901", "x", pos_key="sb.",
+                       udtale=[{"ipa": "", "label": None, "audio_url": None,
+                                "slot_n": None}])
+    assert S70.pron_html_for_group([empty], S70.Media(cfg)) == ""
+    # and a genuine IPA duplicate is still collapsed
+    dup = make_entry("11000902", "hus", pos_key="sb.",
+                     udtale=[{"ipa": "huˀs", "label": None, "audio_url": None,
+                              "slot_n": None}] * 2)
+    assert S70.pron_html_for_group([dup], S70.Media(cfg)).count("ipa-row") == 1
+
+
+# ------------------------------------------------- stage 10 governance / gzip
+
+def test_robots_blanket_disallow_is_a_governance_stop():
+    from ankidkdeck.stages.s10_sitemap import robots_forbids_ddo
+    assert robots_forbids_ddo("User-agent: *\nAllow: /\n") is None
+    assert robots_forbids_ddo("User-agent: *\nDisallow: /ddo\n") is not None
+    # the strictest possible robots.txt used to PASS the gate
+    assert robots_forbids_ddo("User-agent: *\nDisallow: /\n") is not None
+    assert robots_forbids_ddo("User-agent: *\nDisallow: /   # comment\n") is not None
+    # another agent's blanket ban is not ours
+    assert robots_forbids_ddo("User-agent: BadBot\nDisallow: /\n") is None
+
+
+def test_a_gz_url_serving_plain_xml_is_not_gunzipped():
+    """CloudFront serves these with content-encoding: br, so what requests hands
+    back depends on whether brotli is installed. Trusting the .gz suffix raised
+    a bare BadGzipFile traceback."""
+    import gzip as gziplib
+
+    from ankidkdeck.stages.s10_sitemap import _shard_xml
+    from ankidkdeck.util import FatalError
+
+    class R:
+        def __init__(self, content, text=None):
+            self.content = content
+            self.text = text if text is not None else content.decode("utf-8")
+
+    plain = b"<urlset><url><loc>https://ordnet.dk/ddo/ordbog?query=hus</loc>"
+    assert _shard_xml("shard_a_d.xml.gz", R(plain)) == plain.decode("utf-8")
+    packed = gziplib.compress(plain)
+    assert _shard_xml("shard_a_d.xml.gz", R(packed, text="junk")) == \
+        plain.decode("utf-8")
+    # a truncated gzip is a FatalError that names the shard, not a traceback
+    with pytest.raises(FatalError) as exc:
+        _shard_xml("shard_a_d.xml.gz", R(packed[:12], text="junk"))
+    assert "shard_a_d.xml.gz" in str(exc.value)

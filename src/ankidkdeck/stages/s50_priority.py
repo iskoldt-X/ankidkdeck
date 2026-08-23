@@ -33,12 +33,8 @@ import json
 import time
 
 from ..config import Config
-from ..gates import Gate, run_gates
+from ..gates import G_ORDER, Gate, run_gates
 from ..util import FatalError, read_json, write_json
-
-# Local gate id: the guide's table has no id for "the display order is a
-# permutation of the family", it only spells the assertion out in 4.11.
-G_ORDER = "G-ORDER"
 
 # One family per call, as in 03_rank_homographs.py; 1.6s keeps the free tier's
 # 30 RPM with margin.
@@ -296,7 +292,10 @@ def run(cfg: Config, registry=None, confirm: bool = False) -> dict:
     from .s42_translate import _generate, _pool_from_env
 
     pool = _pool_from_env()
-    prov = "gemini:%s@%s" % (cfg.gemini_model, datetime.date.today().isoformat())
+    # The ranking is a short permutation, not prose: it shares the expressions
+    # model rather than the definition model (config.expressions_model).
+    model = cfg.expressions_model
+    prov = "gemini:%s@%s" % (model, datetime.date.today().isoformat())
     ranked = 0
     for row in queue:
         fid = row["family_id"]
@@ -307,7 +306,7 @@ def run(cfg: Config, registry=None, confirm: bool = False) -> dict:
                 % (fam.get("lemma"), json.dumps(payload, ensure_ascii=False,
                                                 indent=2)))
         time.sleep(RANK_REQUEST_INTERVAL)
-        parsed = _generate(pool, cfg.gemini_model, rank_prompt(), user,
+        parsed = _generate(pool, model, rank_prompt(), user,
                            _rank_schema(len(eids)), 0.1, "ranking %s" % fid)
         sorted_ids = parsed.get("sorted_ids")
         if not isinstance(sorted_ids, list) or set(sorted_ids) != set(eids) \

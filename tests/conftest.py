@@ -111,8 +111,14 @@ def make_entry(entry_id: str, lemma: str, *, pos_key="sb.", pos_text="substantiv
                display_headword=None, super_=None, paradigm_rows=None,
                paradigm_short=None, udtale=(), source_words=(),
                orddannelser=None, etymology=None) -> dict:
-    """One entries.json row. `forms` are extra flex-table cells; the lemma is
-    always in form_index, exactly as stage 20 writes it."""
+    """One entries.json row, exactly as stage 20 writes it.
+
+    `forms` are extra flex-table cells. The two indexes are built the same way
+    the parser builds them, and the difference matters: `paradigm_index` is real
+    inflection cells only (bucket 2's evidence), `form_index` adds the lemma key
+    and the OFFICIAL alternative spellings (stage 21's reverse index). A
+    deprecated spelling (`{"form": "kan", "official": False}`) reaches neither.
+    """
     from ankidkdeck.util import NFC, canonical_json, nk, sha256_str
     rows = paradigm_rows
     if rows is None:
@@ -122,7 +128,10 @@ def make_entry(entry_id: str, lemma: str, *, pos_key="sb.", pos_text="substantiv
            for a in alt_spellings]
     e = {
         "entry_id": entry_id,
-        "display_headword": display_headword or lemma,
+        # display_headword IS the lemma; the homograph index lives in `super`
+        # and is rendered as a superscript by stage 70.
+        "display_headword": display_headword or NFC(lemma),
+        "headword_glued": NFC(lemma) + (super_ or ""),
         "lemma": NFC(lemma),
         "lemma_key": nk(lemma),
         "super": super_,
@@ -138,9 +147,10 @@ def make_entry(entry_id: str, lemma: str, *, pos_key="sb.", pos_text="substantiv
         "orddannelser": orddannelser or {},
         "source_words": list(source_words),
     }
-    e["form_index"] = sorted({nk(c) for r in rows for c in r["cells"]}
+    e["paradigm_index"] = sorted({nk(c) for r in rows for c in r["cells"]})
+    e["form_index"] = sorted(set(e["paradigm_index"])
                              | {nk(lemma)}
-                             | {nk(a["form"]) for a in alt})
+                             | {nk(a["form"]) for a in alt if a.get("official")})
     e["empty"] = not e["senses"] and not e["expressions"]
     e["article_sha"] = sha256_str(canonical_json(e))
     return e

@@ -56,6 +56,11 @@ class Net:
             raise FatalError(f"blocked/throttled: HTTP {r.status_code} for {url}")
         if r.status_code >= 500:
             if not retried:
+                # Record the failed FIRST attempt: without it a run that 5xx'd
+                # on every other request and recovered each time showed a 100%
+                # rolling success rate, and the circuit breaker -- whose whole
+                # job is to notice a degraded run -- never tripped.
+                self.circuit.record(False)
                 time.sleep(30)
                 return self.get(url, retried=True)
             raise FatalError(f"persistent 5xx for {url}")

@@ -33,6 +33,23 @@ class Config:
     wordlist_file: Path | None = None
     wordlist_sha256: str | None = None
     gemini_model: str = "gemini-2.0-flash"
+    # Expressions, the homograph ranking and the POS table are the three calls
+    # whose output is short and whose failure mode is contamination rather than
+    # truncation, so they may be pointed at a different (usually cheaper) model
+    # without touching the 22,734 definition cells' house style. None = use
+    # gemini_model.
+    gemini_model_expressions: str | None = None
+    # The release label stamped into card_keys.json rows. NOT __version__: those
+    # rows are immutable once frozen, so a dev pre-release ("3.0.0a0") would
+    # brand every v3.0 family forever in the file whose diff is the release
+    # artifact.
+    registry_version: str = "3.0"
+    # Where the .apkg lands.
+    dist_dir: Path = Path("dist")
+
+    @property
+    def expressions_model(self) -> str:
+        return self.gemini_model_expressions or self.gemini_model
 
     @property
     def raw_dir(self) -> Path:
@@ -74,6 +91,7 @@ def load_config(path: Path | None = None, **overrides) -> Config:
         if v is not None and hasattr(cfg, k):
             setattr(cfg, k, v)
     cfg.work_dir = Path(cfg.work_dir)
+    cfg.dist_dir = Path(cfg.dist_dir)
     if cfg.legacy_workspace:
         cfg.legacy_workspace = Path(cfg.legacy_workspace)
     if cfg.wordlist_file:

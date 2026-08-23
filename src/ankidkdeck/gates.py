@@ -16,14 +16,17 @@ A gate that cannot fail is not a gate: every helper below returns the measured
 detail alongside the verdict, so a passing gate still leaves evidence.
 """
 
+import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
 from .util import FatalError, NFC, read_json, write_json
 
-# Gate ids, spelled exactly as in the final guide's table (section 4.12). The
-# ids segment 2 owns are listed here; segment 3 adds the export-time ones.
+# EVERY gate id in the pipeline lives here, spelled exactly as in the final
+# guide's table (section 4.12). Segment 3 used to declare its own copies at the
+# top of s42/s50/s70; one list means a typo in a gate id cannot silently create
+# a second, invisible gate.
 G_RANK = "G-RANK"
 G_SEED = "G-SEED"
 G_GUID = "G-GUID"
@@ -33,6 +36,16 @@ G_BIND = "G-BIND"
 G_TIE = "G-TIE"
 G_SITEMAP = "G-SITEMAP"
 G_ASSIGN = "G-ASSIGN"  # "every word in at most one family" (guide 4.9 step 4)
+G_REGKEY = "G-REGKEY"  # family_id IS an entry_id; no wordlist form may leak in
+# Export-time and LLM-stage ids (previously local to s42/s50/s70).
+G_ORPH = "G-ORPH"
+G_ORDER = "G-ORDER"       # 4.11 spells the assertion out but names no id
+G_EMPTY_C = "G-EMPTY-C"
+G_RATE = "G-RATE"
+G_COV = "G-COV"
+G_MEDIA = "G-MEDIA"
+G_NOTE = "G-NOTE"
+G_DET = "G-DET"
 
 # The closed set of translation drop reason codes. A drop carrying anything
 # else is an unexplained loss, which is what G-BIND exists to forbid.
@@ -46,6 +59,19 @@ DROP_REASONS = frozenset({
 })
 
 AFFIX_POS_KEYS = frozenset({"førsteled", "sidsteled", "suffiks", "præfiks"})
+
+# family_id is the anchor article's entry_id and nothing else: it is the
+# permanent key of card_keys.json, so a wordlist-derived token in it would be
+# orphaned the day that word joins another family or leaves the list.
+FAMILY_ID_RE = re.compile(r"^[0-9]{6,}$")
+
+
+def is_affix_entry(entry: dict) -> bool:
+    """Affix pages are detected by headword shape AND data-pos-key, never by
+    sitemap shard: `-kvinde` (kvinder), `-ske` (sker), `for-`."""
+    lemma = entry.get("lemma") or ""
+    return (entry.get("pos_key") in AFFIX_POS_KEYS
+            or lemma.startswith("-") or lemma.endswith("-"))
 
 
 @dataclass
@@ -161,7 +187,8 @@ def unique_assignment(assignments: dict, families: dict):
                 "assignment_vs_membership_mismatch": mismatched[:20]}
 
 
-def anchors_not_demoted_or_affix(families: dict, entries: dict, demoted_pos: set):
+def anchors_not_demoted_or_affix(families: dict, entries: dict, demoted_pos: set,
+                                 all_demoted_max: int | None = None):
     """G-ANCHOR + G-AFFIX. A family must never be headed by an affix page
     (`-kvinde`, `-ske`) and must never be headed by a demoted article while a
     real one is available in the same family.
@@ -171,13 +198,20 @@ def anchors_not_demoted_or_affix(families: dict, entries: dict, demoted_pos: set
     reached through its own flex table) has no non-demoted anchor to pick, and
     stopping the build for it would contradict the owner's 2026-08-24 ruling
     that word-level resolution problems are recorded, not fatal. Those are
-    listed as all_demoted, not failed.
+    listed as all_demoted -- but their COUNT is baselined
+    (registry/gates.json:all_demoted_families_max) so the population cannot
+    grow silently, which is the condition the reviewers put on the softening.
+
+    The other half of the invariant lives in stage 30's anchor_of(), which sorts
+    demotion FIRST: with that key demoted_anchored_with_alternative is
+    unreachable by construction, so a failure here is a real defect rather than
+    a tie-break accident.
     """
     affix_anchored, demoted_anchored, all_demoted = [], [], []
     for fid, fam in families.items():
         a = entries[fam["anchor_entry_id"]]
         lemma = a.get("lemma", "")
-        if a.get("pos_key") in AFFIX_POS_KEYS or lemma.startswith("-") or lemma.endswith("-"):
+        if is_affix_entry(a):
             affix_anchored.append({"family_id": fid, "lemma": lemma,
                                    "pos_key": a.get("pos_key")})
         if a.get("pos_key") in demoted_pos:
@@ -187,11 +221,47 @@ def anchors_not_demoted_or_affix(families: dict, entries: dict, demoted_pos: set
             row = {"family_id": fid, "lemma": lemma, "pos_key": a.get("pos_key"),
                    "non_demoted_alternatives": alt}
             (demoted_anchored if alt else all_demoted).append(row)
-    ok = not affix_anchored and not demoted_anchored
+    over = all_demoted_max is not None and len(all_demoted) > all_demoted_max
+    ok = not affix_anchored and not demoted_anchored and not over
     return ok, {"affix_anchored": affix_anchored[:20],
                 "demoted_anchored_with_alternative": demoted_anchored[:20],
                 "all_demoted_families": len(all_demoted),
+                "all_demoted_families_max": all_demoted_max,
+                "all_demoted_over_baseline": bool(over),
                 "all_demoted_sample": all_demoted[:10]}
+
+
+def no_affix_members(classification: dict, entries: dict):
+    """G-AFFIX. No accepted member may be an affix-page article.
+
+    5 of the spec's 30 new lemmas are affix pages, and `-kvinde` absorbed into
+    the `kvinde` card is how the real word vanishes. This used to be a bare
+    `raise AssertionError` AFTER classification.json was written; as a gate it
+    runs before the outputs are final and shows up in gates_report.json.
+    """
+    bad = []
+    for word in sorted(classification):
+        for m in (classification[word].get("members") or []):
+            e = entries.get(m["entry_id"])
+            if e is not None and is_affix_entry(e):
+                bad.append({"word": word, "entry_id": m["entry_id"],
+                            "lemma": e.get("lemma"), "pos_key": e.get("pos_key"),
+                            "bucket": m.get("bucket"),
+                            "evidence": m.get("evidence")})
+    return not bad, {"words": len(classification), "affix_members": len(bad),
+                     "sample": bad[:20]}
+
+
+def registry_family_ids(card_keys: dict):
+    """G-REGKEY. Every card_keys.json key is a bare DDO entry_id.
+
+    The v1 refused-merge fallback minted `11028611#kunne`, putting a wordlist
+    form into the registry whose whole purpose is to make wordlist changes
+    GUID-neutral. A gate makes that impossible to commit rather than merely
+    unlikely."""
+    bad = sorted(k for k in card_keys if not FAMILY_ID_RE.match(str(k)))
+    return not bad, {"rows": len(card_keys), "malformed": len(bad),
+                     "sample": bad[:20]}
 
 
 def bind_accounting(per_lang: dict):
@@ -215,14 +285,31 @@ def bind_accounting(per_lang: dict):
     return not bad, {"per_language": per_lang, "violations": bad}
 
 
-def tie_break_resolved(per_lang: dict):
+def tie_break_resolved(per_lang: dict, byte_order_max: int = 0):
     """G-TIE. Every multi-candidate migration cell was resolved by the written
     tie-break and every loser was written out. 40-50% of the cells in
     multi-file buckets carry 2-6 candidate translations, so without this the
-    build picks one by dict iteration order and is not reproducible."""
-    bad = {lang: s for lang, s in per_lang.items()
-           if s.get("unresolved_conflicts", 0) or not s.get("discard_file_written")}
-    return not bad, {"per_language": per_lang, "violations": bad}
+    build picks one by dict iteration order and is not reproducible.
+
+    `unresolved_conflicts` counts conflicts the RULE could not separate -- the
+    key compared WITHOUT its filename component. Comparing the full key made
+    the number structurally zero (filenames are unique), i.e. a gate that could
+    not fail. Falling through to byte order is still reproducible, so the count
+    is baselined (registry/gates.json:tie_break_byte_order_max) instead of
+    being flatly forbidden: the gate fires when the population GROWS.
+    """
+    bad = {}
+    for lang, s in per_lang.items():
+        problems = {}
+        n = s.get("unresolved_conflicts", 0)
+        if n > byte_order_max:
+            problems["conflicts_resolved_only_by_byte_order"] = n
+        if not s.get("discard_file_written"):
+            problems["discard_file_written"] = False
+        if problems:
+            bad[lang] = problems
+    return not bad, {"per_language": per_lang, "violations": bad,
+                     "byte_order_max": byte_order_max}
 
 
 def sitemap_shortfall(rows: list, n_families: int, max_rate: float):
