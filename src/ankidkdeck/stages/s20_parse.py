@@ -17,7 +17,11 @@ from ..util import (FatalError, NFC, canonical_json, collapse_ws, nk,
                     read_json, sha256_str, write_json)
 from .s12_download import Ledger, raw_path
 
-MAILTO_RE = re.compile(r"mailto:[^\"'>]*?\((\d{6,})\)")
+# The character class excludes " and > only. An apostrophe-excluding form loses
+# the witness for every apostrophe headword, because the fejlrapport subject
+# embeds the headword: d'herrer (11008184) bridges under this form and not under
+# [^"'>]. [verified against the 2025 corpus: 5,259 vs 5,258 files]
+MAILTO_RE = re.compile(r"mailto:[^\">]*?\((\d{6,})\)")
 AUDIO_ID_RE = re.compile(r'<audio[^>]*id="(\d{6,})_\d+"')
 UDTRYK_ID_RE = re.compile(r"^udtryk-\d+$")
 

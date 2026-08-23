@@ -24,7 +24,10 @@ FILES = [
 
 
 def _package_default(name: str):
-    ref = resources.files("ankidkdeck.registry").joinpath(name)
+    # Address the data directory through the top-level package: this module is
+    # itself named `registry`, so files("ankidkdeck.registry") resolves to
+    # registry.py and hands back src/ankidkdeck/ instead of the data dir.
+    ref = resources.files("ankidkdeck").joinpath("registry", name)
     with ref.open("r", encoding="utf-8") as f:
         return json.load(f)
 

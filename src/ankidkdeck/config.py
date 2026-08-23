@@ -54,6 +54,12 @@ class Config:
     def registry_local(self) -> Path:
         return self.work_dir / "registry"
 
+    @property
+    def review_dir(self) -> Path:
+        """Artifacts a human is required to read before a release (rejected
+        classifications, refused merges, the registry diff)."""
+        return self.work_dir / "review"
+
 
 def load_config(path: Path | None = None, **overrides) -> Config:
     cfg = Config()
