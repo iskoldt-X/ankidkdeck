@@ -1,96 +1,165 @@
 # ankidkdeck
 
-A pipeline of Python scripts that builds high-quality Danish frequency Anki decks
-(~4,400 words from the top 5,000 of the Wiktionary Danish frequency list) with
-IPA, audio, definitions, example sentences, fixed expressions, derivatives,
-etymology, and AI-generated translations into a target language.
+Build a Danish frequency Anki deck from [Den Danske Ordbog](https://ordnet.dk)
+(DDO): one card per word family, with IPA, audio, numbered senses, example
+sentences, fixed expressions, inflection tables, derivatives, etymology and
+AI-assisted translations into your target language.
 
-This is the **V2.1 pipeline** -- the exact code that built the decks published in
-the [v2.0 release](https://github.com/iskoldt-X/ankidkdeck/releases/tag/v2.0)
-(Chinese, English, German, Spanish). The earlier v1 scripts have been removed
-from HEAD and remain available in the git history.
+This is **v3**. The published v2.0 decks (Chinese, English, German, Spanish) were
+built with the v2.1 script pipeline, which is still on the `v2.1-pipeline`
+branch. v3 is a proper Python package with one CLI, and it is designed so that
+re-importing a rebuilt deck **upgrades your existing cards instead of duplicating
+them** -- see [Study progress](#study-progress).
 
-## Pipeline overview
-
-| Stage | Script | Input -> Output |
-|---|---|---|
-| 1 | `01_download_all_ddo_versions.py` | Wiktionary frequency list -> `ddo_html_all_versions/` + `download_map.json` (discovers and downloads every homograph page per word from Den Danske Ordbog) |
-| 2 | `02_generate_entries.py` | HTML corpus -> `ddo_entries.json` (structured entries: definitions, examples, IPA/audio links, wordforms, etymology, fixed expressions, derivatives) |
-| 3 | `03_rank_homographs.py` | `ddo_entries.json` -> `priority_map.json` (Gemini ranks homograph meanings from most to least common) |
-| 4 | `04_translate_pos.py` | POS tags -> `pos_translations_<LANG>_gemini.json` |
-| 5 | `05_translate_definitions.py` | definitions -> `definition_translations_<LANG>_gemini-2.0-flash.json` (lemma + gloss per definition, resumable) |
-| 6 | `06_translate_expressions.py` | fixed expressions -> `expression_translations<LANG>_gemini-2.0-flash.json` (batched, with a generate-review-correct loop against language contamination) |
-| 7 | `07_review_translations.py` | any translation file -> `review_issues_*.json` (post-hoc AI review report for manual inspection) |
-| 8 | `08_download_audio.py` | `ddo_entries.json` -> `audio/` + `audio_map.json` |
-| 9 | `09_export_apkg.py` | everything above -> `DDO_Danish_Frequency_Deck_<LANG>.apkg` |
-
-Stages 1, 5, 6, and 8 are resumable: they checkpoint progress to their output
-files and skip already-processed items on restart.
-
-## Prerequisites
-
-- **Python 3.12+**
-- Install required packages:
-  ```bash
-  pip install requests beautifulsoup4 tqdm genanki google-genai google-api-core tiktoken
-  ```
-- Gemini API key(s) for stages 3-7, provided via environment variable
-  (comma-separated to rotate across a pool of keys):
-  ```bash
-  export GEMINI_API_KEYS="key1,key2,..."
-  export MAX_PER_API=5   # optional: requests per key before rotating
-  ```
-
-## Usage
-
-Before downloading content from Den Danske Ordbog, please read and respect
-their [terms of use](https://ordnet.dk/copyright).
-
-Set `TARGET_LANG` at the top of `04_translate_pos.py`,
-`05_translate_definitions.py`, `06_translate_expressions.py`, and
-`09_export_apkg.py` to your target language (e.g. `"English"`, `"Chinese"`),
-then run the stages in order:
+## Install
 
 ```bash
-python 01_download_all_ddo_versions.py
-python 02_generate_entries.py
-python 03_rank_homographs.py
-python 04_translate_pos.py
-python 05_translate_definitions.py
-python 06_translate_expressions.py
-python 07_review_translations.py   # optional quality check
-python 08_download_audio.py
-python 09_export_apkg.py
+uvx ankidkdeck --help                      # run without installing
+pip install "ankidkdeck[llm]"              # or install it, with the Gemini extra
+git clone https://github.com/iskoldt-X/ankidkdeck && pip install -e ".[llm,dev]"
 ```
 
-Stage 9 produces an `.apkg` file ready to import into Anki.
+Python 3.11+. The `llm` extra is only needed for the translation stages; crawling
+and exporting work without it.
 
-## Deck design notes
+## The four commands
 
-- One card per word: homograph entries are merged into a single note, ordered
-  by the commonness ranking from stage 3.
-- Stable identities: deck and model IDs are derived from `adler32(TARGET_LANG)`,
-  and note GUIDs from `(query_word, TARGET_LANG)`, so re-imports of rebuilt
-  decks preserve study progress.
-- Known issue: the GUID scheme changed between v1 and v2 decks, so importing a
-  v2 deck alongside an old v1 deck creates duplicate cards instead of upgrading
-  them in place. A migration path is being worked on.
+Everything is written under `./work` (add `--work PATH` to move it).
 
-## Disclaimer
+```bash
+ankidkdeck crawl --pilot                     # 300 pages first, then:
+ankidkdeck crawl --full                      # ~5,000 pages, 4-5 h, resumable
+ankidkdeck crawl --phase-b                   # lemma pages the inflections need
 
-This repository contains code only. Content downloaded from Den Danske Ordbog
-(definitions, examples, audio) stays on your machine, is ignored by git, and
-must not be redistributed -- the generated decks are for your personal study
-use only. If you use data from Den Danske Ordbog, you are responsible for
-complying with their official terms of use: https://ordnet.dk/copyright
+ankidkdeck build                             # parse -> classify -> resolve -> merge -> bind
+
+export GEMINI_API_KEYS="key1,key2"
+ankidkdeck translate --lang German           # prints a BILL and stops
+ankidkdeck translate --lang German --confirm-spend
+
+ankidkdeck audio --seed-legacy               # reuse a previous run's mp3s
+ankidkdeck export --lang German              # dist/DDO_Danish_Frequency_Deck_German.apkg
+```
+
+`ankidkdeck status` prints where you are; `ankidkdeck gates` prints every quality
+gate and whether it passed. `ankidkdeck --help` lists every stage individually
+(`wordlist`, `sitemap`, `parse`, `classify`, `resolve`, `merge`, `bind`,
+`migrate`, `priority`).
+
+Options worth knowing:
+
+| option | why |
+|---|---|
+| `--work PATH` | where the corpus, JSON and reports live (default `./work`) |
+| `--config PATH` | TOML config (default `./ankidkdeck.toml`): languages, model, sleep range, copyright year |
+| `--legacy-workspace PATH` | a previous run's workspace, for reusing its translations, rankings and audio |
+| `--confirm-spend` | the only way `translate` and `priority` place a paid API call |
+| `--check-determinism` | build twice and compare, before writing the `.apkg` |
+
+## You need a residential IP
+
+DDO sits behind a WAF that challenges datacenter addresses. From a VPS or a
+cloud runner the crawl gets challenged, and the crawler treats a challenge as
+fatal on purpose -- it never retries into a block. Run it from a home
+connection.
+
+The crawl is polite by design: one request at a time, 2-4 s apart, an honest
+User-Agent, no parallelism, ~5,000 requests once per release. Every request is
+checkpointed, so a stopped run resumes where it left off instead of starting
+over.
+
+## Translations
+
+Translation is the only step that costs money, so it is the only step that asks:
+
+```
+$ ankidkdeck translate --lang German
+--- translation bill (model: gemini-2.0-flash) ---
+  German     571 cells  (definitions 571: 571 new / 0 changed | expressions 0: ...)
+             412 entries, 43-43 API requests, ~18k source tokens
+  TOTAL 571 cells across 1 language(s)
+  nothing has been sent. Re-run with --confirm-spend to place calls.
+```
+
+Without `--confirm-spend` nothing is imported from the Gemini SDK and no request
+is made. Keys come from `GEMINI_API_KEYS` (comma-separated; the pool rotates
+every `MAX_PER_API` requests, default 5). Only missing cells are translated: if
+you point `--legacy-workspace` at an earlier run, its translations are re-keyed
+and reused, and you pay for the gap only.
+
+The card's target-language text is machine-translated and marked as such.
+
+## Study progress
+
+Anki matches an imported note to an existing one by its GUID. v3 keeps every
+card's GUID stable by never deriving it from data at build time: the seed lives
+in a checked-in, append-only registry (`src/ankidkdeck/registry/card_keys.json`),
+is reviewed once per major version, and is never recomputed. That matters
+because `guid_for()` hashes the exact bytes, and 55 word pairs in this deck
+differ only by case (`Er` the erbium symbol vs `er` the verb form, at rank 1).
+
+v3 also merges inflections into one card per family (~2,900 cards instead of
+~4,400 notes), so some old cards become duplicates. `tools/guid_diff.py` prints
+exactly which GUIDs are kept, new and retired, and `tools/retired_notes.py`
+writes a companion package that tags the retired ones so you can delete them
+with one search.
+
+**Not yet verified:** the deck's behaviour on import is checked by a human
+against a real Anki, following `tools/import_smoke_test.md`. Until that
+checklist is signed for a build, treat "progress is preserved" as untested.
+
+## Data policy
+
+This repository contains **code only**.
+
+- DDO content -- pages, definitions, examples, audio -- stays on your machine.
+  Everything the pipeline downloads or derives lands in `work/` and `dist/`,
+  which are gitignored, and so are the test fixtures built from it.
+- The tracked exception is `src/ankidkdeck/registry/*.json`: word identities and
+  hand-curated rules (which lemma a form belongs to, which parts of speech are
+  demoted, gate baselines). No DDO text.
+- The decks you build are for your own study. Do not redistribute them. You are
+  responsible for complying with DDO's
+  [terms of use](https://ordnet.dk/copyright), and the frequency list comes from
+  [Wiktionary](https://en.wiktionary.org/wiki/Wiktionary:Frequency_lists/Danish_wordlist)
+  under CC BY-SA 3.0.
+
+## Quality gates
+
+Every stage ends in named gates, and a failed gate means no output -- there is no
+warning-and-continue path. They exist because each one is a defect that shipped
+once: bare untranslated cards (`G-COV`), an unreproducible media order
+(`G-MEDIA`), a silently re-anchored GUID (`G-SEED`), empty card bodies
+(`G-EMPTY-C`), a build that differs from itself (`G-DET`). `ankidkdeck gates`
+prints the standing record. Two gates are human: reading
+`work/review/rejected.json` and the Anki import smoke test.
+
+## Tests
+
+```bash
+pip install -e ".[dev]"
+python -m pytest tests               # pure-logic tests, no data needed
+ANKIDKDECK_FIXTURES=work/fixtures python -m pytest tests   # + golden tests
+```
+
+The golden tests need saved DDO pages, which cannot be committed; build them on
+the machine that holds the corpus with `tools/build_fixtures.py`. Without them
+those modules skip and say so.
+
+## Upgrading from a previous run
+
+If you have a workspace from an earlier version, `ankidkdeck migrate
+--legacy-workspace <path>` re-keys its translations onto the current sense ids
+offline (no network, no API calls), records every dropped row with a reason code,
+and lets `priority` and `audio` reuse its homograph rankings and mp3s. Run
+`migrate` before `merge`, so the GUID registry can be frozen from the words that
+actually shipped.
 
 ## License
 
-This project is released under the **MIT License**. See [LICENSE](LICENSE) for
-details.
+MIT -- see [LICENSE](LICENSE). Code only; the data is not ours to license.
 
 ## Acknowledgments
 
-- **Data sources**: Den Danske Ordbog (definitions, IPA, audio -- personal use),
-  Wiktionary (frequency list, CC BY-SA).
-- **Translations**: Google Gemini (2.0 Flash / 2.5 Flash).
+Den Danske Ordbog (definitions, IPA, audio -- personal use), Wiktionary
+(frequency list, CC BY-SA 3.0), Google Gemini (translations).
