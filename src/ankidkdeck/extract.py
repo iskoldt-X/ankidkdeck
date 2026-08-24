@@ -11,6 +11,14 @@ research/2026-08-v3-review/v3_final_guide.md section 1.1).
 
 from .util import collapse_ws
 
+# The version of the PARSED-ARTICLE HASH contract (s20_parse.content_sha), not of
+# this table. Bump it whenever the set of fields that feed article_sha changes,
+# so the drift ledger can say "the parser schema changed" instead of reporting
+# every article in the corpus as edited by DDO. Schema 1 hashed the whole entry
+# dict, derived indexes and provenance included, so any parser refactor reset the
+# whole ledger; schema 2 hashes content only.
+ARTICLE_SHA_SCHEMA = 2
+
 # field -> get_text separator. Source of truth: 02_generate_entries.py line refs.
 SEP = {
     # space-joined (definition 388/388 space vs 330 nosep; etymology 49/49 vs 0)

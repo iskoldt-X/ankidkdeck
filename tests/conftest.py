@@ -53,6 +53,22 @@ requires_fixtures = pytest.mark.skipif(not fixtures_available(),
                                        reason=NO_FIXTURES_REASON)
 
 
+@pytest.fixture
+def fixtures_env(monkeypatch):
+    """For tests that run a full stage-70 export.
+
+    G-SEP is an EXPORT gate now, and "fixtures unavailable" is a FAILURE there
+    on purpose: a release host that cannot check the separator table has not
+    checked it. So a test that drives s70_export.run() to completion needs the
+    fixture set, and points the gate at it through the same environment variable
+    a release build would use.
+    """
+    if not fixtures_available():
+        pytest.skip(NO_FIXTURES_REASON)
+    monkeypatch.setenv("ANKIDKDECK_FIXTURES", str(FIXTURES_DIR))
+    return FIXTURES_DIR
+
+
 # --------------------------------------------------------------------------
 # config / registry
 # --------------------------------------------------------------------------

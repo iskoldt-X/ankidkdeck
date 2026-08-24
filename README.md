@@ -117,7 +117,12 @@ This repository contains **code only**.
   which are gitignored, and so are the test fixtures built from it.
 - The tracked exception is `src/ankidkdeck/registry/*.json`: word identities and
   hand-curated rules (which lemma a form belongs to, which parts of speech are
-  demoted, gate baselines). No DDO text.
+  demoted, gate baselines, the part-of-speech label table). No DDO text.
+  `pos_translations.json` is what makes an `.apkg` buildable with no LLM call at
+  all: the ~20 `data-pos-key` values in four languages are hand-written
+  grammatical vocabulary, not machine output. A `pos_key` no source covers fails
+  `G-COV` loudly instead of shipping an unlabelled group, and
+  `work/json/translations/<lang>/pos.json` still overrides any row.
 - The decks you build are for your own study. Do not redistribute them. You are
   responsible for complying with DDO's
   [terms of use](https://ordnet.dk/copyright), and the frequency list comes from
@@ -147,7 +152,21 @@ possible without editing the checked-in baselines: building 200 words instead of
 ```
 
 lets the rest of the gates do their job. The overlay lives under `work/`, which
-is gitignored, so it can never be mistaken for a released baseline.
+is gitignored, so it can never be mistaken for a released baseline. Nested
+objects are merged one level deeper, so an overlay naming a single
+`empty_rate_baseline_pct` field keeps the other four.
+
+Gate rows are keyed on `(id, stage, scope)`, and the export-time gates carry the
+language as their scope. A passing German export therefore cannot overwrite a
+failing Chinese row, and `ankidkdeck gates` exits non-zero if ANY recorded row
+fails.
+
+**`export` needs the test fixtures.** `G-SEP` re-runs the golden separator
+comparison at export time -- a one-character drift in the extraction table
+silently invalidates every existing translation cell, and its symptom is a big
+translation bill rather than a blocked build. "Fixtures unavailable" is recorded
+as a FAILURE, not skipped: point `ANKIDKDECK_FIXTURES` at them, or keep them in
+`work/fixtures`.
 
 ## Tests
 
@@ -159,7 +178,10 @@ ANKIDKDECK_FIXTURES=work/fixtures python -m pytest tests   # + golden tests
 
 The golden tests need saved DDO pages, which cannot be committed; build them on
 the machine that holds the corpus with `tools/build_fixtures.py`. Without them
-those modules skip and say so.
+those modules skip and say so. The builder takes either directories of
+human-named pages (`--pages`) or the pipeline's own crawl corpus
+(`--work <workspace>`, reading `raw/<sha1>.html` plus `json/fetch_ledger.json`),
+which is how the fixture set grows past a handful of hand-saved pages.
 
 ## Upgrading from a previous run
 

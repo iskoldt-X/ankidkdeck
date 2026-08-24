@@ -19,8 +19,39 @@ FILES = [
     "alias_pairs.json",
     "demoted_pos_keys.json",
     "paradigm_slots.json",
+    "pos_translations.json",
     "gates.json",
 ]
+
+
+def _merge_dicts(base: dict, extra: dict) -> dict:
+    """Overlay `extra` onto `base`, recursing into nested DICTS only.
+
+    A shallow `{**base, **extra}` made every advertised partial overlay a trap: a
+    work/registry/gates.json that touches `empty_rate_baseline_pct` at all
+    replaced the whole 5-field baseline dict with whatever it named, and a
+    pos_translations overlay adding one Chinese term would drop the other 21.
+
+    A nested LIST is replaced, not appended: `note_count_range: [1, 10]` means
+    that range, not "2800, 3100, 1 and 10". Appending is the right rule only for
+    a whole registry file that IS a list (alias_pairs, demoted_pos_keys), which
+    _merge() handles one level up.
+    """
+    out = dict(base)
+    for k, v in extra.items():
+        if isinstance(base.get(k), dict) and isinstance(v, dict):
+            out[k] = _merge_dicts(base[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def _merge(base, extra):
+    if isinstance(base, dict) and isinstance(extra, dict):
+        return _merge_dicts(base, extra)
+    if isinstance(base, list) and isinstance(extra, list):
+        return base + [x for x in extra if x not in base]
+    return extra
 
 
 def _package_default(name: str):
@@ -40,11 +71,7 @@ class Registry:
             base = _package_default(name)
             local = Path(cfg.registry_local) / name
             if local.exists():
-                extra = read_json(local)
-                if isinstance(base, dict) and isinstance(extra, dict):
-                    base = {**base, **extra}
-                elif isinstance(base, list) and isinstance(extra, list):
-                    base = base + [x for x in extra if x not in base]
+                base = _merge(base, read_json(local))
             self.data[name.removesuffix(".json")] = base
 
     @property
@@ -70,6 +97,25 @@ class Registry:
     def paradigm_labels(self, pos_key: str | None, shape: tuple) -> list | None:
         key = f"{pos_key}|{','.join(str(n) for n in shape)}"
         return self.data["paradigm_slots"].get(key)
+
+    @property
+    def pos_translations(self) -> dict:
+        """{lang: {pos_key: translated}} -- hand-written, human-reviewed, and
+        the reason an .apkg can be built with no LLM call at all.
+
+        The ~14 live `data-pos-key` values x 4 languages are a table a
+        lexicographer can write in an afternoon; without it G-COV blocked every
+        export until someone paid for a Gemini POS call, which made the offline
+        deck hostage to an API key. The 2025 `pos_translations_*_gemini.json`
+        (41 mangled display strings) is deliberately NOT reused -- guide 1.11f.
+
+        Keys starting with "_" are file-level documentation, not languages.
+        """
+        return {k: v for k, v in (self.data.get("pos_translations") or {}).items()
+                if not str(k).startswith("_")}
+
+    def pos_for(self, lang: str) -> dict:
+        return dict(self.pos_translations.get(lang) or {})
 
     @property
     def gates(self) -> dict:

@@ -21,10 +21,10 @@ word) pairs differ only by case -- ('Er','er') at rank 1.
 from collections import defaultdict
 
 from ..config import Config
-from ..gates import (G_ANCHOR, G_ASSIGN, G_RANK, G_REGKEY, G_SEED, Gate,
-                     anchors_not_demoted_or_affix, dense_unique_ranks,
-                     registry_family_ids, registry_seed_bytes, run_gates,
-                     unique_assignment)
+from ..gates import (G_ANCHOR, G_ASSIGN, G_CASE, G_RANK, G_REGKEY, G_SEED, Gate,
+                     anchors_not_demoted_or_affix, case_only_members,
+                     dense_unique_ranks, registry_family_ids,
+                     registry_seed_bytes, run_gates, unique_assignment)
 from ..util import NFC, FatalError, nk, read_json, sha256_str, write_json
 from .s22_classify import BUCKET_ORDER, squash
 
@@ -205,14 +205,52 @@ def run(cfg: Config, registry) -> dict:
     comps.sort(key=lambda c: (c["words"], c["entry_ids"]))
 
     # ---- 2. family_id and anchor ----------------------------------------
-    def anchor_of(eids: list[str]) -> str:
-        """DEMOTION FIRST, then sense count. With sense count first a demoted
-        article outranked a real one whenever it had more senses -- Cm(symbol, 4
-        senses) beat centimeter(sb., 1 sense) -- and G-ANCHOR then failed the
-        whole build on a tie-break accident rather than on a defect. With this
-        key demoted_anchored_with_alternative is unreachable by construction."""
+    def edge_bucket(word: str, eid: str) -> str | None:
+        """The classifier's verdict on this exact (word, article) pair."""
+        for m in ((classification.get(word) or {}).get("members") or []):
+            if m["entry_id"] == eid:
+                return m.get("bucket")
+        return None
+
+    def best_bucket(words: list[str], eid: str) -> int:
+        """The best (lowest) classifier bucket any of the family's words gave
+        this article. 99 when no word claims it as a member."""
+        ranks = [BUCKET_ORDER.get(edge_bucket(w, eid), 99) for w in words]
+        return min(ranks) if ranks else 99
+
+    def anchor_of(eids: list[str], words: list[str]) -> str:
+        """The card headline, in the guide's own order (4.8).
+
+        Key, after the non-empty filter:
+          1. NOT DEMOTED. With sense count first a demoted article outranked a
+             real one whenever it had more senses -- Cm(symbol, 4 senses) beat
+             centimeter(sb., 1 sense) -- and G-ANCHOR then failed the whole build
+             on a tie-break accident rather than on a defect. With demotion first
+             demoted_anchored_with_alternative is unreachable by construction.
+          2. BEST CLASSIFIER BUCKET (exact_cs > form > variant > exact_ci). Guide
+             4.8 rules that bucket order decides the headline, Variants and
+             Etymology, because stage 70 reads them off sorted_entries[0]. Without
+             it `uden for` (praep., variant bucket, 4 senses) headed the card for
+             `udenfor` (exact_cs, 3 senses) -- the card face showed a spelling no
+             wordlist word has.
+          3. THE WORDLIST SPELLING. Tie-break within a bucket: prefer the article
+             whose own lemma IS the family's lowest-rank member word.
+          4. sense count, then the lowest entry_id (oldest DDO article).
+
+        `var`/`VAR` is deliberately NOT fixed here: the `var` adjective has 0
+        senses, so it is `empty` and the filter one line below excludes it.
+        Forcing an empty article to anchor would hand the family id, the
+        Etymology field and a header-only meaning block to an article with
+        nothing to render. That family's content genuinely belongs to a different
+        spelling -- information for a human, which is what
+        review/case_only_members.json is for.
+        """
+        lead = min(words, key=lambda w: (wrank.get(w, 10 ** 9), w)) if words else ""
+        lead_key = nk(lead)
         ranked = [e for e in eids if not entries[e]["empty"]] or list(eids)
         return max(ranked, key=lambda e: (not demoted(e),
+                                          -best_bucket(words, e),
+                                          entries[e]["lemma_key"] == lead_key,
                                           len(entries[e]["senses"]), -int(e)))
 
     families: dict[str, dict] = {}
@@ -220,7 +258,7 @@ def run(cfg: Config, registry) -> dict:
     for comp in comps:
         if not comp["entry_ids"]:
             continue
-        anchor = anchor_of(comp["entry_ids"])
+        anchor = anchor_of(comp["entry_ids"], comp["words"])
         fid = anchor
         if fid in families:
             # Components have pairwise-disjoint entry sets (union-find gives
@@ -365,6 +403,59 @@ def run(cfg: Config, registry) -> dict:
                                    key=lambda f: (f["rank"], str(f["family_id"]))), 1):
         fam["freq_rank"] = i
 
+    # ---- 6b. the case-only membership population, as a REVIEWED artifact ----
+    # Bucket 4 (exact_ci) is card membership on purpose: making it xref-only
+    # would delete `I` (pron., 2 senses + 7 expressions) from the deck, because
+    # no wordlist word reaches it -- the wordlist's only capitalised entries are
+    # names (Jack, Dr, Mrs, David...). The anchor rule above keeps such an
+    # article from heading the card, which was the real risk. What remains is a
+    # content change a human should see once: ~55 (headword, wordlist word) pairs
+    # that differ only by case, plus the `var`/`VAR` class where the family's
+    # whole content sits under a different spelling. Written out, and the COUNT
+    # baselined in registry/gates.json so the population cannot grow silently.
+    # The population is per EDGE, not per word: `i` matches i(praep.) exactly AND
+    # I(pron.) by case only, and it is the second edge that changes what the card
+    # shows. Two row kinds, both reviewable:
+    #   case_only_member  a (word, article) pair admitted through bucket 4
+    #   anchor_spelling   the anchor's own lemma differs from the family's
+    #                     lowest-rank member word by case only (var/VAR)
+    case_only = []
+    for fid in sorted(families):
+        fam = families[fid]
+        lemma = fam["lemma"]
+        own = set(fam["entry_ids"])
+        for m in fam["members"]:
+            word = m["word"]
+            for x in ((classification.get(word) or {}).get("members") or []):
+                eid = x["entry_id"]
+                if eid not in own or x.get("bucket") != "exact_ci":
+                    continue
+                case_only.append({
+                    "kind": "case_only_member", "family_id": fid,
+                    "anchor_lemma": lemma, "word": word, "entry_id": eid,
+                    "member_lemma": entries[eid]["lemma"],
+                    "pos_key": entries[eid].get("pos_key"),
+                    "senses": len(entries[eid]["senses"]),
+                    "wiktionary_rank": m.get("wiktionary_rank"),
+                    "why": "this article joins the family only through a "
+                           "case-only (exact_ci) match, so its meaning block "
+                           "appears on a card the wordlist reached under a "
+                           "different capitalisation"})
+            if nk(lemma) == nk(word) and NFC(lemma) != NFC(word):
+                case_only.append({
+                    "kind": "anchor_spelling", "family_id": fid,
+                    "anchor_lemma": lemma, "word": word,
+                    "wiktionary_rank": m.get("wiktionary_rank"),
+                    "why": "the anchor article's own spelling differs from the "
+                           "wordlist word by case only, so the meaning-block "
+                           "header and the Etymology field come from a "
+                           "capitalisation the wordlist does not have"})
+    write_json(cfg.review_dir / "case_only_members.json", case_only)
+    report["case_only_members"] = len(case_only)
+    report["case_only_members_by_kind"] = {
+        k: sum(1 for r in case_only if r["kind"] == k)
+        for k in ("case_only_member", "anchor_spelling")}
+
     # ---- 7. sitemap homograph shortfall (report only at this stage) --------
     # Enforced at export (G-SITEMAP) and reported by phase C, where a shortfall
     # can actually be remedied by a fetch. Compared against max(homographs) or
@@ -421,6 +512,12 @@ def run(cfg: Config, registry) -> dict:
                                          list(families)), stage="30"),
         Gate(G_REGKEY, "every card_keys.json family_id is a bare DDO entry_id",
              lambda: registry_family_ids(proposed), stage="30"),
+        Gate(G_CASE, "the case-only family membership population "
+                     "(review/case_only_members.json) is inside its baseline",
+             lambda: case_only_members(
+                 case_only,
+                 int(registry.gates.get("case_only_members_max", 80))),
+             stage="30"),
     ], cfg, stage="30")
 
     # ---- 9. FREEZE the registry, then write the outputs -------------------
@@ -457,8 +554,10 @@ def run(cfg: Config, registry) -> dict:
         "sitemap_shortfall_families": len(shortfall),
         "sitemap_lemmas_rejected_wholesale": len(rejected_lemmas),
         "sitemap_shortfall": shortfall[:200],
+        "case_only_members_sample": case_only[:25],
     })
     write_json(cfg.report_dir / "merge_report.json", report)
     return {k: v for k, v in report.items()
             if k not in ("sitemap_shortfall", "unplaced_sample",
-                         "words_off_wordlist", "dropped_components_sample")}
+                         "words_off_wordlist", "dropped_components_sample",
+                         "case_only_members_sample")}

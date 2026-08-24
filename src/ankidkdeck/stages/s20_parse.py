@@ -13,7 +13,8 @@ from bs4 import BeautifulSoup
 
 from .. import extract
 from ..config import Config
-from ..extract import cell_alternatives, is_tag
+from ..extract import ARTICLE_SHA_SCHEMA, cell_alternatives, is_tag
+from ..gates import G_LABEL, Gate, ledger_label_reconciliation, run_gates
 from ..util import (FatalError, NFC, canonical_json, collapse_ws, nk,
                     read_json, sha256_str, write_json)
 from .s12_download import Ledger, raw_path
@@ -74,6 +75,36 @@ ORDDANNELSE_MAP = {
     "Øvrige": "Øvrige",
     "Ovrige": "Øvrige",
 }
+
+
+# article_sha is the DDO-EDIT DETECTOR, so it must hash the article's CONTENT and
+# nothing else. Schema 1 hashed canonical_json(entry) whole, which meant it also
+# hashed:
+#   headword_glued   provenance, never rendered
+#   paradigm_index   derived from paradigm.rows
+#   form_index       derived from paradigm.rows + lemma + alt_spellings
+#   source_words     which of OUR queries happened to reach the article
+#   slot_label       a registry lookup, i.e. OUR table and not DDO's page
+# so renaming a derived field or editing registry/paradigm_slots.json reported
+# every one of the 3,812 articles as "changed since last run" -- the exact line a
+# human reads as "DDO moved". Excluded here, and the schema number is stamped in
+# the ledger so a future change prints "parser schema changed" instead.
+SHA_EXCLUDE_FIELDS = ("headword_glued", "paradigm_index", "form_index",
+                      "source_words", "article_sha")
+SHA_EXCLUDE_PARADIGM_ROW_FIELDS = ("slot_label",)
+
+
+def content_sha(e: dict) -> str:
+    """sha256 over the article's CONTENT fields only. See SHA_EXCLUDE_FIELDS."""
+    payload = {k: v for k, v in e.items() if k not in SHA_EXCLUDE_FIELDS}
+    par = e.get("paradigm") or {}
+    payload["paradigm"] = {
+        "short": par.get("short"),
+        "rows": [{k: v for k, v in row.items()
+                  if k not in SHA_EXCLUDE_PARADIGM_ROW_FIELDS}
+                 for row in par.get("rows", [])],
+    }
+    return sha256_str(canonical_json(payload))
 
 
 def slice_articles(soup):
@@ -424,7 +455,7 @@ def parse_article(eid: str, scope, art, registry, report: dict) -> dict:
 
     e["empty"] = not e["senses"] and not e["expressions"]
     # 0-sense articles are real (godte2, vinge2); kept, marked, never rendered.
-    e["article_sha"] = sha256_str(canonical_json(e))
+    e["article_sha"] = content_sha(e)
     return e
 
 
@@ -433,6 +464,7 @@ def run(cfg: Config, registry) -> dict:
     entries: dict[str, dict] = {}
     provenance: dict[str, list] = {}
     report: dict = {}
+    parsed_counts: dict[str, int] = {}
     n_pages = 0
     for word, led in sorted(ledger.data.items()):
         if led.get("status") != "ok":
@@ -452,6 +484,7 @@ def run(cfg: Config, registry) -> dict:
                     {"entry_id": eid, "word": word})
             entries[eid] = parsed
             provenance.setdefault(eid, []).append(word)
+        parsed_counts[word] = n
         if n != led.get("article_count"):
             raise FatalError(
                 f"page for {word!r}: parsed {n} articles, ledger says {led.get('article_count')}")
@@ -462,8 +495,26 @@ def run(cfg: Config, registry) -> dict:
         raise FatalError("no entries parsed -- is the crawl done?")
     for eid, words in provenance.items():
         entries[eid]["source_words"] = sorted(set(words))
+
+    # G-LABEL as a RECORDED verdict. The reconciliation rule itself has always
+    # run (s12.verdict_of, and the per-page FatalError above), but its result
+    # never reached gates_report.json, so a release could not show that the
+    # crawl's own checksum held. Runs before entries.json is written, like every
+    # other gate in this pipeline.
+    gates_cfg = getattr(registry, "gates", {}) or {}
+    run_gates([
+        Gate(G_LABEL, "every ok page's #results-label reconciles with its "
+                      "article count, the parse agrees, and the error-page "
+                      "population is inside its baseline",
+             lambda: ledger_label_reconciliation(
+                 ledger.data, parsed_counts,
+                 float(gates_cfg.get("label_error_max_rate", 0.01))),
+             stage="20"),
+    ], cfg, stage="20")
+
     write_json(cfg.json_dir / "entries.json", entries)
     report.update({"pages_parsed": n_pages, "entries": len(entries),
+                   "article_sha_schema": ARTICLE_SHA_SCHEMA,
                    "empty_entries": sum(1 for e in entries.values() if e["empty"])})
     write_json(cfg.report_dir / "parse_report.json", report)
     return report

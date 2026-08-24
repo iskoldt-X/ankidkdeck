@@ -262,12 +262,18 @@ def test_a_variant_or_case_only_member_is_not_refused_as_a_second_head(cfg,
     assert report["dropped_components"] == 0
     assert read_json(cfg.review_dir / "merge_conflicts.json") == []
     fams = read_json(cfg.json_dir / "words.json")
-    # udenfor's 4 spaced senses reach the card
-    uf = fams["12003754"]      # 4 senses beats 3, both non-demoted
+    # THE BUCKET DECIDES THE HEADLINE (guide 4.8). `uden for` is the variant
+    # bucket with 4 senses and `udenfor` is exact_cs with 3; sense count used to
+    # win, so the card face showed a spelling no wordlist word has.
+    uf = fams["12003753"]
+    assert uf["lemma"] == "udenfor"
     assert sorted(uf["entry_ids"]) == ["12003753", "12003754"]
     assert [m["word"] for m in uf["members"]] == ["udenfor"]
-    # ...and I(pron.) reaches the `i` card instead of no card at all
+    assert "12003754" not in fams
+    # ...and I(pron.) reaches the `i` card instead of no card at all, anchored on
+    # the exact_cs preposition rather than the exact_ci pronoun.
     fi = fams["11022727"]
+    assert fi["lemma"] == "i"
     assert sorted(fi["entry_ids"]) == ["11022727", "11022728"]
     # a genuinely different lemma is STILL refused
     hav = make_entry("11000600", "hav", pos_key="sb.",
@@ -283,6 +289,124 @@ def test_a_variant_or_case_only_member_is_not_refused_as_a_second_head(cfg,
                     v2_querywords={})
     report2 = merge_run(cfg, registry)
     assert report2["refused_components"] == 1
+
+
+def test_the_bucket_decides_the_anchor_before_the_sense_count(cfg, registry):
+    """Guide 4.8: "bucket ORDER decides the card headline, Variants and
+    Etymology, because 09 uses primary_entry = sorted_entries[0]".
+
+    Measured defect: `uden for` (praep., variant bucket, 4 senses) headed the
+    card for `udenfor` (exact_cs, 3 senses), so the card face showed a spelling
+    no wordlist word has -- and Etymology came from the wrong article.
+    """
+    solid = make_entry("12003753", "udenfor", pos_key="adv.",
+                       senses=[make_sense("2100150%d" % i, "udenfor %d" % i)
+                               for i in range(3)],
+                       source_words=["udenfor"])
+    spaced = make_entry("12003754", "uden for", pos_key="præp.",
+                        senses=[make_sense("2100151%d" % i, "uden for %d" % i)
+                                for i in range(4)],
+                        source_words=["udenfor"])
+    entries = {e["entry_id"]: e for e in (solid, spaced)}
+    write_workspace(cfg, entries, [(585, "udenfor")],
+                    classification={"udenfor": _c(
+                        _members("12003753", "exact_cs"),
+                        _members("12003754", "variant"))},
+                    v2_querywords={"udenfor": 585})
+    merge_run(cfg, registry)
+    fams = read_json(cfg.json_dir / "words.json")
+    assert list(fams) == ["12003753"]
+    assert fams["12003753"]["lemma"] == "udenfor"
+    assert fams["12003753"]["display_headword"] == "udenfor"
+
+
+def test_the_wordlist_spelling_breaks_a_tie_inside_a_bucket(cfg, registry):
+    """Third key: two exact_cs articles with the same sense count, one of which
+    IS the family's lowest-rank member word."""
+    other = make_entry("11000801", "have", pos_key="sb.",
+                       senses=[make_sense("21001600", "en have")],
+                       source_words=["haven"])
+    own = make_entry("11000802", "haven", pos_key="sb.",
+                     senses=[make_sense("21001601", "haven")],
+                     source_words=["haven"])
+    entries = {e["entry_id"]: e for e in (other, own)}
+    write_workspace(cfg, entries, [(50, "haven")],
+                    classification={"haven": _c(_members("11000802", "exact_cs"),
+                                                _members("11000801", "form"))},
+                    v2_querywords={})
+    merge_run(cfg, registry)
+    fams = read_json(cfg.json_dir / "words.json")
+    assert list(fams) == ["11000802"]
+    assert fams["11000802"]["lemma"] == "haven"
+
+
+def test_case_only_memberships_are_written_out_and_baselined(cfg, registry):
+    """Bucket 4 is card membership on purpose -- making it xref-only would delete
+    `I`(pron., a real word) from the deck. What remains is a content change a
+    human should see once, so the rows are an artifact and the COUNT is
+    baselined."""
+    lower = make_entry("11022727", "i", pos_key="præp.",
+                       senses=[make_sense("21001700", "inde i")],
+                       source_words=["i"])
+    upper = make_entry("11022728", "I", pos_key="pron.",
+                       senses=[make_sense("21001701", "2. person flertal")],
+                       source_words=["i"])
+    entries = {e["entry_id"]: e for e in (lower, upper)}
+    write_workspace(cfg, entries, [(5, "i")],
+                    classification={"i": _c(_members("11022727", "exact_cs"),
+                                            _members("11022728", "exact_ci"))},
+                    v2_querywords={"i": 5})
+    report = merge_run(cfg, registry)
+    rows = read_json(cfg.review_dir / "case_only_members.json")
+    assert report["case_only_members"] == len(rows) == 1
+    row = rows[0]
+    assert row["kind"] == "case_only_member"
+    assert (row["word"], row["member_lemma"]) == ("i", "I")
+    assert row["family_id"] == "11022727"
+    gates = read_json(cfg.report_dir / "gates_report.json")
+    case = [r for r in gates["results"] if r["id"] == "G-CASE"][0]
+    assert case["ok"] is True and case["detail"]["rows"] == 1
+
+
+def test_the_case_only_population_cannot_grow_past_its_baseline(cfg, registry):
+    lower = make_entry("11022727", "i", pos_key="præp.",
+                       senses=[make_sense("21001800", "inde i")],
+                       source_words=["i"])
+    upper = make_entry("11022728", "I", pos_key="pron.",
+                       senses=[make_sense("21001801", "2. person flertal")],
+                       source_words=["i"])
+    write_workspace(cfg, {e["entry_id"]: e for e in (lower, upper)},
+                    [(5, "i")],
+                    classification={"i": _c(_members("11022727", "exact_cs"),
+                                            _members("11022728", "exact_ci"))},
+                    v2_querywords={})
+    from ankidkdeck.registry import Registry
+    from ankidkdeck.util import write_json
+    write_json(cfg.registry_local / "gates.json", {"case_only_members_max": 0})
+    with pytest.raises(FatalError) as exc:
+        merge_run(cfg, Registry(cfg))
+    assert "G-CASE" in str(exc.value)
+
+
+def test_an_anchor_whose_spelling_differs_only_by_case_is_recorded(cfg, registry):
+    """The var/VAR class: the family's content belongs to a different
+    capitalisation from the wordlist word. Information for a human, not a
+    tie-break -- forcing the empty article to anchor would put an article with
+    nothing to render in charge of family_id and Etymology."""
+    acronym = make_entry("49002989", "VAR", pos_key="sb.",
+                         senses=[make_sense("21001900", "video assistant "
+                                                        "referee")],
+                         source_words=["var"])
+    entries = {acronym["entry_id"]: acronym}
+    write_workspace(cfg, entries, [(10, "var")],
+                    classification={"var": _c(_members("49002989", "exact_ci"))},
+                    v2_querywords={"var": 10})
+    merge_run(cfg, registry)
+    rows = read_json(cfg.review_dir / "case_only_members.json")
+    kinds = {r["kind"] for r in rows}
+    assert kinds == {"case_only_member", "anchor_spelling"}
+    spelling = [r for r in rows if r["kind"] == "anchor_spelling"][0]
+    assert (spelling["anchor_lemma"], spelling["word"]) == ("VAR", "var")
 
 
 def test_anchor_prefers_a_non_demoted_article_over_sense_count(cfg, registry):

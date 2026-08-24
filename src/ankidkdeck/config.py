@@ -1,9 +1,12 @@
 """Configuration: CLI args + optional ankidkdeck.toml + defaults. No source-code
 constants to edit -- that was the v1/v2 workflow this package retires."""
 
+import dataclasses
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .util import FatalError
 
 LANGS_DEFAULT = ["Chinese", "English", "German", "Spanish"]
 
@@ -78,18 +81,45 @@ class Config:
         return self.work_dir / "review"
 
 
+def settable_fields() -> list[str]:
+    """The names a TOML file may set: the dataclass FIELDS, never every
+    attribute `hasattr` answers True for.
+
+    `expressions_model`, `raw_dir`, `json_dir`, `audio_dir`, `report_dir`,
+    `registry_local` and `review_dir` are read-only properties, and hasattr() is
+    True for all of them -- so `json_dir = "..."` in a config file raised a bare
+    `AttributeError: property 'json_dir' has no setter` out of main(), which only
+    catches FatalError. `expressions_model` is the likely typo (the settable
+    field is gemini_model_expressions).
+    """
+    return [f.name for f in dataclasses.fields(Config)]
+
+
+def _apply(cfg: Config, data: dict, source: str) -> None:
+    allowed = settable_fields()
+    for k, v in data.items():
+        if k in allowed:
+            setattr(cfg, k, v)
+            continue
+        hint = ""
+        if isinstance(getattr(type(cfg), k, None), property):
+            hint = (" -- that is a derived, read-only property, not a setting"
+                    + (" (did you mean gemini_model_expressions?)"
+                       if k == "expressions_model" else ""))
+        raise FatalError(
+            "unknown setting %r in %s%s. Accepted keys: %s"
+            % (k, source, hint, ", ".join(allowed)))
+
+
 def load_config(path: Path | None = None, **overrides) -> Config:
     cfg = Config()
     toml_path = path or Path("ankidkdeck.toml")
     if toml_path.exists():
         with open(toml_path, "rb") as f:
             data = tomllib.load(f)
-        for k, v in data.items():
-            if hasattr(cfg, k):
-                setattr(cfg, k, v)
-    for k, v in overrides.items():
-        if v is not None and hasattr(cfg, k):
-            setattr(cfg, k, v)
+        _apply(cfg, data, str(toml_path))
+    _apply(cfg, {k: v for k, v in overrides.items() if v is not None},
+           "the command line")
     cfg.work_dir = Path(cfg.work_dir)
     cfg.dist_dir = Path(cfg.dist_dir)
     if cfg.legacy_workspace:

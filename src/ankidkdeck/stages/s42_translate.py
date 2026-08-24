@@ -39,13 +39,21 @@ import os
 import time
 
 from ..config import Config
+from ..extract import ARTICLE_SHA_SCHEMA
 from ..gates import G_ORPH, Gate, run_gates
 from ..util import NFC, FatalError, read_json, sha256_str, write_json
 
 MAX_DEFS_PER_BATCH = 20        # 05: one call per entry, capped
 MAX_EXPR_PER_BATCH = 20        # 06: MAX_EXPR_PER_BATCH
 MAX_RETRIES = 5
-MAX_CORRECTION_ATTEMPTS = 3    # 06: review -> correct rounds before giving up
+# 06's review -> correct rounds. v2.1 retried up to 5 times before giving up on
+# an entry; 3 rounds with no backoff meant one flaky response aborted a paid
+# multi-hour run (measured: 64 calls spent before the contamination FATAL).
+MAX_CORRECTION_ATTEMPTS = 5
+# The same ladder for a violated COUNT LOCK. A short array is a dropped sense,
+# never something to zip anyway -- but it is also the classic transient, and
+# FATALing on the first one throws away every call already paid for in the run.
+MAX_COUNT_LOCK_ATTEMPTS = 5
 BASE_RETRY_DELAY = 5
 DEF_REQUEST_INTERVAL = 2.1     # 05: 10 RPM free tier
 EXPR_REQUEST_INTERVAL = 5.0    # 06: 30 RPM free tier, two calls per batch
@@ -93,18 +101,33 @@ def expression_hint(expr: dict) -> str:
     return ""
 
 
-def renderable_scope(cfg: Config, entries: dict, families: dict) -> tuple[set, dict]:
+def renderable_scope(cfg: Config, entries: dict, families: dict,
+                     include_unused: bool = False) -> tuple[set, dict]:
     """The entry_ids a card will actually show.
 
     Deviation from the guide's pseudocode, deliberate: it iterates every parsed
     entry, which would pay for articles the classifier rejected and the export
     never renders. G-COV is defined over renderable senses, so the scope that
-    the gate checks is the scope the bill should quote. When words.json does not
-    exist yet the scope falls back to every entry, and the report says so.
+    the gate checks is the scope the bill should quote.
+
+    Falling back to "every parsed entry" when words.json is absent is now behind
+    an explicit flag. Measured on the fixture corpus the fallback quotes 57 cells
+    instead of 17 -- 3.4x, all of it on articles the classifier rejected and the
+    exporter will never render -- and the docstring saying so is not a refusal to
+    spend. Running the merge stage first is the answer; --include-unused is for
+    the deliberate case.
     """
     if not families:
+        if not include_unused:
+            raise FatalError(
+                "no %s: the translation scope is the set of entries a card will "
+                "actually render, and without words.json every rejected article "
+                "would be billed too (measured 3.4x on the fixture corpus). Run "
+                "the merge stage first, or pass --include-unused to bill every "
+                "parsed entry on purpose." % (cfg.json_dir / "words.json"))
         return set(entries), {"basis": "all parsed entries",
-                              "why": "words.json not found; run the merge stage first"}
+                              "why": "words.json not found and --include-unused "
+                                     "was given: rejected articles ARE billed"}
     scope = {eid for fam in families.values() for eid in fam.get("entry_ids", [])
              if eid in entries}
     return scope, {"basis": "renderable families (words.json)",
@@ -116,17 +139,47 @@ def pos_keys_in_scope(entries: dict, scope) -> list:
                    if entries[eid].get("pos_key")})
 
 
+def _restore_from_archive(kind: str, key: str, sha, have: dict, archive: dict,
+                          restored: list) -> bool:
+    """A sense that comes back after a DDO edit must not be paid for twice.
+
+    gc() moves a dead row into archive.json and its docstring has always claimed
+    this property (guide D7) -- but nothing anywhere read archive.json back, so
+    the property was not implemented: remove a sense, run translate (archived),
+    put it back, run translate again, and the cell was billed a second time.
+
+    Restoring is conditional on the SOURCE TEXT being unchanged: the archived
+    gloss was produced from a specific Danish string, and src_sha is that string.
+    A row whose sha no longer matches stays archived and is billed as changed.
+    """
+    if archive is None:
+        return False
+    row = (archive.get(kind) or {}).get(key)
+    if row is None or row.get("src_sha") != sha:
+        return False
+    have[key] = dict(row)
+    restored.append({"kind": kind, "key": key,
+                     "provenance": row.get("provenance")})
+    return True
+
+
 def compute_todo(cfg: Config, entries: dict, translations: dict, lang: str,
-                 scope=None) -> list:
+                 scope=None, archive: dict | None = None,
+                 restored: list | None = None) -> list:
     """Cells that are missing, or whose Danish source text has changed.
 
     One row per cell: {key, kind, entry_id, lemma, pos_text, dannetid, text,
     hint, src_sha, reason}. Empty definition texts are not cells -- there is
     nothing to translate and the exporter does not render them.
+
+    A key that is missing from the live table but present in archive.json with
+    the SAME src_sha is restored into the live table (in place, so the caller
+    persists it) and is not billed.
     """
     scope = set(entries) if scope is None else set(scope)
     have_defs = translations.get("definitions") or {}
     have_exprs = translations.get("expressions") or {}
+    restored = [] if restored is None else restored
     todo = []
     for eid in sorted(scope):
         e = entries.get(eid)
@@ -138,6 +191,10 @@ def compute_todo(cfg: Config, entries: dict, translations: dict, lang: str,
                 continue
             key = definition_key(eid, s)
             row = have_defs.get(key)
+            if row is None and _restore_from_archive(
+                    "definitions", key, s.get("src_sha"), have_defs, archive,
+                    restored):
+                row = have_defs.get(key)
             reason = None
             if row is None:
                 reason = "missing"
@@ -157,6 +214,9 @@ def compute_todo(cfg: Config, entries: dict, translations: dict, lang: str,
                 continue
             sha = expression_src_sha(x)
             row = have_exprs.get(key)
+            if row is None and _restore_from_archive(
+                    "expressions", key, sha, have_exprs, archive, restored):
+                row = have_exprs.get(key)
             reason = None
             if row is None:
                 reason = "missing"
@@ -302,7 +362,7 @@ def gc(cfg: Config, lang: str, entries: dict | None = None, scope=None) -> dict:
                               "expressions": len(archive.get("expressions", {}))},
             "rows_live": {"definitions": len(defs), "expressions": len(exprs)},
             "orphans_remaining": orphans,
-            "definitions": defs, "expressions": exprs}
+            "definitions": defs, "expressions": exprs, "archive": archive}
 
 
 def orphans_gate(per_lang: dict):
@@ -612,20 +672,32 @@ def _translate_definition_batch(pool, model, lang, entry_label, rows) -> list:
             "Expecting exactly %d definition objects.\n"
             "Input Definitions JSON:\n%s"
             % (entry_label, n, json.dumps(payload, ensure_ascii=False, indent=2)))
-    time.sleep(DEF_REQUEST_INTERVAL)
-    parsed = _generate(pool, model, definition_prompt(lang, n), user,
-                       definition_schema(n), 0.1, "definition batch %s" % entry_label)
-    out = parsed.get("definitions")
-    # The 2025 count lock, kept verbatim: a short array means the model dropped
-    # a sense, and zipping it would shift every gloss onto the wrong definition.
-    if not isinstance(out, list) or len(out) != n:
-        raise FatalError("definition batch for %s returned %s objects, expected %d"
-                         % (entry_label, len(out) if isinstance(out, list) else out, n))
-    return out
+    last = None
+    # The 2025 count lock, kept verbatim: a short array means the model dropped a
+    # sense, and zipping it would shift every gloss onto the wrong definition. It
+    # is now RETRIED (5x, with backoff, as v2.1 did) before it is fatal: this is
+    # the classic transient, and aborting on the first one throws away every call
+    # already paid for in a multi-hour run.
+    for attempt in range(1, MAX_COUNT_LOCK_ATTEMPTS + 1):
+        time.sleep(DEF_REQUEST_INTERVAL)
+        parsed = _generate(pool, model, definition_prompt(lang, n), user,
+                           definition_schema(n), 0.1,
+                           "definition batch %s" % entry_label)
+        out = parsed.get("definitions")
+        if isinstance(out, list) and len(out) == n:
+            return out
+        last = len(out) if isinstance(out, list) else out
+        print("  count lock: definition batch %s returned %s objects, expected "
+              "%d (attempt %d/%d)"
+              % (entry_label, last, n, attempt, MAX_COUNT_LOCK_ATTEMPTS))
+        time.sleep(BASE_RETRY_DELAY * attempt)
+    raise FatalError(
+        "definition batch for %s returned %s objects, expected %d, after %d "
+        "attempts" % (entry_label, last, n, MAX_COUNT_LOCK_ATTEMPTS))
 
 
 def _translate_expression_batch(pool, model, lang, entry_label, rows) -> list:
-    """06's generate -> review -> correct loop."""
+    """06's generate -> review -> correct loop, with v2.1's retry budget."""
     payload = {str(i): {"expr": r["text"], "hint": r["hint"]}
                for i, r in enumerate(rows)}
     n = len(payload)
@@ -633,6 +705,7 @@ def _translate_expression_batch(pool, model, lang, entry_label, rows) -> list:
             "Please translate the following %d fixed expressions into %s:\n%s"
             % (entry_label, n, lang, json.dumps(payload, ensure_ascii=False, indent=2)))
     detected: list = []
+    short = None
     for attempt in range(1, MAX_CORRECTION_ATTEMPTS + 1):
         correction = ""
         if detected:
@@ -647,9 +720,13 @@ def _translate_expression_batch(pool, model, lang, entry_label, rows) -> list:
                            "expression batch %s" % entry_label)
         items = parsed.get("fixed_expressions")
         if not isinstance(items, list) or len(items) != n:
-            raise FatalError("expression batch for %s returned %s objects, expected %d"
-                             % (entry_label,
-                                len(items) if isinstance(items, list) else items, n))
+            # Same ladder as the definition count lock: retried, not fatal.
+            short = len(items) if isinstance(items, list) else items
+            print("  count lock: expression batch %s returned %s objects, "
+                  "expected %d (attempt %d/%d)"
+                  % (entry_label, short, n, attempt, MAX_CORRECTION_ATTEMPTS))
+            time.sleep(BASE_RETRY_DELAY * attempt)
+            continue
         time.sleep(EXPR_REQUEST_INTERVAL)
         verdict = _generate(pool, model, "", review_prompt(
             lang, json.dumps(items, ensure_ascii=False)), review_schema(), 0.0,
@@ -657,9 +734,11 @@ def _translate_expression_batch(pool, model, lang, entry_label, rows) -> list:
         if not verdict.get("contains_other_languages"):
             return items
         detected = verdict.get("detected_words") or ["unknown"]
+        time.sleep(BASE_RETRY_DELAY * attempt)
     raise FatalError(
-        "expression batch for %s still contaminated after %d correction rounds: %s"
-        % (entry_label, MAX_CORRECTION_ATTEMPTS, detected))
+        "expression batch for %s failed after %d rounds (contamination: %s, "
+        "last short array: %s)"
+        % (entry_label, MAX_CORRECTION_ATTEMPTS, detected, short))
 
 
 def _translate_pos(pool, model, lang, tags: list) -> dict:
@@ -684,32 +763,78 @@ def _provenance(model: str) -> str:
     return "gemini:%s@%s" % (model, datetime.date.today().isoformat())
 
 
-def _drift_report(cfg: Config, entries: dict) -> dict:
+def _drift_report(cfg: Config, entries: dict, write: bool = False) -> dict:
     """Guide 4.10 stage42_retranslate_changed: the article_sha ledger, so a DDO
     edit is detected by content and never by DDO's own lastmod (hus kept
-    lastmod=1995-03-01 across a real content change)."""
+    lastmod=1995-03-01 across a real content change).
+
+    Two round-2 corrections:
+
+      * The ledger is written only on a CONFIRMED run. It used to be rewritten
+        unconditionally, so a bill-only run consumed
+        "entries_changed_since_last_run" and the second dry run reported 0 --
+        and `translate --lang German` then `--lang English` gave the second
+        language a "nothing changed" report. Retranslation is driven by per-sense
+        src_sha, so this only ever affected the human artifact; the human
+        artifact is the whole point of it.
+      * The file carries a SCHEMA number. article_sha's input set changed once
+        (content fields only), and without a schema stamp every entry in the
+        corpus reads as "changed since last run" -- which a human reads as "DDO
+        moved". On a schema bump the report says so and the ledger is re-seeded.
+    """
     path = cfg.json_dir / "ledger" / "content_hashes.json"
-    known = read_json(path, default={})
-    changed = sorted(eid for eid, e in entries.items()
-                     if eid in known and known[eid] != e.get("article_sha"))
-    fresh = sorted(eid for eid in entries if eid not in known)
-    write_json(path, {eid: e.get("article_sha") for eid, e in entries.items()})
-    return {"entries_changed_since_last_run": len(changed),
-            "changed_sample": changed[:20], "entries_new": len(fresh)}
+    raw = read_json(path, default={})
+    if isinstance(raw, dict) and "hashes" in raw:
+        known, schema = raw.get("hashes") or {}, raw.get("schema")
+    else:
+        # Schema 1 wrote a bare {entry_id: sha} map with no version stamp.
+        known, schema = (raw if isinstance(raw, dict) else {}), 1
+    payload = {"schema": ARTICLE_SHA_SCHEMA,
+               "hashes": {eid: e.get("article_sha") for eid, e in entries.items()}}
+    if known and schema != ARTICLE_SHA_SCHEMA:
+        out = {"schema_changed": True, "ledger_schema": schema,
+               "parser_schema": ARTICLE_SHA_SCHEMA,
+               "entries_changed_since_last_run": None,
+               "changed_sample": [], "entries_new": len(entries),
+               "note": "parser schema changed; no drift information for this "
+                       "run. The ledger is re-seeded on the next confirmed run."}
+    else:
+        changed = sorted(eid for eid, e in entries.items()
+                         if eid in known and known[eid] != e.get("article_sha"))
+        fresh = sorted(eid for eid in entries if eid not in known)
+        out = {"schema_changed": False, "parser_schema": ARTICLE_SHA_SCHEMA,
+               "entries_changed_since_last_run": len(changed),
+               "changed_sample": changed[:20], "entries_new": len(fresh)}
+    if write:
+        write_json(path, payload)
+    out["ledger_written"] = bool(write)
+    return out
 
 
 def run(cfg: Config, registry=None, lang: str | None = None,
-        confirm: bool = False, do_gc: bool = True) -> dict:
+        confirm: bool = False, do_gc: bool = True,
+        include_unused: bool = False) -> dict:
     entries = read_json(cfg.json_dir / "entries.json")
     families = read_json(cfg.json_dir / "words.json", default={})
     langs = [lang] if lang else list(cfg.langs)
-    scope, scope_note = renderable_scope(cfg, entries, families)
+    # `german` is not `German`: none of the 22,734 migrated cells are visible
+    # under the lowercase key, so --confirm-spend would pay the full
+    # from-scratch price and write to translations/german/. The CLI checks this
+    # too; the stage checks it because the stage is also called directly.
+    unknown = [lg for lg in langs if lg not in cfg.langs]
+    if unknown:
+        raise FatalError(
+            "unknown language(s) %s. Configured languages are: %s. Add the "
+            "language to `langs` in ankidkdeck.toml before spending on it."
+            % (", ".join(repr(u) for u in unknown), ", ".join(cfg.langs)))
+    scope, scope_note = renderable_scope(cfg, entries, families, include_unused)
     pos_wanted = pos_keys_in_scope(entries, scope)
+    reg_pos = getattr(registry, "pos_translations", None) or {}
 
     report: dict = {"languages": {}, "scope": scope_note, "confirmed": bool(confirm),
                     "model": cfg.gemini_model,
                     "model_expressions": cfg.expressions_model,
-                    "drift": _drift_report(cfg, entries)}
+                    "drift": _drift_report(cfg, entries, write=confirm)}
     bill: dict = {}
     gc_stats: dict = {}
     state: dict = {}
@@ -719,21 +844,38 @@ def run(cfg: Config, registry=None, lang: str | None = None,
         if do_gc:
             g = gc(cfg, lg, entries, scope)
             defs, exprs = g.pop("definitions"), g.pop("expressions")
+            archive = g.pop("archive")
             gc_stats[lg] = g
         else:
             defs = read_json(tdir / "definitions.json", default={})
             exprs = read_json(tdir / "expressions.json", default={})
+            archive = read_json(tdir / "archive.json",
+                               default={"definitions": {}, "expressions": {}})
         pos = read_json(tdir / "pos.json", default={})
+        restored: list = []
         todo = compute_todo(cfg, entries, {"definitions": defs, "expressions": exprs},
-                            lg, scope)
-        pos_todo = [k for k in pos_wanted if k not in pos]
+                            lg, scope, archive=archive, restored=restored)
+        if restored:
+            # A returning sense is un-archived for free, on the DRY path too:
+            # the row already exists and paying for it again is the defect.
+            write_json(tdir / "definitions.json", defs)
+            write_json(tdir / "expressions.json", exprs)
+        # A pos_key the checked-in registry already covers is NOT billed. Stage
+        # 42's POS call still exists for a language the registry does not know,
+        # which is what makes adding a language a no-registry-edit operation.
+        have_pos = set(pos) | set(reg_pos.get(lg) or {})
+        pos_todo = [k for k in pos_wanted if k not in have_pos]
         state[lg] = {"dir": tdir, "defs": defs, "exprs": exprs, "pos": pos,
                      "todo": todo, "pos_todo": pos_todo}
         bill[lg] = bill_row(todo, pos_todo)
+        bill[lg]["restored_from_archive"] = len(restored)
         write_json(cfg.report_dir / ("translate_bill_%s.json" % lg),
                    {"language": lg, "model": cfg.gemini_model,
                     "model_expressions": cfg.expressions_model,
                     "scope": scope_note,
+                    "pos_keys_from_registry": sorted(
+                        set(pos_wanted) & set(reg_pos.get(lg) or {})),
+                    "restored_from_archive_rows": restored[:50],
                     **bill[lg],
                     "cells": [{k: v for k, v in r.items() if k != "hint"}
                               for r in todo]})

@@ -21,8 +21,11 @@ What DID change from v2.1 (guide D10, deliberate and gate-visible):
     ('Er','er') at rank 1.
   * The card front groups by data-pos-key and shows the DDO display string;
     2025's 41 mangled POS strings are not translation keys any more.
-  * Variants carries the paradigm block, the alternative spellings and a hidden
-    searchable-forms span, so Anki search finds the card by any member form.
+  * Variants carries the paradigm block and the alternative spellings, and is
+    honestly EMPTY when there are neither -- AFMT wraps it in a {{#Variants}}
+    section, so a never-empty field printed a bare "Variants:" label. The hidden
+    searchable-forms span that makes Anki search find the card by any member form
+    rides at the end of Content instead, which is rendered unconditionally.
   * A missing translation for a renderable sense is a GATE FAILURE (G-COV), not
     a silently bare definition. That defect shipped 2,007 bare English cards.
   * COPYRIGHT_YEAR comes from config, never datetime.now().year -- that single
@@ -33,6 +36,7 @@ for including it, the owner deferred that change to a later version (2026-08-24)
 """
 
 import json
+import re
 import sqlite3
 import tempfile
 import zipfile
@@ -41,13 +45,29 @@ from pathlib import Path
 
 from ..config import Config
 from ..gates import (G_COV, G_DET, G_EMPTY_C, G_GUID, G_MEDIA, G_NOTE, G_RANK,
-                     G_RATE, G_SEED, G_SITEMAP, Gate, dense_unique_ranks,
-                     registry_seed_bytes, run_gates, sitemap_shortfall)
+                     G_RATE, G_REL, G_SEED, G_SEP, G_SITEMAP, Gate,
+                     dense_unique_ranks, guid_diff_reconciles,
+                     registry_seed_bytes, run_gates, separator_golden,
+                     sitemap_shortfall)
 from ..util import NFC, FatalError, canonical_json, read_json, write_json
 
 FIELD_NAMES = ["QueryWord", "FrontSideSummary", "Content", "Collocations",
                "Variants", "Derivatives", "Etymology", "FrequencyRank"]
 SORT_FIELD_INDEX = 7
+CONTENT_INDEX = FIELD_NAMES.index("Content")
+
+# The hidden searchable-forms span is display:none, so it is not content a human
+# can see -- and both empty-field gates measure what a human sees. Without this,
+# putting the span in a field makes that field permanently non-empty and turns
+# its gate row into a tautology, which is exactly what it did to Variants.
+HIDDEN_SPAN_RE = re.compile(r'<span class="searchable-forms">.*?</span>', re.S)
+
+
+def visible(field_text: str) -> str:
+    """A field's text with the display:none searchable-forms span removed."""
+    return HIDDEN_SPAN_RE.sub("", field_text or "")
+
+
 DEFAULT_POS_KEY = "Uncategorized"       # v2.1's default_pos_key, unchanged
 # The stage-20 schema keys, not raw DDO display text. Oevrige is parsed but not
 # rendered (owner deferred that change, 2026-08-24).
@@ -126,6 +146,14 @@ def deck_meta(lang: str, year: int) -> dict:
 
 # --------------------------------------------------------------------------
 # templates -- v2.1 CSS/QFMT/AFMT verbatim, plus a clearly separated v3 block
+#
+# VERBATIM MEANS BYTE-FOR-BYTE, trailing whitespace included: two CSS lines
+# (`details > summary`) and three AFMT <script> lines carry a trailing space in
+# 09_export_apkg.py, and an editor had stripped them. Inert on the rendered card,
+# but the docstring claimed "verbatim" and it was not true; tests/
+# test_export_parity.py now pins the sha256 of each ported block against
+# `git show v2.1-pipeline:09_export_apkg.py`, so a stripping editor fails CI
+# instead of quietly rewriting the notetype.
 # --------------------------------------------------------------------------
 
 CSS = """
@@ -142,8 +170,8 @@ CSS = """
 .def-text { display: block; }
 .translation { color: #2e7d32; font-size: 0.95em; margin-left: 1.2em; }
 .example { color: #757575; font-size: 0.9em; margin-left: 1.2em; border-left: 2px solid #d0d0d0; padding-left: 8px; margin-top: 4px; }
-details > summary { list-style: none; }
-details > summary::-webkit-details-marker { display: none; }
+details > summary { list-style: none; } 
+details > summary::-webkit-details-marker { display: none; } 
 .details-toggle { cursor: pointer; color: #0066cc; font-size: 0.9em; margin-top: 10px; }
 .hr-divider { border: 0; height: 1px; background: #ddd; margin: 20px 0; }
 .bottom-info { font-size: 0.9em; color: #666; margin-top: 20px; padding-top: 10px; border-top: 1px solid #eee; }
@@ -240,15 +268,15 @@ AFMT_SCRIPT = """
 
       // Initialize all relevant summary texts to the "MORE" state.
       // Using the more general selector as provided by ChatGPT's tested solution.
-      document.querySelectorAll("summary.details-toggle").forEach(s => {
-        s.textContent = MORE;
+      document.querySelectorAll("summary.details-toggle").forEach(s => { 
+        s.textContent = MORE; 
       });
 
       // Use event delegation on the document for click events
       document.addEventListener("click", e => {
         // Find the closest summary.details-toggle that was clicked or contains the click target
         const summary = e.target.closest("summary.details-toggle");
-
+        
         // If the click was not on or inside a relevant summary, do nothing
         if (!summary) return;
 
@@ -612,6 +640,16 @@ def searchable_forms_hidden(fam: dict, ents: list) -> str:
 
     Anki searches the FIELD TEXT, not the rendered card, so this is what makes
     'hjaelp' find the 'hjaelpe' card after the merge.
+
+    It is appended to CONTENT, not to Variants. AFMT wraps Variants in
+    `{{#Variants}}<b>Variants:</b> {{Variants}}<br>{{/Variants}}` and Mustache's
+    section test is "the field is non-empty", so a span that is always present
+    printed a bare "Variants:" label with nothing visible after it on every card
+    with no paradigm and no alternative spelling (measured: 5 of 34 on the German
+    build; ~300 of 4,442 at full scale). It also pinned the measured Variants
+    empty rate at 0.00% against a 10.96% baseline, so G-RATE could never fire for
+    that field again. Content is rendered unconditionally in a bare
+    `<div>{{Content}}</div>`, so it carries the span with no visible effect.
     """
     forms = list(fam.get("searchable_forms") or [])
     if not forms:
@@ -634,8 +672,14 @@ def searchable_forms_hidden(fam: dict, ents: list) -> str:
 
 
 def variants_html(fam: dict, ents: list) -> str:
-    return (paradigm_block_html(ents) + alt_forms_html(fam, ents)
-            + searchable_forms_hidden(fam, ents))
+    """The paradigm block and the alternative spellings -- and NOTHING ELSE.
+
+    Empty is a legitimate and common answer here (a family with no flex table
+    and no alias), and it has to be an EMPTY STRING so that AFMT's
+    `{{#Variants}}` section drops the label with it. The hidden
+    searchable-forms span moved to the end of Content.
+    """
+    return paradigm_block_html(ents) + alt_forms_html(fam, ents)
 
 
 # --------------------------------------------------------------------------
@@ -695,13 +739,20 @@ def build_note(fam: dict, entries: dict, tr: dict, media: Media, misses: list,
     front += boejning_line(anchor)
     stats["senses_rendered"] = stats.get("senses_rendered", 0) + sum(
         len(renderable_senses(e)) for e in ents)
-    stats["expressions_rendered"] = stats.get("expressions_rendered", 0) + len(
-        {x.get("dannetid") for e in ents for x in e.get("expressions", [])
-         if x.get("dannetid")})
+    # A SHARED idiom is one rendered expression, not one per family: 10 idioms
+    # sit on two entry_ids and collocations_html() deliberately collapses them to
+    # one translation. Summing per-family distinct dannetids counted those twice
+    # (measured 481 reported vs 477 distinct), and the number lands in G-COV's
+    # `rendered` detail and in export_report_<lang>.json.
+    seen_expr = stats.setdefault("_expression_dannetids", set())
+    seen_expr.update(x["dannetid"] for e in ents
+                     for x in e.get("expressions", []) if x.get("dannetid"))
+    content = content_html(ents, tr["definitions"], misses, stats)
     fields = [
         seed,
         front,
-        content_html(ents, tr["definitions"], misses, stats),
+        # The hidden searchable-forms span rides at the END of Content.
+        content + searchable_forms_hidden(fam, ents),
         collocations_html(ents, tr["expressions"], misses),
         variants_html(fam, ents),
         derivatives_text(ents),
@@ -713,14 +764,35 @@ def build_note(fam: dict, entries: dict, tr: dict, media: Media, misses: list,
             "freq_rank": fam.get("freq_rank")}
 
 
+def pos_table(cfg: Config, registry, lang: str) -> tuple[dict, dict]:
+    """The POS label table: the checked-in registry FIRST, the work-dir
+    translations/<lang>/pos.json as an OVERRIDE on top.
+
+    Stage 40 re-keys definitions and expressions only, and guide 1.11f rules that
+    2025's `pos_translations_*_gemini.json` (41 mangled display strings) must not
+    be re-used -- so before the registry table shipped, the only way to satisfy
+    G-COV for `pos` was a paid Gemini call, and there was no offline path to an
+    .apkg at all. The registry table is 22 keys x 4 languages of hand-written
+    grammatical vocabulary; an LLM-written row still overrides it, and a pos_key
+    neither source knows fails G-COV loudly.
+    """
+    reg = getattr(registry, "pos_for", None)
+    from_registry = reg(lang) if callable(reg) else {}
+    override = read_json(cfg.json_dir / "translations" / lang / "pos.json",
+                         default={})
+    return {**from_registry, **override}, {"from_registry": len(from_registry),
+                                           "override_rows": len(override)}
+
+
 def build_all(cfg: Config, registry, lang: str) -> dict:
     """Everything except genanki: notes, media, coverage misses, statistics."""
     entries = read_json(cfg.json_dir / "entries.json")
     families = read_json(cfg.json_dir / "words.json")
     tdir = cfg.json_dir / "translations" / lang
+    pos, pos_note = pos_table(cfg, registry, lang)
     tr = {"definitions": read_json(tdir / "definitions.json", default={}),
           "expressions": read_json(tdir / "expressions.json", default={}),
-          "pos": read_json(tdir / "pos.json", default={})}
+          "pos": pos}
     media = Media(cfg)
     misses: list = []
     stats: dict = {}
@@ -749,9 +821,12 @@ def build_all(cfg: Config, registry, lang: str) -> dict:
                                       for f in renderable
                                       for e in family_entries(f, entries)
                                       if e.get("pos_key")})
+    stats["expressions_rendered"] = len(stats.pop("_expression_dannetids", set()))
     return {"notes": notes, "media": media, "misses": unique_misses, "stats": stats,
-            "report": report, "families": families, "entries": entries,
-            "translations": {k: len(v) for k, v in tr.items()}}
+            "report": {**report, "pos_table": pos_note},
+            "families": families, "entries": entries,
+            "translations": {k: len(v) for k, v in tr.items()},
+            "pos_table": pos_note}
 
 
 # --------------------------------------------------------------------------
@@ -759,8 +834,14 @@ def build_all(cfg: Config, registry, lang: str) -> dict:
 # --------------------------------------------------------------------------
 
 def empty_content_gate(notes: list):
-    """G-EMPTY-C. Reachable only together with the 0-sense rule."""
-    bad = [n["family_id"] for n in notes if not n["fields"][2].strip()]
+    """G-EMPTY-C. Reachable only together with the 0-sense rule.
+
+    Measured on the VISIBLE content: Content now also carries the display:none
+    searchable-forms span, and testing the raw field would make this gate
+    unfalsifiable (the span is never empty).
+    """
+    bad = [n["family_id"] for n in notes
+           if not visible(n["fields"][CONTENT_INDEX]).strip()]
     return not bad, {"notes": len(notes), "empty_content": len(bad),
                      "sample": bad[:20]}
 
@@ -768,11 +849,15 @@ def empty_content_gate(notes: list):
 def empty_rate_gate(notes: list, baseline_pct: dict, tolerance_pp: float):
     """G-RATE. Rates, not counts: at ~2,875 notes every absolute count from the
     4,442-note baseline drops ~35% for free, so the old gate was vacuous. An
-    improvement (a LOWER rate) always passes."""
+    improvement (a LOWER rate) always passes.
+
+    Emptiness is VISIBLE emptiness: a hidden span is not something a learner
+    sees, and counting it made the field carrying it permanently 0.00% empty.
+    """
     n = len(notes)
     rows, bad = {}, {}
     for i, name in enumerate(FIELD_NAMES):
-        empties = sum(1 for note in notes if not note["fields"][i].strip())
+        empties = sum(1 for note in notes if not visible(note["fields"][i]).strip())
         rate = (100.0 * empties / n) if n else 0.0
         base = float(baseline_pct.get(name, 0.0))
         limit = base + tolerance_pp
@@ -926,16 +1011,25 @@ def apkg_path(cfg: Config, lang: str) -> Path:
 def run(cfg: Config, registry, lang: str, check_determinism: bool = False) -> dict:
     if not lang:
         raise FatalError("export needs --lang (one of %s)" % ", ".join(cfg.langs))
+    if lang not in cfg.langs:
+        # `export --lang Gemran` used to mint a fresh deck_id and model_id from
+        # adler32("Gemran") and only fail later, at G-COV.
+        raise FatalError(
+            "unknown --lang %r. Configured languages are: %s. The deck id and "
+            "the notetype id are derived from this exact string, so a typo mints "
+            "a brand-new deck instead of upgrading the existing one."
+            % (lang, ", ".join(cfg.langs)))
     gates_cfg = registry.gates
     built = build_all(cfg, registry, lang)
     notes, media, misses = built["notes"], built["media"], built["misses"]
     if not notes:
         raise FatalError("no renderable families -- run the build stages first")
 
-    second = None
+    second = second_media = None
     pkg_a = pkg_b = None
     if check_determinism:
-        second = build_all(cfg, registry, lang)["notes"]
+        second_built = build_all(cfg, registry, lang)
+        second, second_media = second_built["notes"], second_built["media"]
 
     v2_querywords = read_json(cfg.json_dir / "legacy" / "v2_querywords.json",
                               default={})
@@ -956,54 +1050,84 @@ def run(cfg: Config, registry, lang: str, check_determinism: bool = False) -> di
     write_json(cfg.report_dir / ("coverage_misses_%s.json" % lang),
                {"language": lang, "n": len(misses), "misses": misses})
 
+    # EVERY stage-70 gate carries the language in `extra`. These are verdicts
+    # about ONE language's deck, and merging them on the bare gate id let a
+    # passing German export overwrite a failing Chinese row -- so
+    # `ankidkdeck gates` reported the release all-green with the Chinese deck's
+    # coverage failure erased.
+    scope = {"lang": lang}
+    # read_json() treats default=None as "required", so an absent report has to
+    # be an empty dict here.
+    guid_diff = read_json(cfg.report_dir / "guid_diff.json", default={})
     gate_list = [
         Gate(G_EMPTY_C, "no note has an empty Content field",
-             lambda: empty_content_gate(notes), stage="70"),
+             lambda: empty_content_gate(notes), stage="70", extra=scope),
         Gate(G_RATE, "no field's empty RATE exceeds the v2.1 baseline plus "
                      "tolerance",
              lambda: empty_rate_gate(notes,
                                      gates_cfg.get("empty_rate_baseline_pct", {}),
                                      float(gates_cfg.get("empty_rate_tolerance_pp", 1.0))),
-             stage="70"),
+             stage="70", extra=scope),
         Gate(G_COV, "every rendered sense, expression and pos_key has a "
                     "translation in this language",
-             lambda: coverage_gate(misses, counts), stage="70"),
+             lambda: coverage_gate(misses, counts), stage="70", extra=scope),
         Gate(G_GUID, "every note GUID is unique",
-             lambda: guid_gate(notes), stage="70"),
+             lambda: guid_gate(notes), stage="70", extra=scope),
         Gate(G_SEED, "every carried guid_seed is NFC and byte-equal to a v2.1 "
                      "QueryWord",
              lambda: registry_seed_bytes(registry.card_keys, v2_querywords,
-                                         family_ids), stage="70"),
+                                         family_ids), stage="70", extra=scope),
         Gate(G_RANK, "FrequencyRank is dense 1..N and unique over the notes",
              lambda: dense_unique_ranks([int(n["fields"][7]) for n in notes],
-                                        len(notes)), stage="70"),
+                                        len(notes)), stage="70", extra=scope),
         Gate(G_MEDIA, "every [sound:] tag resolves, media_files is a sorted "
                       "list, and the count clears the floor",
              lambda: media_gate(media, int(gates_cfg.get("media_floor", 0)),
-                                sound_names), stage="70"),
+                                sound_names), stage="70", extra=scope),
         Gate(G_NOTE, "the note count is inside the declared range",
              lambda: note_count_gate(notes, gates_cfg.get("note_count_range")),
-             stage="70"),
+             stage="70", extra=scope),
         Gate(G_SITEMAP, "the per-family homograph shortfall against the sitemap "
                         "inventory is under the declared rate",
              lambda: sitemap_shortfall(
                  shortfall.get("rows") or [],
                  shortfall.get("n_families") or len(notes),
                  float(gates_cfg.get("sitemap_shortfall_max_rate", 0.01))),
-             stage="70"),
+             stage="70", extra=scope),
+        # G-SEP on the EXPORT path, not only under pytest. A one-character drift
+        # in extract.SEP voids 22,734 cells x 4 languages and its symptom is a
+        # collapsed bind rate, not a blocked build. Fixtures absent FAILS: a
+        # release host that cannot run this check has not run it.
+        Gate(G_SEP, "the separator table still reproduces the 2025 Danish "
+                    "strings the translation asset is keyed by, and a wrong "
+                    "table provably does not",
+             lambda: separator_golden(registry, cfg.work_dir / "fixtures"),
+             stage="70", extra=scope),
     ]
+    if guid_diff:
+        # Recorded only when the tool has been run: it needs a released .apkg,
+        # which a fresh checkout does not have.
+        gate_list.append(
+            Gate(G_REL, "reports/guid_diff.json describes this language and the "
+                        "same card count the exporter is about to write",
+                 lambda: guid_diff_reconciles(guid_diff, len(notes), lang),
+                 stage="70", extra=scope))
     if check_determinism:
         with tempfile.TemporaryDirectory() as tmp:
             a = Path(tmp) / "a.apkg"
             b = Path(tmp) / "b.apkg"
+            # Build B writes its OWN media list. Passing build A's made
+            # package_media_equal a list compared against itself -- a gate half
+            # that could not fail, and the media ORDERING bug this gate exists
+            # for (v2.1's set()) is exactly what it would have missed.
             write_package(cfg, lang, notes, media_paths, a)
-            write_package(cfg, lang, second, media_paths, b)
+            write_package(cfg, lang, second, second_media.sorted_paths(), b)
             pkg_a, pkg_b = read_package(a), read_package(b)
             gate_list.append(
                 Gate(G_DET, "two consecutive builds produce identical notes and "
                             "media",
                      lambda: determinism_gate(notes, second, pkg_a, pkg_b),
-                     stage="70"))
+                     stage="70", extra=scope))
             run_gates(gate_list, cfg, stage="70")
     else:
         run_gates(gate_list, cfg, stage="70")
@@ -1021,8 +1145,9 @@ def run(cfg: Config, registry, lang: str, check_determinism: bool = False) -> di
         "copyright_year": cfg.copyright_year,
         "coverage_misses": len(misses),
         "determinism_checked": bool(check_determinism),
+        # Visible emptiness, the same measure G-RATE uses.
         "empty_rates_pct": {name: round(100.0 * sum(
-            1 for n in notes if not n["fields"][i].strip()) / len(notes), 2)
+            1 for n in notes if not visible(n["fields"][i]).strip()) / len(notes), 2)
             for i, name in enumerate(FIELD_NAMES)},
         **built["stats"], **built["report"],
     }

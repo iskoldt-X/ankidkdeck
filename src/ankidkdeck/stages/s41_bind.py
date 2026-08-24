@@ -115,6 +115,8 @@ def run(cfg: Config, registry=None) -> dict:
         dropped: list = []
         counts = {"definitions": {"bound": 0, "dropped": 0, "legacy": 0,
                                   "via_text": 0, "via_sense_path": 0,
+                                  "sense_text_changed_expression_sense_match": 0,
+                                  "sense_text_changed_no_match": 0,
                                   "bound_on_unused_entries": 0},
                   "expressions": {"bound": 0, "dropped": 0, "legacy": 0,
                                   "via_expression": 0, "via_variant": 0,
@@ -143,7 +145,25 @@ def run(cfg: Config, registry=None) -> dict:
                         cand = [s for s in e["senses"] if s.get("sense_path") == path]
                         via = "via_sense_path"
                 if not cand:
-                    drop(base, "sense_text_changed")
+                    # Guide 4.10's pseudocode has a second candidate source --
+                    # `or [s for s in all_expr_senses(e) if ...]` -- which was
+                    # adjudicated OUT because the 2025 asset cannot contain such
+                    # a row: definition_translations_*.json was keyed on
+                    # entry["definitions"][].definition, and expression
+                    # sub-definitions went into a different file. Measured over
+                    # the whole English asset: 22,679 article-only, 49 both, 0
+                    # expression-only. The reason code is SPLIT so the full
+                    # 3,678-entry run proves that on its own data instead of
+                    # inheriting the measurement -- a non-zero
+                    # expression_sense_match count is the signal to reinstate the
+                    # fallback.
+                    expr_match = any(
+                        s.get("definition") == text
+                        for x in e.get("expressions", [])
+                        for s in (x.get("senses") or []))
+                    sub = ("expression_sense_match" if expr_match else "no_match")
+                    drop(base, "sense_text_changed", {"sub_reason": sub})
+                    counts["definitions"]["sense_text_changed_" + sub] += 1
                     counts["definitions"]["dropped"] += 1
                     continue
                 s = cand[0]
@@ -248,5 +268,16 @@ def run(cfg: Config, registry=None) -> dict:
 
     report["per_language"] = per_lang
     report["drop_reason_codes"] = sorted(DROP_REASONS)
+    report["sense_text_changed_split"] = {
+        lang: {"expression_sense_match":
+                   s["detail"]["definitions"]["sense_text_changed_expression_sense_match"],
+               "no_match":
+                   s["detail"]["definitions"]["sense_text_changed_no_match"]}
+        for lang, s in per_lang.items()}
+    report["sense_text_changed_split_note"] = (
+        "expression_sense_match > 0 anywhere means guide 4.10's expression-sense "
+        "fallback for DEFINITIONS would have rescued a row after all, and the "
+        "adjudication that dropped it must be revisited. Measured 0 on the 2025 "
+        "asset.")
     write_json(cfg.report_dir / "bind_report.json", report)
     return report

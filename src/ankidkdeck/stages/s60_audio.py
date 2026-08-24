@@ -113,7 +113,8 @@ def _media_gate(missing: list, zero_byte: list, n_want: int):
                 "n_zero_byte": len(zero_byte)}
 
 
-def run(cfg: Config, net=None, seed_legacy: bool = False) -> dict:
+def run(cfg: Config, net=None, seed_legacy: bool = False,
+        sweep_orphans: bool = False) -> dict:
     entries = read_json(cfg.json_dir / "entries.json")
     audio_dir = Path(cfg.audio_dir)
     audio_dir.mkdir(parents=True, exist_ok=True)
@@ -131,14 +132,29 @@ def run(cfg: Config, net=None, seed_legacy: bool = False) -> dict:
         dest = audio_dir / audio_filename(eid, n)
         row = manifest.get(url)
         if dest.exists() and dest.stat().st_size > 0:
+            size = dest.stat().st_size
+            # SIZE FIRST. `ankidkdeck audio` re-runs on every resume, and hashing
+            # every already-cached file meant a full sha256 sweep of 4,629+ files
+            # per invocation. The manifest already records the size, so the hash
+            # is only computed when the cheap check disagrees (or when there is no
+            # manifest row at all) -- which is precisely when it carries
+            # information.
+            if row and row.get("sha256") and row.get("bytes") == size:
+                stats["already_cached"] += 1
+                continue
             sha = _sha_of(dest)
             if row and row.get("sha256") == sha:
+                # Right content, stale/absent size: repair the row, do not
+                # re-download.
+                if row.get("bytes") != size:
+                    manifest[url] = {**row, "bytes": size}
+                    write_json(audio_dir / MANIFEST, manifest)
                 stats["already_cached"] += 1
                 continue
             # Present but unaccounted for (a seeded file, or a manifest that was
             # lost). Adopt it and record the hash rather than re-downloading.
             manifest[url] = {"url": url, "file": dest.name, "sha256": sha,
-                             "bytes": dest.stat().st_size, "entry_id": eid,
+                             "bytes": size, "entry_id": eid,
                              "slot_n": n, "source": (row or {}).get("source", "adopted")}
             stats["rehashed"] += 1
             write_json(audio_dir / MANIFEST, manifest)
@@ -176,18 +192,29 @@ def run(cfg: Config, net=None, seed_legacy: bool = False) -> dict:
         write_json(audio_dir / MANIFEST, manifest)  # checkpoint after every file
 
     # ---- quarantine anything the entries no longer reference -----------------
+    # BEHIND A FLAG. "Not referenced by entries.json" and "not wanted any more"
+    # are the same predicate only when entries.json is complete: run `audio`
+    # against a partial parse -- a pilot, an interrupted crawl -- and the sweep
+    # moved the entire 2025 cache into _orphans/, which the next full run then
+    # re-downloads. The unreferenced files are counted on every run, so the sweep
+    # is a decision made on a number rather than a surprise.
     referenced = {audio_filename(eid, n) for eid, n in want.values()}
-    orphans = []
+    orphans, unreferenced = [], []
     for p in sorted(audio_dir.iterdir()):
         if p.is_dir() or p.name == MANIFEST:
             continue
         if p.name in referenced:
+            continue
+        unreferenced.append(p.name)
+        if not sweep_orphans:
             continue
         target = audio_dir / ORPHAN_DIR / p.name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(p), str(target))
         orphans.append(p.name)
     stats["quarantined_orphans"] = len(orphans)
+    stats["unreferenced_files"] = len(unreferenced)
+    stats["swept"] = bool(sweep_orphans)
 
     # ---- final verification -------------------------------------------------
     for url in sorted(want):
@@ -205,6 +232,12 @@ def run(cfg: Config, net=None, seed_legacy: bool = False) -> dict:
                                "known_urls_now": len(manifest),
                                "gone_from_ddo": len(known_before - set(want))},
               "orphans_sample": orphans[:20],
+              "unreferenced_sample": unreferenced[:20],
+              "sweep_hint": (
+                  "%d cached file(s) are not referenced by entries.json; pass "
+                  "--sweep-orphans to quarantine them into %s once you are sure "
+                  "the parse is complete" % (len(unreferenced), ORPHAN_DIR)
+                  if unreferenced and not sweep_orphans else None),
               "hint": ("run with --seed-legacy --legacy-workspace <path> to "
                        "hardlink the 2025 files instead of downloading them"
                        if missing and not seed_legacy else None)}

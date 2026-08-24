@@ -11,10 +11,23 @@ Two rules make the inheritance honest:
   * A family that inherits orders from more than one source word gets a STABLE
     MERGE with the lowest-rank source setting the tone, and every contradiction
     is logged (measured: 5 -- en/en-acute, tusinde/tusind, sol/so, rose/rosa).
-  * A stored order is reused ONLY when its entry set equals the family's entry
-    set exactly. A family that gained a homograph since 2025 has never been
-    ranked with that homograph in it, so it goes back in the queue instead of
-    inheriting a stale order.
+  * A stored order is reused ONLY when SOMEONE ACTUALLY RANKED IT and its entry
+    set equals the family's entry set exactly. A family that gained a homograph
+    since 2025 has never been ranked with that homograph in it, so it goes back
+    in the queue instead of inheriting a stale order.
+
+`ranked` IS THAT FIRST CLAUSE, and it is why this stage is not a no-op. Every
+multi-article family gets an order written to priority_orders.json -- determinism
+needs one even for a family nobody has ever ranked -- so the entry-set test alone
+is satisfied by the stage's OWN deterministic fallback. The documented workflow
+is `priority` (see the bill) then `priority --confirm-spend`, and on the second
+run every queued family read back its own fallback as if it were an authority:
+the queue emptied, zero calls were placed, ranking_queue.json was overwritten
+with [], and "a new homograph has no rank" became unreachable forever. So the
+reuse test requires prev["ranked"], which is true only for an order that came
+from a 2025 ranking covering the WHOLE entry set, from a Gemini call, or from an
+earlier such order. A fallback order is written, used, and never mistaken for a
+verdict.
 
 Deviation from the guide's pseudocode, on the owner's instruction: the ANCHOR
 STAYS FIRST. Guide 4.11 writes f["entry_ids"] = order + tail, which lets a
@@ -224,9 +237,15 @@ def run(cfg: Config, registry=None, confirm: bool = False) -> dict:
         want = set(eids)
 
         prev = stored.get(fid)
-        if prev and set(prev.get("order") or []) == want:
-            # Reuse only on an exact set match (guide 1.11d / A's P13).
+        provenance = None
+        if prev and prev.get("ranked") and set(prev.get("order") or []) == want:
+            # Reuse needs BOTH an exact set match (guide 1.11d / A's P13) and an
+            # order somebody actually ranked.
             order, tail, source = list(prev["order"]), [], "stored"
+            # Carry the paid-for provenance forward. Overwriting it with the
+            # literal "stored" erased "gemini:<model>@<date>" on the first plain
+            # re-run, i.e. the record of what had been paid for.
+            provenance = prev.get("provenance")
         else:
             props = sorted(proposals.get(fid, []))
             merged: list = []
@@ -243,11 +262,12 @@ def run(cfg: Config, registry=None, confirm: bool = False) -> dict:
         sources[source] = sources.get(source, 0) + 1
 
         if tail:
-            # A homograph nobody ever ranked: the stored order is not valid for
-            # this entry set, so the family goes to the queue and the newcomer
-            # goes last until it is ranked.
+            # A homograph nobody ever ranked: no stored order is valid for this
+            # entry set, so the family goes to the queue and the newcomer goes
+            # last until it is ranked.
             queue.append({"family_id": fid, "lemma": fam.get("lemma"),
-                          "entry_ids": eids, "ranked": order, "unranked": tail,
+                          "entry_ids": eids, "ranked_prefix": order,
+                          "unranked": tail, "status": "pending",
                           "why": "no order covers the current entry set"})
 
         new_order = anchor_first(anchor, order + tail)
@@ -257,20 +277,43 @@ def run(cfg: Config, registry=None, confirm: bool = False) -> dict:
                           "after": new_order})
         fam["entry_ids"] = new_order
         fam["priority_source"] = source
+        # `ranked` is the REUSE AUTHORITY and it is deliberately narrower than
+        # "an order exists": a `none` order is this stage's own deterministic
+        # fallback, and a `legacy` order with a non-empty tail covers only part
+        # of the current entry set -- which is exactly the case the exact-set
+        # rule exists for. Neither is a verdict, so neither may be reused.
         stored[fid] = {"order": new_order, "source": source,
-                       "entry_set": sorted(want)}
+                       "provenance": provenance,
+                       "entry_set": sorted(want),
+                       "ranked": source in ("stored", "legacy", "gemini")
+                                 and not tail}
 
     run_gates([Gate(G_ORDER, "each family's entry order is a permutation of its "
                              "own articles with the anchor still first",
                     lambda: _order_gate(gate_rows), stage="50")], cfg, stage="50")
 
+    conflicts_path = cfg.report_dir / "priority_conflicts.json"
+    # MERGED, never replaced. `conflicts` is only appended on the non-reuse
+    # branch, so on a plain re-run every family takes the reuse branch and an
+    # unconditional write emptied the file -- deleting the audit record of the 5
+    # real two-source contradictions (en/en-acute, tusinde/tusind, sol/so,
+    # rose/rosa) after exactly one run.
+    prev_conflicts = read_json(conflicts_path, default=[])
+    by_fid = {r.get("family_id"): r for r in prev_conflicts if isinstance(r, dict)}
+    for row in conflicts:
+        by_fid[row["family_id"]] = row
+    merged_conflicts = [by_fid[k] for k in sorted(by_fid, key=str)]
+
     write_json(cfg.json_dir / "words.json", families)
     write_json(cfg.json_dir / "priority_orders.json", stored)
-    write_json(cfg.report_dir / "priority_conflicts.json", conflicts)
+    write_json(conflicts_path, merged_conflicts)
     write_json(cfg.report_dir / "ranking_queue.json", queue)
     report.update({"multi_entry_families": len(gate_rows),
                    "order_sources": sources,
+                   "orders_reusable_next_run": sum(1 for v in stored.values()
+                                                   if v.get("ranked")),
                    "conflicts_logged": len(conflicts),
+                   "conflicts_on_file": len(merged_conflicts),
                    "queue_for_ranking": len(queue)})
 
     print("--- homograph ranking queue ---")
@@ -317,13 +360,27 @@ def run(cfg: Config, registry=None, confirm: bool = False) -> dict:
         new_order = anchor_first(fam["anchor_entry_id"], sorted_ids)
         fam["entry_ids"] = new_order
         fam["priority_source"] = "gemini"
-        stored[fid] = {"order": new_order, "source": prov,
-                       "entry_set": sorted(set(eids))}
+        # `source` stays a CLOSED vocabulary (stored/legacy/gemini/none) and the
+        # model+date string lives in its own field. One key that is sometimes an
+        # enum and sometimes a free-form provenance string cannot be filtered on.
+        stored[fid] = {"order": new_order, "source": "gemini",
+                       "provenance": prov, "entry_set": sorted(set(eids)),
+                       "ranked": True}
+        row["status"] = "ranked"
+        row["order"] = new_order
+        row["provenance"] = prov
         ranked += 1
         # checkpoint after EVERY family: an interrupted run loses one call
         write_json(cfg.json_dir / "words.json", families)
         write_json(cfg.json_dir / "priority_orders.json", stored)
+        # The queue keeps its rows WITH their status. Overwriting the file with
+        # [] once a confirm run had resolved it destroyed the only record of what
+        # had needed ranking -- and a run interrupted halfway left no trace of
+        # which families were still pending.
+        write_json(cfg.report_dir / "ranking_queue.json", queue)
     report["families_ranked"] = ranked
+    report["queue_still_pending"] = sum(1 for r in queue
+                                        if r.get("status") != "ranked")
     report["api"] = {"requests": pool.total_requests,
                      "key_rotations": pool.rotations}
     write_json(cfg.report_dir / "priority_report.json", report)

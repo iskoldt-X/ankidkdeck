@@ -10,9 +10,15 @@ estimated: the churn figure in the original spec was off by up to +22%.
         --lang German --work work
 
 Stdlib only (sqlite3 + zipfile). genanki.guid_for() is reimplemented here so the
-tool runs on a host with no genanki installed; when genanki IS importable the
-two are cross-checked on every seed and a disagreement is fatal, because a drift
-in the GUID formula is the one bug that cannot be repaired after release.
+tool runs on a host with no genanki installed; when genanki IS importable the two
+are cross-checked on EVERY seed and a disagreement is fatal, because a drift in
+the GUID formula is the one bug that cannot be repaired after release. (The
+docstring used to promise every seed while the code checked the first 50 -- in a
+tool whose entire value is trustworthiness. ~2,900 sha256 calls is nothing.)
+
+The report carries a `summary` row so the export gate can assert against it:
+G-REL fails the build when reports/guid_diff.json describes a different language
+or a different card count from the deck being written.
 """
 
 import argparse
@@ -110,8 +116,7 @@ def main(argv=None) -> int:
         seeds[guid_for(seed, args.lang)] = {"family_id": fid, "guid_seed": seed,
                                             "lemma": f.get("lemma"),
                                             "freq_rank": f.get("freq_rank")}
-    check_note = _cross_check([f["guid_seed"] for f in list(seeds.values())[:50]],
-                              args.lang)
+    check_note = _cross_check([f["guid_seed"] for f in seeds.values()], args.lang)
 
     old = read_apkg(Path(args.apkg))
     old_by_guid = {g: q for g, q, _ in old}
@@ -136,6 +141,13 @@ def main(argv=None) -> int:
         "old_apkg": str(args.apkg),
         "guid_formula": "genanki.guid_for(guid_seed, lang)",
         "guid_check": check_note,
+        # The row G-REL asserts against at export time. Kept deliberately small
+        # and flat: a churn number nobody compares to the shipped deck is an
+        # estimate, and the original spec's estimate was off by up to +22%.
+        "summary": {"language": args.lang, "card_count": len(seeds),
+                    "old_notes": len(old), "kept": len(kept_guids),
+                    "new": len(new_guids), "retired": len(retired_guids),
+                    "seeds_cross_checked": len(seeds)},
         "counts": {"old_notes": len(old), "new_notes": len(seeds),
                    "kept": len(kept_guids), "new": len(new_guids),
                    "retired": len(retired_guids),

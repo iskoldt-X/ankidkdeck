@@ -10,8 +10,11 @@
   "note_count_range": [2800, 3100],
   "media_floor": 4629,
   "affix_count_range": [150, 600],
+  "sitemap_total_range": null,
+  "label_error_max_rate": 0.01,
   "pilot_max_error_rate": 0.01,
   "sitemap_shortfall_max_rate": 0.01,
   "all_demoted_families_max": 40,
+  "case_only_members_max": 80,
   "tie_break_byte_order_max": 3
 }

@@ -10,9 +10,19 @@ Nothing here talks to the network.
         --legacy-workspace ~/GitHub/danish_pipelines/data/recovered-v2.1-workspace \
         --out work/fixtures
 
-Pass the cleanest page directory FIRST: page names come from the filenames, and
-the first directory wins a name collision. tests/test_parse_pages.py looks for
-pages named exactly "hus" and "god", which html_2026/ provides.
+    python3 tools/build_fixtures.py --work work \
+        --legacy-workspace .../recovered-v2.1-workspace --out work/fixtures
+
+TWO INPUT MODES, and --work is the one that matters at scale. --pages reads
+directories of human-named .html files, which is all the probe dirs are; but the
+pipeline stores its own crawl as raw/<sha1(NFC(word))>.html plus
+json/fetch_ledger.json, so without --work the 39-page (and later ~5,000-page)
+crawl corpus was simply unusable as a fixture source. G-SEP is "THE most
+important test here" and it was stuck at 27 joinable entry_ids against a target of
+">= 500 after the first full crawl". --work recovers the word from the ledger, so
+the page name is the word and every crawled page is a candidate. Both modes may
+be given at once; --pages wins a name collision (pass the cleanest dir first).
+tests/test_parse_pages.py looks for pages named exactly "hus" and "god".
 
 What it writes:
 
@@ -130,9 +140,29 @@ def is_ddo_page(path: Path) -> bool:
             or "results-label" in head)
 
 
-def collect_pages(dirs, out_dir: Path) -> list:
-    pages, used_names = [], set()
-    for d in dirs:
+def _adopt(path: Path, out_dir: Path, pages: list, used_names: set,
+           name: str | None = None, extra: dict | None = None) -> None:
+    info = describe_page(path)
+    base = name or info["name"]
+    candidate, n = base, 2
+    while candidate in used_names:
+        candidate = "%s__%d" % (base, n)
+        n += 1
+    used_names.add(candidate)
+    info["name"] = candidate
+    info.update(extra or {})
+    rel = "pages_2026/%s.html" % candidate
+    dest = out_dir / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(path, dest)
+    info["file"] = rel
+    pages.append(info)
+
+
+def collect_pages(dirs, out_dir: Path, pages=None, used_names=None) -> list:
+    pages = [] if pages is None else pages
+    used_names = set() if used_names is None else used_names
+    for d in dirs or ():
         d = Path(d).expanduser()
         if not d.is_dir():
             print("skip (not a directory): %s" % d, file=sys.stderr)
@@ -140,21 +170,74 @@ def collect_pages(dirs, out_dir: Path) -> list:
         for path in sorted(d.glob("*.html")):
             if not is_ddo_page(path):
                 continue
-            info = describe_page(path)
-            name = info["name"]
-            n = 2
-            while name in used_names:
-                name = "%s__%d" % (info["name"], n)
-                n += 1
-            used_names.add(name)
-            info["name"] = name
-            rel = "pages_2026/%s.html" % name
-            dest = out_dir / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(path, dest)
-            info["file"] = rel
-            pages.append(info)
+            _adopt(path, out_dir, pages, used_names)
     return pages
+
+
+def safe_name(word: str) -> str:
+    """A filesystem-safe fixture name for a DDO query word.
+
+    The pipeline stores pages under sha1(NFC(word)) precisely because a word is
+    not a filename (case-insensitive filesystems, spaces, dots). The fixture set
+    is read by name, so the word comes back here -- with the same hazards handled
+    explicitly and the sha1 prefix appended whenever anything had to be replaced,
+    so `min.` and `min` cannot collide into one page.
+    """
+    w = nfc(word)
+    cleaned = "".join(c if (c.isalnum() or c in "-_") else "_" for c in w)
+    cleaned = cleaned.strip("_") or "page"
+    if cleaned != w:
+        cleaned = "%s-%s" % (cleaned, hashlib.sha1(w.encode("utf-8")).hexdigest()[:8])
+    return cleaned
+
+
+def collect_from_work(work: Path, out_dir: Path, pages=None,
+                      used_names=None) -> tuple:
+    """The pipeline's OWN crawl corpus: raw/<sha1(NFC(word))>.html + the ledger.
+
+    Only `ok` pages and `nohit` pages are adopted: an `error` page is a fetch or
+    parse failure, not a specimen of DDO markup, and `attempted` means the run
+    never got an answer. The ledger's own results_label / article_count are
+    carried into the manifest so tests/test_results_label.py can reconcile
+    against what the CRAWL recorded, not only against what the page says now.
+    """
+    pages = [] if pages is None else pages
+    used_names = set() if used_names is None else used_names
+    work = Path(work).expanduser()
+    ledger_path = work / "json" / "fetch_ledger.json"
+    raw_dir = work / "raw"
+    if not ledger_path.exists():
+        print("skip --work %s: no json/fetch_ledger.json" % work, file=sys.stderr)
+        return pages, {"work": str(work), "adopted": 0, "reason": "no ledger"}
+    if not raw_dir.is_dir():
+        print("skip --work %s: no raw/" % work, file=sys.stderr)
+        return pages, {"work": str(work), "adopted": 0, "reason": "no raw dir"}
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    stats = {"work": str(work), "ledger_words": len(ledger), "adopted": 0,
+             "skipped_status": {}, "missing_raw": 0}
+    for word in sorted(ledger):
+        row = ledger[word] or {}
+        status = row.get("status")
+        if status not in ("ok", "nohit"):
+            stats["skipped_status"][status] = \
+                stats["skipped_status"].get(status, 0) + 1
+            continue
+        path = raw_dir / ("%s.html" % hashlib.sha1(
+            nfc(word).encode("utf-8")).hexdigest())
+        if not path.exists():
+            stats["missing_raw"] += 1
+            continue
+        if not is_ddo_page(path):
+            stats["skipped_status"]["not_a_ddo_page"] = \
+                stats["skipped_status"].get("not_a_ddo_page", 0) + 1
+            continue
+        _adopt(path, out_dir, pages, used_names, name=safe_name(word),
+               extra={"query_word": nfc(word), "ledger_status": status,
+                      "ledger_results_label": row.get("results_label"),
+                      "ledger_article_count": row.get("article_count"),
+                      "from_work": str(work)})
+        stats["adopted"] += 1
+    return pages, stats
 
 
 def bridge_legacy(workspace: Path, wanted_keys: set) -> tuple:
@@ -230,17 +313,31 @@ def legacy_texts(bridge: dict, by_file: dict) -> tuple:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--pages", nargs="+", required=True,
+    ap.add_argument("--pages", nargs="+",
                     help="directories of saved 2026 pages (cleanest one first)")
+    ap.add_argument("--work", action="append", default=[],
+                    help="an ankidkdeck workspace: reads raw/<sha1(word)>.html "
+                         "plus json/fetch_ledger.json, so the pipeline's own "
+                         "crawl corpus feeds the fixtures. Repeatable.")
     ap.add_argument("--legacy-workspace",
                     help="recovered 2025 workspace (ddo_entries.json + "
                          "ddo_html_all_versions/); omit to build pages only")
     ap.add_argument("--out", default="work/fixtures", help="output directory")
     args = ap.parse_args(argv)
+    if not args.pages and not args.work:
+        ap.error("give at least one of --pages <dirs> or --work <workspace>")
 
     out = Path(args.out).expanduser()
     out.mkdir(parents=True, exist_ok=True)
-    pages = collect_pages(args.pages, out)
+    pages: list = []
+    used_names: set = set()
+    # --pages first: those directories are human-curated and their names are the
+    # ones tests/test_parse_pages.py looks for.
+    collect_pages(args.pages, out, pages, used_names)
+    work_stats = []
+    for w in args.work:
+        _, st = collect_from_work(w, out, pages, used_names)
+        work_stats.append(st)
     if not pages:
         print("no DDO pages found; nothing written", file=sys.stderr)
         return 1
@@ -248,12 +345,19 @@ def main(argv=None) -> int:
     page_entry_ids = {eid for p in pages for eid in p["entry_ids"]}
     wanted_keys = {nk(x) for p in pages for x in p["lemmas"]}
     wanted_keys |= {nk(p["name"]) for p in pages}
+    # The QUERY WORD, when we know it: with --work the fixture name is a
+    # filesystem-safe mangling and the word itself is the key that joins the 2025
+    # corpus (2025 buckets were keyed by query_word / headword).
+    wanted_keys |= {nk(p["query_word"]) for p in pages if p.get("query_word")}
+    wanted_keys.discard("")
 
     manifest = {
         "built_by": "tools/build_fixtures.py",
         "note": "contains DDO text: gitignored, never committed or uploaded",
         "pages": pages,
         "n_pages": len(pages),
+        "sources": {"pages_dirs": list(args.pages or []),
+                    "workspaces": work_stats},
         "entry_ids_2026": sorted(page_entry_ids),
         "expected": {"definitions": "expected/definitions_by_entry.json",
                      "expressions": "expected/expressions_by_entry.json",
@@ -294,6 +398,11 @@ def main(argv=None) -> int:
     print("fixtures written to %s" % out)
     print("  pages          %d (%s)" % (len(pages),
                                         ", ".join(p["name"] for p in pages[:8])))
+    for st in work_stats:
+        print("  from --work    %s: %d adopted of %s ledger words (%s)"
+              % (st.get("work"), st.get("adopted", 0),
+                 st.get("ledger_words", "?"), st.get("skipped_status")
+                 or st.get("reason") or "nothing skipped"))
     print("  2026 entry_ids %d" % len(page_entry_ids))
     if args.legacy_workspace:
         print("  joinable ids   %d  (definition texts %d, expression texts %d)"

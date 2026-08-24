@@ -29,8 +29,6 @@ from . import __version__
 from .config import load_config
 from .util import FatalError, read_json
 
-NETWORK_COMMANDS = {"sitemap", "crawl", "audio"}
-
 
 # --------------------------------------------------------------------------
 # output
@@ -140,11 +138,21 @@ def build_parser() -> argparse.ArgumentParser:
                    help="place the Gemini calls the bill just quoted")
     s.add_argument("--no-gc", action="store_true",
                    help="skip archiving translation rows with no live sense")
+    s.add_argument("--include-unused", action="store_true",
+                   help="bill every parsed entry when words.json is absent, "
+                        "including the articles the classifier rejected "
+                        "(measured 3.4x the cells). Normally you run the merge "
+                        "stage first instead.")
 
     s = sub.add_parser("audio", help="audio cache and delta download (stage 60)")
     s.add_argument("--seed-legacy", action="store_true",
                    help="hardlink/copy from the 2025 workspace instead of "
                         "downloading (~4,629 requests saved)")
+    s.add_argument("--sweep-orphans", action="store_true",
+                   help="move cached mp3s that entries.json no longer references "
+                        "into audio/_orphans/. Only safe once the parse is "
+                        "complete: against a partial entries.json this "
+                        "quarantines the whole cache.")
 
     s = sub.add_parser("export", help="render cards and write the .apkg (stage 70)")
     s.add_argument("--lang", required=True, help="target language")
@@ -170,6 +178,24 @@ def _net(cfg):
     return Net(cfg)
 
 
+def check_lang(cfg, lang) -> None:
+    """--lang must name a CONFIGURED language, checked before anything runs.
+
+    `--lang german` is not `--lang German`: none of the 22,734 migrated cells
+    are visible under the lowercase key, so `translate --lang german
+    --confirm-spend` would quietly pay the full from-scratch price and write to
+    translations/german/. Export is protected by G-COV -- the money is not. The
+    escape hatch is `langs` in ankidkdeck.toml, not a typo.
+    """
+    if lang is None:
+        return
+    if lang not in cfg.langs:
+        raise FatalError(
+            "unknown --lang %r. Configured languages are: %s. Add it to `langs` "
+            "in ankidkdeck.toml first -- a new language means a full "
+            "from-scratch translation bill." % (lang, ", ".join(cfg.langs)))
+
+
 def _lemmas_needed(cfg, registry) -> set:
     """Phase B's input: the lemma pages we have never asked for.
 
@@ -192,6 +218,10 @@ def _lemmas_needed(cfg, registry) -> set:
 
 def run_command(args, cfg) -> int:
     cmd = args.command
+    # One place, before any stage runs: every subcommand that takes --lang
+    # (translate, export, and anything added later) is validated against
+    # cfg.langs. Nothing is fetched, parsed or billed for a typo.
+    check_lang(cfg, getattr(args, "lang", None))
     if cmd == "wordlist":
         from .stages import s00_wordlist
         print_report("wordlist", s00_wordlist.run(cfg, args.accept_new_wordlist))
@@ -237,17 +267,20 @@ def run_command(args, cfg) -> int:
         return 0
     if cmd == "translate":
         from .stages import s42_translate
+        check_lang(cfg, args.lang)
         print_report("translate", s42_translate.run(
             cfg, _registry(cfg), lang=args.lang, confirm=args.confirm_spend,
-            do_gc=not args.no_gc))
+            do_gc=not args.no_gc, include_unused=args.include_unused))
         return 0
     if cmd == "audio":
         from .stages import s60_audio
         print_report("audio", s60_audio.run(cfg, _net(cfg),
-                                            seed_legacy=args.seed_legacy))
+                                            seed_legacy=args.seed_legacy,
+                                            sweep_orphans=args.sweep_orphans))
         return 0
     if cmd == "export":
         from .stages import s70_export
+        check_lang(cfg, args.lang)
         print_report("export", s70_export.run(cfg, _registry(cfg), args.lang,
                                               check_determinism=args.check_determinism))
         return 0
@@ -291,25 +324,33 @@ def status(cfg) -> dict:
 
 
 def gates_report(cfg) -> int:
-    """Print the accumulated gate report. Gates run inside their stages; this
-    is the standing record of what passed, and what a human still owes."""
+    """Print the accumulated gate report and AGGREGATE it: exit non-zero if any
+    recorded row fails.
+
+    Rows are keyed on (id, stage, extra), so the per-language export gates
+    (G-COV / G-RATE / G-MEDIA / G-DET) keep one row per language. Before that,
+    a passing German export overwrote a failing Chinese one and this command
+    certified the release all-green.
+    """
+    from .gates import row_label
     path = cfg.report_dir / "gates_report.json"
     data = read_json(path, default={})
     if not data:
         print("no gate report yet: %s" % path)
         return 1
-    for row in data.get("results", []):
-        print("%-4s %-12s %-10s %s"
-              % ("PASS" if row.get("ok") else "FAIL", row.get("id"),
+    rows = data.get("results", [])
+    width = max((len(row_label(r)) for r in rows), default=12)
+    for row in rows:
+        print("%-4s %-*s %-10s %s"
+              % ("PASS" if row.get("ok") else "FAIL", width, row_label(row),
                  "stage " + str(row.get("stage") or "?"), row.get("description")))
-    failed = data.get("failed") or []
-    print("%d gate(s) recorded, %d failing%s"
-          % (len(data.get("results", [])), len(failed),
-             (": " + ", ".join(failed)) if failed else ""))
+    bad = [row_label(r) for r in rows if not r.get("ok")]
+    print("%d gate row(s) recorded, %d failing%s"
+          % (len(rows), len(bad), (": " + ", ".join(bad)) if bad else ""))
     print("manual gates are never recorded here: G-IMPORT (the Anki smoke test, "
           "tools/import_smoke_test.md) and G-REVIEW (a human reading "
           "review/rejected.json) need a signature, not a script.")
-    return 1 if failed else 0
+    return 1 if bad else 0
 
 
 def main(argv=None) -> int:

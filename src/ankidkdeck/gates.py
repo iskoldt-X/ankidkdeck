@@ -8,9 +8,13 @@ report worth reading:
 
   1. ALL gates run before anything raises, so one build shows every failure
      instead of only the first.
-  2. Results accumulate in one file, merged by gate id, so a later stage
-     appends to the same report rather than overwriting it. The export-time
-     gate list (segment 3) plugs in here with no changes to this module.
+  2. Results accumulate in one file, merged by (gate id, stage, extra), so a
+     later stage appends to the same report rather than overwriting it. `extra`
+     is what makes the per-LANGUAGE export gates independent rows: G-COV,
+     G-RATE, G-MEDIA and G-DET are verdicts about one language's deck, and
+     merging them on the bare id let a passing German export erase a failing
+     Chinese one -- i.e. `ankidkdeck gates` certified a release all-green while
+     the Chinese deck's coverage failure had been overwritten.
 
 A gate that cannot fail is not a gate: every helper below returns the measured
 detail alongside the verdict, so a passing gate still leaves evidence.
@@ -19,9 +23,10 @@ detail alongside the verdict, so a passing gate still leaves evidence.
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
-from .util import FatalError, NFC, read_json, write_json
+from .util import FatalError, NFC, canonical_json, read_json, write_json
 
 # EVERY gate id in the pipeline lives here, spelled exactly as in the final
 # guide's table (section 4.12). Segment 3 used to declare its own copies at the
@@ -46,6 +51,14 @@ G_COV = "G-COV"
 G_MEDIA = "G-MEDIA"
 G_NOTE = "G-NOTE"
 G_DET = "G-DET"
+# The separator table (guide 4.12 row 1): "wire it into the export gate (G-SEP)
+# so an .apkg can never be built by a parser with a corrupted separator table".
+# It used to exist only under pytest, which is not on the export path.
+G_SEP = "G-SEP"
+G_LABEL = "G-LABEL"          # #results-label reconciles against the article count
+G_REL = "G-REL"              # the release-note churn numbers are computed, not estimated
+G_SITEMAP_INV = "G-SITEMAP-INV"   # the sitemap inventory is inside its declared range
+G_CASE = "G-CASE"            # the case-only membership population is baselined
 
 # The closed set of translation drop reason codes. A drop carrying anything
 # else is an unexplained loss, which is what G-BIND exists to forbid.
@@ -77,7 +90,13 @@ def is_affix_entry(entry: dict) -> bool:
 @dataclass
 class Gate:
     """id: the guide's gate id. description: why a human should care.
-    fn: () -> (ok, detail). detail is JSON-serialisable and always recorded."""
+    fn: () -> (ok, detail). detail is JSON-serialisable and always recorded.
+
+    extra: the SCOPE of this verdict, and part of the report's merge key. A
+    per-language export gate passes extra={"lang": lang} so that two languages
+    keep two rows instead of the later run silently overwriting the earlier
+    one's failure.
+    """
 
     id: str
     description: str
@@ -86,18 +105,36 @@ class Gate:
     extra: dict = field(default_factory=dict)
 
 
+def row_key(row: dict) -> str:
+    """The report's merge key: (id, stage, extra). Canonical JSON so the key is
+    stable across runs and machines regardless of dict order."""
+    return canonical_json([row.get("id"), str(row.get("stage") or ""),
+                           row.get("extra") or {}])
+
+
+def row_label(row: dict) -> str:
+    """`G-COV` or `G-COV[lang=Chinese]` -- what a human needs to see in the
+    failure list to know WHICH deck failed."""
+    extra = row.get("extra") or {}
+    if not extra:
+        return str(row.get("id"))
+    inner = ",".join("%s=%s" % (k, extra[k]) for k in sorted(extra))
+    return "%s[%s]" % (row.get("id"), inner)
+
+
 def run_gates(gates: Iterable[Gate], cfg, stage: str = "") -> list[dict]:
     """Run every gate, write the merged report, then raise on any failure."""
     results = []
     for g in gates:
         ok, detail = g.fn()
         results.append({"id": g.id, "description": g.description,
-                        "stage": g.stage or stage, "ok": bool(ok),
-                        "detail": detail})
+                        "stage": g.stage or stage, "extra": dict(g.extra),
+                        "ok": bool(ok), "detail": detail})
     _write_report(cfg, results)
     failed = [r for r in results if not r["ok"]]
     if failed:
-        lines = [f"  {r['id']}: {r['description']} -> {r['detail']}" for r in failed]
+        lines = ["  %s: %s -> %s" % (row_label(r), r["description"], r["detail"])
+                 for r in failed]
         raise FatalError(
             "%d gate(s) failed; no output is valid until they pass:\n%s"
             % (len(failed), "\n".join(lines))
@@ -108,15 +145,21 @@ def run_gates(gates: Iterable[Gate], cfg, stage: str = "") -> list[dict]:
 def _write_report(cfg, results: list[dict]) -> None:
     path = cfg.report_dir / "gates_report.json"
     prev = read_json(path, default={"results": []})
+    rows = list(prev.get("results", [])) + results
     merged: dict[str, dict] = {}
-    for row in list(prev.get("results", [])) + results:
-        merged[row["id"]] = row  # later stage wins; first-seen order kept below
-    order = []
-    for row in list(prev.get("results", [])) + results:
-        if row["id"] not in order:
-            order.append(row["id"])
-    out = {"results": [merged[i] for i in order]}
-    out["failed"] = sorted(r["id"] for r in out["results"] if not r["ok"])
+    order: list[str] = []
+    for row in rows:
+        row.setdefault("extra", {})
+        key = row_key(row)
+        if key not in merged:
+            order.append(key)
+        merged[key] = row      # a later run of the SAME scope wins
+    out = {"results": [merged[k] for k in order]}
+    # `failed` stays a list of bare ids (that is what the release checklist and
+    # the tests read); `failed_rows` carries the scope, so a Chinese-only
+    # failure is not reported as if German had failed too.
+    out["failed"] = sorted({r["id"] for r in out["results"] if not r["ok"]})
+    out["failed_rows"] = [row_label(r) for r in out["results"] if not r["ok"]]
     out["n_gates"] = len(out["results"])
     write_json(path, out)
 
@@ -321,3 +364,301 @@ def sitemap_shortfall(rows: list, n_families: int, max_rate: float):
     return rate <= max_rate, {"families_short": len(rows), "n_families": n_families,
                               "rate": round(rate, 5), "max_rate": max_rate,
                               "sample": rows[:20]}
+
+
+def sitemap_inventory(total: int, total_range, affix_slugs: int, affix_range):
+    """G-SITEMAP-INV. The inventory's own size, as a recorded verdict.
+
+    The URL total used to be a bare `raise FatalError(total < 80_000)` with the
+    threshold as a source constant, so (a) it never reached
+    gates_report.json and (b) the bound was extrapolated from nothing. An
+    absolute lower bound guessed from a partial measurement is the same class of
+    vacuous gate the guide rejects: `sitemap_total_range` therefore ships as
+    null, meaning REPORT ONLY, and a human copies the first real 9-request run's
+    total into registry/gates.json as a band. A 3x jump is as suspicious as a
+    collapse -- it means the shard set changed -- which is why it is a range and
+    not a floor.
+
+    The affix range is already baselined from a real measurement, so it stays
+    enforced; it just lands in the report now instead of raising inline.
+    """
+    detail = {"total_urls": total, "total_range": total_range,
+              "affix_slugs": affix_slugs, "affix_range": affix_range}
+    problems = {}
+    lo, hi = (list(total_range) + [None, None])[:2] if total_range else (None, None)
+    if lo is None and hi is None:
+        detail["total_note"] = (
+            "sitemap_total_range is null: report-only. Copy this total into "
+            "registry/gates.json as a band (+/-25%) after the first real run.")
+    else:
+        if (lo is not None and total < lo) or (hi is not None and total > hi):
+            problems["total_urls_outside_range"] = {"total": total,
+                                                    "range": [lo, hi]}
+    a_lo, a_hi = (list(affix_range) + [None, None])[:2] if affix_range else (None, None)
+    if a_lo is not None and a_hi is not None and not a_lo <= affix_slugs <= a_hi:
+        problems["affix_slugs_outside_range"] = {"unique_affix_slugs": affix_slugs,
+                                                 "range": [a_lo, a_hi]}
+    detail["violations"] = problems
+    return not problems, detail
+
+
+def case_only_members(rows: list, max_n: int | None = None):
+    """G-CASE. The population of case-only family memberships is BASELINED.
+
+    Bucket 4 (exact_ci) is deliberately a card-membership bucket, not an
+    xref-only one: `I` (pron., 2 senses + 7 expressions) is not a wordlist word
+    and would otherwise be deleted from the deck entirely. The anchor rule keeps
+    it from heading the card, but ~55 (headword, wordlist word) pairs still
+    differ only by case, and `var`/`VAR` is the case where the family's whole
+    content belongs to a different spelling -- information for a human, not a
+    tie-break. So the rows are written to review/case_only_members.json and the
+    COUNT is baselined (registry/gates.json:case_only_members_max), exactly as
+    round 1 did for all_demoted_families_max: the gate fires when the population
+    GROWS, never on the existing, reviewed population.
+    """
+    over = max_n is not None and len(rows) > max_n
+    return not over, {"rows": len(rows), "max": max_n,
+                      "over_baseline": bool(over), "sample": rows[:20]}
+
+
+_RESULTS_RE = re.compile(r"^(\d+) resultater$")
+
+
+def _label_reconciles(label, n_articles) -> bool:
+    """s12.verdict_of's rule, applied to what the ledger STORED."""
+    if label == "" and n_articles == 1:
+        return True
+    m = _RESULTS_RE.fullmatch(label or "")
+    return bool(m) and int(m.group(1)) == n_articles
+
+
+def ledger_label_reconciliation(ledger: dict, parsed_counts: dict,
+                                error_max_rate: float = 0.01):
+    """G-LABEL. DDO answers 200 for everything, so a miss can only be read off
+    the page: #results-label is the page's own checksum against the article
+    count. The rule ran inside stage 12 and in pytest, and its verdict never
+    reached gates_report.json -- so a release could not show that it held.
+
+    Three measurements: every ok page's stored label still reconciles with its
+    stored article_count, every ok page parsed to that same number, and the
+    error-status population is inside its baseline (an `error` page is skipped
+    by stage 20 by design, and it is the page a human is asked about).
+    """
+    rows = sorted(ledger.items())
+    n = len(rows)
+    errors, bad_label, parse_mismatch = [], [], []
+    n_ok = 0
+    for word, row in rows:
+        status = row.get("status")
+        if status == "error":
+            errors.append({"word": word, "results_label": row.get("results_label"),
+                           "article_count": row.get("article_count")})
+            continue
+        if status != "ok":
+            continue
+        n_ok += 1
+        label, n_art = row.get("results_label"), row.get("article_count")
+        if not _label_reconciles(label, n_art):
+            bad_label.append({"word": word, "results_label": label,
+                              "article_count": n_art})
+        got = parsed_counts.get(word)
+        if got is not None and got != n_art:
+            parse_mismatch.append({"word": word, "ledger": n_art, "parsed": got})
+    rate = (len(errors) / n) if n else 0.0
+    ok = (not bad_label and not parse_mismatch and rate <= error_max_rate)
+    return ok, {"words_in_ledger": n, "ok_pages": n_ok,
+                "error_pages": len(errors), "error_rate": round(rate, 5),
+                "error_max_rate": error_max_rate,
+                "label_does_not_reconcile": bad_label[:20],
+                "parsed_count_disagrees_with_ledger": parse_mismatch[:20],
+                "error_sample": errors[:20]}
+
+
+def guid_diff_reconciles(report: dict, n_notes: int, lang: str):
+    """G-REL. tools/guid_diff.py computes kept / new / retired against the
+    released .apkg; nothing used to compare those numbers to the deck actually
+    being shipped, so the release note's churn figure was an estimate (the
+    original spec's was off by up to +22%).
+
+    The assertion is narrow on purpose: the summary row must describe THIS
+    language and the same number of cards the exporter is about to write. The
+    kept/retired split is a human-review number, not a machine-checkable one.
+    """
+    summary = (report or {}).get("summary") or {}
+    counts = (report or {}).get("counts") or {}
+    card_count = summary.get("card_count")
+    problems = {}
+    if card_count is None:
+        problems["no_summary_row"] = ("reports/guid_diff.json predates the "
+                                      "summary row; re-run tools/guid_diff.py")
+    elif card_count != n_notes:
+        problems["card_count_mismatch"] = {"guid_diff": card_count,
+                                           "notes_being_written": n_notes}
+    if summary.get("language") not in (None, lang):
+        problems["language_mismatch"] = {"guid_diff": summary.get("language"),
+                                         "export": lang}
+    return not problems, {"summary": summary, "counts": counts,
+                          "notes_being_written": n_notes,
+                          "violations": problems}
+
+
+# --------------------------------------------------------------------------
+# G-SEP: the separator table, as an EXPORT gate
+# --------------------------------------------------------------------------
+
+# Guide 1.1, measured: definitions reproduce 388/388 under " " and 330/388
+# under ""; expressions 689/689 under "" and 499/689 under " ".
+SEP_MIN_CORRECT_RATE = 0.98
+
+
+def _fixtures_root(explicit=None) -> Path | None:
+    """$ANKIDKDECK_FIXTURES, then <work>/fixtures. Returns None when neither
+    holds a manifest -- and the CALLER must treat that as a FAILURE, not a
+    skip: a release host with no fixtures has not checked the separator table."""
+    import os
+    cands = []
+    env = os.environ.get("ANKIDKDECK_FIXTURES")
+    if env:
+        cands.append(Path(env))
+    if explicit:
+        cands.append(Path(explicit))
+    for c in cands:
+        if (c / "manifest.json").exists():
+            return c
+    return None
+
+
+def _pages_to_parse(manifest: dict, joinable: set) -> list:
+    """Only the pages that carry a JOINABLE entry_id.
+
+    A page with nothing on both sides contributes to neither reproduction rate,
+    so parsing it changes no measurement -- and this gate runs on the export
+    path, twice per call, over a fixture set that is meant to grow to the whole
+    crawl corpus. The bound is what keeps it a gate rather than a tax.
+    """
+    out = []
+    for page in manifest.get("pages", []):
+        if set(page.get("entry_ids") or ()) & joinable:
+            out.append(page)
+    return out
+
+
+def _parse_fixture_pages(root: Path, pages: list, registry) -> dict:
+    # Imported lazily: gates.py is imported by every stage, and the parser
+    # pulls in bs4.
+    from bs4 import BeautifulSoup
+
+    from .stages.s20_parse import parse_article, slice_articles
+    entries: dict = {}
+    for page in pages:
+        p = root / page.get("file", "")
+        if not p.exists():
+            continue
+        soup = BeautifulSoup(p.read_text(encoding="utf-8"), "html.parser")
+        report: dict = {}
+        for eid, scope, art in slice_articles(soup):
+            entries[eid] = parse_article(eid, scope, art, registry, report)
+    return entries
+
+
+def _reproduction_rate(entries: dict, expected: dict, kind: str) -> tuple:
+    hit = total = 0
+    misses = []
+    for eid, wanted in expected.items():
+        e = entries.get(eid)
+        if e is None:
+            continue
+        if kind == "definitions":
+            have = {s["definition"] for s in e["senses"]}
+            have |= {s["definition"] for x in e["expressions"]
+                     for s in x.get("senses", [])}
+        else:
+            have = {x["expression"] for x in e["expressions"]}
+            have |= {v for x in e["expressions"] for v in x.get("variants", [])}
+        for text in wanted:
+            total += 1
+            if text in have:
+                hit += 1
+            elif len(misses) < 10:
+                misses.append({"entry_id": eid, "text": text})
+    return (hit / total if total else None), total, misses
+
+
+def separator_golden(registry, fixtures_dir=None):
+    """G-SEP. Two-sided: the shipped extract.SEP table reproduces the 2025
+    Danish strings the 22,734 x 4 translation cells are keyed by, AND a
+    deliberately wrong table provably does not.
+
+    A one-character change here silently invalidates the whole translation
+    asset -- that is how 2,007 bare English cards shipped -- and the observable
+    symptom is a collapsed bind rate plus a very large translate bill, not a
+    blocked build. So this runs on the EXPORT path, not only under pytest.
+
+    Fixtures absent is a FAILURE, never a silent pass: a release host that
+    cannot run this check has not run it.
+    """
+    from . import extract
+
+    root = _fixtures_root(fixtures_dir)
+    if root is None:
+        return False, {"checked": False, "reason": "fixtures unavailable",
+                       "hint": "build them with tools/build_fixtures.py "
+                               "--work <workspace> and point "
+                               "ANKIDKDECK_FIXTURES at the result, or place "
+                               "them in <work>/fixtures"}
+    manifest = read_json(root / "manifest.json")
+    joinable = set(manifest.get("joinable_entry_ids") or [])
+    if not joinable:
+        return False, {"checked": False,
+                       "reason": "no entry_id joins the 2025 and 2026 sides in "
+                                 "this fixture set",
+                       "pages": len(manifest.get("pages") or [])}
+    exp = manifest.get("expected") or {}
+    want_defs = {k: v for k, v in
+                 read_json(root / exp.get("definitions", "x"), default={}).items()
+                 if k in joinable}
+    want_exprs = {k: v for k, v in
+                  read_json(root / exp.get("expressions", "x"), default={}).items()
+                  if k in joinable}
+    pages = _pages_to_parse(manifest, joinable)
+    entries = _parse_fixture_pages(root, pages, registry)
+    r_def, n_def, miss_def = _reproduction_rate(entries, want_defs, "definitions")
+    r_expr, n_expr, miss_expr = _reproduction_rate(entries, want_exprs, "expressions")
+
+    saved = dict(extract.SEP)
+    try:
+        extract.SEP["definition"] = ""
+        extract.SEP["expr_definition"] = ""
+        extract.SEP["expression"] = " "
+        wrong = _parse_fixture_pages(root, pages, registry)
+        w_def, _, _ = _reproduction_rate(wrong, want_defs, "definitions")
+        w_expr, _, _ = _reproduction_rate(wrong, want_exprs, "expressions")
+    finally:
+        extract.SEP.clear()
+        extract.SEP.update(saved)
+
+    def _under(rate) -> bool:
+        return rate is not None and rate < SEP_MIN_CORRECT_RATE
+
+    problems = {}
+    if _under(r_def):
+        problems["definitions_do_not_reproduce"] = r_def
+    if _under(r_expr):
+        problems["expressions_do_not_reproduce"] = r_expr
+    if n_def and (w_def is None or not w_def < r_def):
+        problems["wrong_definition_separator_still_reproduces"] = w_def
+    if n_expr and (w_expr is None or not w_expr < r_expr):
+        problems["wrong_expression_separator_still_reproduces"] = w_expr
+    if not n_def and not n_expr:
+        problems["nothing_to_compare"] = True
+    return not problems, {
+        "checked": True, "fixtures": str(root),
+        "joinable_entry_ids": len(joinable),
+        "pages_parsed": len(pages),
+        "pages_in_fixture_set": len(manifest.get("pages") or []),
+        "definitions": {"texts": n_def, "rate": r_def, "rate_wrong_sep": w_def,
+                        "misses": miss_def},
+        "expressions": {"texts": n_expr, "rate": r_expr, "rate_wrong_sep": w_expr,
+                        "misses": miss_expr},
+        "min_correct_rate": SEP_MIN_CORRECT_RATE,
+        "violations": problems}

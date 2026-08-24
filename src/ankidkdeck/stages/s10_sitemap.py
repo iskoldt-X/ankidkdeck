@@ -12,6 +12,7 @@ import re
 from urllib.parse import unquote
 
 from ..config import Config
+from ..gates import G_SITEMAP_INV, Gate, run_gates, sitemap_inventory
 from ..net import Net
 from ..util import NFC, FatalError, nk, write_json
 
@@ -111,16 +112,25 @@ def run(cfg: Config, net: Net, gates: dict) -> dict:
                 affix_slugs.add(base)
         lastmods_per_shard[su] = mods
 
-    if total < 80_000:
-        raise FatalError(f"sitemap total {total} URLs; expected > 80k -- site changed?")
-    # Range re-baselined from a 4-shard measurement (285 unique affix slugs over
-    # a_d/e_h/other/u_z) plus the trailing-hyphen population scaled to the three
-    # unmeasured shards: the old [150, 400] ceiling was derived from TWO shards
-    # and would have hard-stopped the first real run.
-    lo, hi = gates.get("affix_count_range", [150, 600])
-    if not lo <= len(affix_slugs) <= hi:
-        raise FatalError(
-            f"unique affix slug count {len(affix_slugs)} outside [{lo},{hi}]")
+    # Both inventory bounds are DATA and both are RECORDED. The URL total used
+    # to be `if total < 80_000: raise FatalError(...)` -- a source constant
+    # extrapolated from a partial measurement, and a stop that never reached
+    # gates_report.json. It now lives in registry/gates.json as
+    # sitemap_total_range, shipped null = report-only until a human copies the
+    # first real 9-request run's total in as a band. The affix range is already
+    # baselined from a real 4-shard measurement (285 unique slugs over
+    # a_d/e_h/other/u_z, scaled to the three unmeasured shards; the old
+    # [150, 400] ceiling came from TWO shards and would have hard-stopped the
+    # first real run), so it stays enforced -- as a gate row, not a bare raise.
+    total_range = gates.get("sitemap_total_range")
+    affix_range = gates.get("affix_count_range", [150, 600])
+    run_gates([
+        Gate(G_SITEMAP_INV, "the sitemap inventory's URL total and unique affix "
+                            "slug count are inside their declared ranges",
+             lambda: sitemap_inventory(total, total_range, len(affix_slugs),
+                                       affix_range),
+             stage="10"),
+    ], cfg, stage="10")
 
     out = {
         "total_urls": total,
@@ -131,5 +141,14 @@ def run(cfg: Config, net: Net, gates: dict) -> dict:
         "lastmod_distinct_per_shard": {k: sorted(x for x in v if x) for k, v in lastmods_per_shard.items()},
     }
     write_json(cfg.json_dir / "sitemap.json", out)
-    return {"total_urls": total, "n_lemmas": len(lemmas), "n_affix": len(affix_slugs),
-            "requests": net.request_count}
+    report = {"total_urls": total, "n_lemmas": len(lemmas),
+              "n_affix": len(affix_slugs), "requests": net.request_count,
+              "sitemap_total_range": total_range,
+              "baseline_hint": (
+                  None if total_range else
+                  "sitemap_total_range is null (report-only). Copy "
+                  "sitemap_total_range: [%d, %d] into registry/gates.json to "
+                  "baseline this inventory." % (int(total * 0.75),
+                                                int(total * 1.25)))}
+    write_json(cfg.report_dir / "sitemap_report.json", report)
+    return report

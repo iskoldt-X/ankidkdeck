@@ -1,4 +1,16 @@
 {
+  "_note": [
+   "Flex-table slot labels, keyed '<data-pos-key>|<row counts per table>'.",
+   "THESE LABELS STAY ENGLISH ON EVERY DECK, including the Chinese, German and",
+   "Spanish ones. That is the v2.1 precedent and it is deliberate: every UI string",
+   "the exporter emits is English on every deck ('Fixed Expressions', 'Variants:',",
+   "'Derivatives:', 'Etymology:', 'Rank:', 'Show more definitions...'), so",
+   "translating this one table would make the paradigm block the single",
+   "inconsistent element rather than fixing an inconsistency. Per-language slot",
+   "labels are explicitly out of scope for v3.0 (owner ruling, round 2).",
+   "A shape with no entry here renders its cells with NO label -- never an",
+   "invented one."
+  ],
   "sb.|3": ["definite singular", "indefinite plural", "definite plural"],
   "vb.|3": ["present tense", "past tense", "past participle"],
   "adj.|2,2": ["neuter form", "plural / definite form", "comparative", "superlative"]

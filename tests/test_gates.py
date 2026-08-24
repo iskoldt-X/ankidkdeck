@@ -171,6 +171,140 @@ def test_run_gates_records_everything_before_it_raises(cfg):
     assert report["failed"] == ["G-ALSO-BAD", "G-BAD"]
 
 
+# ------------------------------------------------- the report's merge key
+
+def test_a_passing_language_cannot_erase_a_failing_one(cfg):
+    """R4 M1. G-COV / G-RATE / G-MEDIA / G-DET are verdicts about ONE language's
+    deck, and the report merged on the bare gate id with "later stage wins" --
+    so `export --lang Chinese` (FATAL G-COV) followed by `export --lang German`
+    (passing) left `ankidkdeck gates` certifying the release all-green."""
+    from ankidkdeck.util import FatalError, read_json
+    zh = [G.Gate(G.G_COV, "coverage", lambda: (False, {"missing": 8}),
+                 stage="70", extra={"lang": "Chinese"})]
+    de = [G.Gate(G.G_COV, "coverage", lambda: (True, {"missing": 0}),
+                 stage="70", extra={"lang": "German"})]
+    with pytest.raises(FatalError):
+        G.run_gates(zh, cfg, stage="70")
+    G.run_gates(de, cfg, stage="70")
+    report = read_json(cfg.report_dir / "gates_report.json")
+    rows = {G.row_label(r): r for r in report["results"]}
+    assert set(rows) == {"G-COV[lang=Chinese]", "G-COV[lang=German]"}
+    assert rows["G-COV[lang=Chinese]"]["ok"] is False
+    assert rows["G-COV[lang=German]"]["ok"] is True
+    # the aggregate still names the failure
+    assert report["failed"] == ["G-COV"]
+    assert report["failed_rows"] == ["G-COV[lang=Chinese]"]
+
+
+def test_re_running_the_same_scope_replaces_its_own_row(cfg):
+    from ankidkdeck.util import read_json
+    scope = {"lang": "German"}
+    G.run_gates([G.Gate(G.G_COV, "coverage", lambda: (True, {"n": 1}),
+                        stage="70", extra=scope)], cfg)
+    G.run_gates([G.Gate(G.G_COV, "coverage", lambda: (True, {"n": 2}),
+                        stage="70", extra=scope)], cfg)
+    rows = read_json(cfg.report_dir / "gates_report.json")["results"]
+    assert len(rows) == 1 and rows[0]["detail"]["n"] == 2
+
+
+def test_the_same_gate_id_at_two_stages_keeps_two_rows(cfg):
+    from ankidkdeck.util import read_json
+    G.run_gates([G.Gate(G.G_SEED, "seeds", lambda: (True, {}), stage="30")], cfg)
+    G.run_gates([G.Gate(G.G_SEED, "seeds", lambda: (True, {}), stage="70")], cfg)
+    rows = read_json(cfg.report_dir / "gates_report.json")["results"]
+    assert sorted(r["stage"] for r in rows) == ["30", "70"]
+
+
+def test_the_cli_gates_command_exits_non_zero_when_any_row_fails(cfg, capsys):
+    from ankidkdeck.cli import gates_report
+    from ankidkdeck.util import FatalError
+    with pytest.raises(FatalError):
+        G.run_gates([G.Gate(G.G_COV, "coverage", lambda: (False, {}),
+                            stage="70", extra={"lang": "Chinese"})], cfg)
+    G.run_gates([G.Gate(G.G_COV, "coverage", lambda: (True, {}),
+                        stage="70", extra={"lang": "German"})], cfg)
+    assert gates_report(cfg) == 1
+    out = capsys.readouterr().out
+    assert "G-COV[lang=Chinese]" in out and "1 failing" in out
+
+
+# ------------------------------------------------------- the new gate bodies
+
+def test_case_only_members_is_baselined_not_forbidden():
+    rows = [{"family_id": "1", "word": "var"}] * 5
+    assert G.case_only_members(rows)[0] is True          # unbaselined: report
+    assert G.case_only_members(rows, 5)[0] is True
+    ok, detail = G.case_only_members(rows, 4)
+    assert ok is False and detail["over_baseline"] is True
+    assert detail["rows"] == 5
+
+
+def test_sitemap_inventory_is_report_only_until_it_is_baselined():
+    # null range = report-only, which is what ships: an absolute floor
+    # extrapolated from a partial measurement is a vacuous gate.
+    ok, detail = G.sitemap_inventory(91234, None, 285, [150, 600])
+    assert ok is True and "report-only" in detail["total_note"]
+    # baselined: a collapse AND a 3x jump both fail (the shard set changed)
+    assert G.sitemap_inventory(91234, [70000, 110000], 285, [150, 600])[0] is True
+    assert G.sitemap_inventory(4000, [70000, 110000], 285, [150, 600])[0] is False
+    assert G.sitemap_inventory(300000, [70000, 110000], 285, [150, 600])[0] is False
+    # the affix range is already measured, so it stays enforced
+    ok, detail = G.sitemap_inventory(91234, None, 9, [150, 600])
+    assert ok is False
+    assert "affix_slugs_outside_range" in detail["violations"]
+
+
+def test_ledger_label_reconciliation():
+    ok, detail = G.ledger_label_reconciliation(
+        {"hus": {"status": "ok", "results_label": "3 resultater",
+                 "article_count": 3},
+         "har": {"status": "ok", "results_label": "", "article_count": 1},
+         "zzz": {"status": "nohit"}},
+        {"hus": 3, "har": 1})
+    assert ok is True and detail["ok_pages"] == 2 and detail["error_pages"] == 0
+    # a label that does not reconcile with its own stored count
+    bad, detail = G.ledger_label_reconciliation(
+        {"hus": {"status": "ok", "results_label": "5 resultater",
+                 "article_count": 3}}, {"hus": 3})
+    assert bad is False and detail["label_does_not_reconcile"]
+    # the parse disagreeing with the ledger
+    bad, detail = G.ledger_label_reconciliation(
+        {"hus": {"status": "ok", "results_label": "3 resultater",
+                 "article_count": 3}}, {"hus": 2})
+    assert bad is False and detail["parsed_count_disagrees_with_ledger"]
+    # error pages are baselined, not forbidden: they are skipped by design
+    rows = {"w%d" % i: {"status": "ok", "results_label": "", "article_count": 1}
+            for i in range(99)}
+    rows["broken"] = {"status": "error", "results_label": "5 resultater",
+                      "article_count": 1}
+    counts = {w: 1 for w in rows if rows[w]["status"] == "ok"}
+    assert G.ledger_label_reconciliation(rows, counts, 0.01)[0] is True
+    assert G.ledger_label_reconciliation(rows, counts, 0.0)[0] is False
+
+
+def test_guid_diff_reconciles_against_the_deck_being_written():
+    report = {"summary": {"language": "German", "card_count": 34}}
+    assert G.guid_diff_reconciles(report, 34, "German")[0] is True
+    ok, detail = G.guid_diff_reconciles(report, 35, "German")
+    assert ok is False and "card_count_mismatch" in detail["violations"]
+    ok, detail = G.guid_diff_reconciles(report, 34, "Chinese")
+    assert ok is False and "language_mismatch" in detail["violations"]
+    # a report written before the summary row existed
+    ok, detail = G.guid_diff_reconciles({"counts": {}}, 34, "German")
+    assert ok is False and "no_summary_row" in detail["violations"]
+
+
+def test_g_sep_fails_when_the_fixtures_are_absent(cfg, registry, monkeypatch):
+    """"Fixtures unavailable" is a FAILURE, never a silent pass: a release host
+    that cannot check the separator table has not checked it."""
+    monkeypatch.delenv("ANKIDKDECK_FIXTURES", raising=False)
+    ok, detail = G.separator_golden(registry, cfg.work_dir / "fixtures")
+    assert ok is False
+    assert detail["checked"] is False
+    assert detail["reason"] == "fixtures unavailable"
+    assert "build_fixtures.py" in detail["hint"]
+
+
 # --------------------------------------------------------------- export gates
 
 def _note(guid="g1", content="1. hus", fields=None, rank="1"):
@@ -354,6 +488,143 @@ def test_robots_blanket_disallow_is_a_governance_stop():
     assert robots_forbids_ddo("User-agent: *\nDisallow: /   # comment\n") is not None
     # another agent's blanket ban is not ours
     assert robots_forbids_ddo("User-agent: BadBot\nDisallow: /\n") is None
+
+
+def test_a_dead_gate_id_is_not_declared_and_gate_extra_is_used():
+    """R4 m14 / item 20. Both halves of the dead-code finding: cli's
+    NETWORK_COMMANDS is gone (the invariant is enforced by which body calls
+    _net), and Gate.extra is now the report's scope key."""
+    import ankidkdeck.cli as cli
+    assert not hasattr(cli, "NETWORK_COMMANDS")
+    g = G.Gate("G-X", "d", lambda: (True, {}), stage="70",
+               extra={"lang": "German"})
+    assert G.row_label({"id": g.id, "extra": g.extra}) == "G-X[lang=German]"
+    assert G.row_label({"id": g.id, "extra": {}}) == "G-X"
+
+
+# ------------------------------------------------------- stage 60 audio cache
+
+def test_the_audio_cache_hashes_only_what_the_cheap_check_flags(cfg, monkeypatch):
+    """R3 m12: _sha_of() ran for every already-cached file on every invocation,
+    i.e. a full sha256 sweep of 4,629+ files per resume."""
+    from ankidkdeck.stages import s60_audio as S60
+    from ankidkdeck.util import sha256_bytes, write_json
+    url = "https://static.ordnet.dk/mp3/11021/11021722_1.mp3"
+    data = b"id3-payload"
+    (cfg.audio_dir / "11021722_1.mp3").write_bytes(data)
+    write_json(cfg.audio_dir / "manifest.json",
+               {url: {"url": url, "file": "11021722_1.mp3",
+                      "sha256": sha256_bytes(data), "bytes": len(data),
+                      "entry_id": "11021722", "slot_n": 1, "source": "legacy"}})
+    e = make_entry("11021722", "hus", pos_key="sb.",
+                   senses=[make_sense("21000001", "bygning")],
+                   udtale=[{"ipa": "huˀs", "label": None, "audio_url": url,
+                            "slot_n": 1}])
+    write_json(cfg.json_dir / "entries.json", {"11021722": e})
+    hashed = []
+    real = S60._sha_of
+    monkeypatch.setattr(S60, "_sha_of",
+                        lambda p: (hashed.append(str(p)), real(p))[1])
+    report = S60.run(cfg, None)
+    assert report["already_cached"] == 1
+    assert hashed == [], "the size check was skipped"
+    # a size that disagrees DOES get hashed
+    write_json(cfg.audio_dir / "manifest.json",
+               {url: {"url": url, "file": "11021722_1.mp3",
+                      "sha256": sha256_bytes(data), "bytes": 999,
+                      "entry_id": "11021722", "slot_n": 1, "source": "legacy"}})
+    S60.run(cfg, None)
+    assert hashed
+
+
+def test_orphans_are_counted_always_and_swept_only_on_request(cfg):
+    """R4 m10: the sweep was unconditional, so running `audio` against a partial
+    entries.json quarantined the whole 2025 cache -- which the next full run then
+    re-downloads."""
+    from ankidkdeck.stages import s60_audio as S60
+    from ankidkdeck.util import write_json
+    (cfg.audio_dir / "19999999_1.mp3").write_bytes(b"stale")
+    e = make_entry("11021722", "hus", pos_key="sb.",
+                   senses=[make_sense("21000001", "bygning")])
+    write_json(cfg.json_dir / "entries.json", {"11021722": e})
+    report = S60.run(cfg, None)
+    assert report["unreferenced_files"] == 1
+    assert report["quarantined_orphans"] == 0
+    assert (cfg.audio_dir / "19999999_1.mp3").exists()
+    assert "--sweep-orphans" in report["sweep_hint"]
+    report = S60.run(cfg, None, sweep_orphans=True)
+    assert report["quarantined_orphans"] == 1
+    assert (cfg.audio_dir / "_orphans" / "19999999_1.mp3").exists()
+
+
+# ------------------------------------------------- stage 10 governance / gzip
+
+class _FakeNet:
+    """Offline stand-in for net.Net: robots.txt, the index, and 1 shard."""
+
+    ROBOTS = ("User-agent: *\nAllow: /\n"
+              "Sitemap: https://ordnet.dk/sitemaps/ddo/index.xml\n")
+
+    def __init__(self, n_urls=12, n_affix=200):
+        self.request_count = 0
+        self.n_urls = n_urls
+        self.n_affix = n_affix
+
+    class _R:
+        def __init__(self, text):
+            self.text = text
+            self.content = text.encode("utf-8")
+
+    def get(self, url):
+        self.request_count += 1
+        if url.endswith("robots.txt"):
+            return self._R(self.ROBOTS)
+        if url.endswith("index.xml"):
+            locs = "".join("<loc>https://x/shard_%d.xml</loc>" % i
+                           for i in range(5))
+            return self._R("<sitemapindex>%s</sitemapindex>" % locs)
+        words = ["ord%d" % i for i in range(self.n_urls)]
+        words += ["-affiks%d" % i for i in range(self.n_affix)]
+        # The slug is the LAST path segment: stage 10 reads it with
+        # unquote(loc.rsplit("/", 1)[-1]).
+        locs = "".join(
+            "<url><loc>https://ordnet.dk/ddo/%s</loc>"
+            "<lastmod>2026-01-01</lastmod></url>" % w for w in words)
+        return self._R("<urlset>%s</urlset>" % locs)
+
+
+def test_the_sitemap_url_total_is_a_gate_row_not_a_bare_raise(cfg):
+    """R4 m1 / R3 v3: the URL total was `raise FatalError(total < 80_000)` --
+    a source constant extrapolated from a partial measurement, and a stop that
+    never reached gates_report.json."""
+    from ankidkdeck.util import read_json
+    from ankidkdeck.stages import s10_sitemap
+    net = _FakeNet(n_urls=12, n_affix=200)
+    # shipped default: sitemap_total_range is null -> report only, no stop,
+    # even though 12 * 5 shards is nowhere near 80k.
+    report = s10_sitemap.run(cfg, net, {"sitemap_total_range": None,
+                                        "affix_count_range": [150, 600]})
+    assert report["total_urls"] == 5 * (12 + 200)
+    assert "sitemap_total_range" in report["baseline_hint"]
+    rows = read_json(cfg.report_dir / "gates_report.json")["results"]
+    inv = [r for r in rows if r["id"] == "G-SITEMAP-INV"]
+    assert inv and inv[0]["ok"] is True and inv[0]["stage"] == "10"
+    assert "report-only" in inv[0]["detail"]["total_note"]
+
+
+def test_a_baselined_sitemap_range_fails_as_a_recorded_gate(cfg):
+    from ankidkdeck.util import FatalError, read_json
+    from ankidkdeck.stages import s10_sitemap
+    with pytest.raises(FatalError) as exc:
+        s10_sitemap.run(cfg, _FakeNet(), {"sitemap_total_range": [80000, 120000],
+                                          "affix_count_range": [150, 600]})
+    assert "G-SITEMAP-INV" in str(exc.value)
+    rows = read_json(cfg.report_dir / "gates_report.json")["results"]
+    inv = [r for r in rows if r["id"] == "G-SITEMAP-INV"][0]
+    assert inv["ok"] is False
+    assert "total_urls_outside_range" in inv["detail"]["violations"]
+    # ...and sitemap.json was NOT written: the stage stops before the inventory
+    assert not (cfg.json_dir / "sitemap.json").exists()
 
 
 def test_a_gz_url_serving_plain_xml_is_not_gunzipped():
