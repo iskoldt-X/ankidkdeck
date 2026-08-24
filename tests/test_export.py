@@ -13,6 +13,9 @@ label and G-RATE's Variants row became vacuous), the glued homograph form on the
 card face, and per-family double counting of shared idioms.
 """
 
+import tempfile
+from pathlib import Path
+
 import pytest
 from conftest import (make_entry, make_expression, make_sense, write_workspace)
 
@@ -371,14 +374,104 @@ def test_a_full_offline_export_passes_every_gate(cfg, fixtures_env):
     assert "G-SEP" in {r["id"] for r in gates["results"]}
 
 
-def test_every_stage_70_gate_row_is_scoped_to_its_language(cfg, fixtures_env):
+# G-SEED reads the append-only registry and G-RANK reads words.json, so both
+# verdicts are identical for every language: recorded ONCE, unscoped.
+LANGUAGE_INDEPENDENT_GATES = {"G-SEED", "G-RANK"}
+
+
+def _stage_70_rows(cfg, reg, lang):
+    """Drive the export for its GATE REPORT only.
+
+    run_gates() writes the report BEFORE it raises, so this works with or
+    without the fixture set: G-SEP fails when the fixtures are absent, and that
+    failure is orthogonal to how rows are scoped.
+    """
+    try:
+        S70.run(cfg, reg, lang)
+    except FatalError:
+        pass
+    return [r for r in read_json(cfg.report_dir / "gates_report.json")["results"]
+            if r["stage"] == "70"]
+
+
+def test_a_stage_70_gate_row_is_scoped_exactly_when_its_verdict_is(cfg):
     reg = _tiny_workspace(cfg)
-    S70.run(cfg, reg, "German")
-    rows = read_json(cfg.report_dir / "gates_report.json")["results"]
-    stage70 = [r for r in rows if r["stage"] == "70"]
+    stage70 = _stage_70_rows(cfg, reg, "German")
     assert stage70
-    for r in stage70:
-        assert r["extra"] == {"lang": "German"}
+    scoped = {r["id"] for r in stage70 if r["extra"] == {"lang": "German"}}
+    unscoped = {r["id"] for r in stage70 if not r["extra"]}
+    assert unscoped == LANGUAGE_INDEPENDENT_GATES
+    assert scoped and not (scoped & LANGUAGE_INDEPENDENT_GATES)
+
+
+def test_a_second_language_adds_rows_only_for_the_per_language_gates(cfg):
+    """Two languages give two G-COV rows -- and exactly ONE G-SEED row."""
+    reg = _tiny_workspace(cfg)
+    zh = cfg.json_dir / "translations" / "Chinese"
+    write_json(zh / "definitions.json",
+               {"11021722:21000050": {"lemma": "fangzi", "gloss": "bygning",
+                                      "src_sha": "x", "provenance": "t"}})
+    write_json(zh / "expressions.json", {})
+    _stage_70_rows(cfg, reg, "German")
+    rows = _stage_70_rows(cfg, reg, "Chinese")
+    per_id = {}
+    for r in rows:
+        per_id.setdefault(r["id"], []).append(r["extra"])
+    assert sorted(per_id["G-COV"], key=str) == [{"lang": "Chinese"},
+                                                {"lang": "German"}]
+    for gid in LANGUAGE_INDEPENDENT_GATES:
+        assert per_id[gid] == [{}], (gid, per_id[gid])
+
+
+def test_the_retired_companion_fills_the_sort_field(cfg, tmp_path):
+    """R4 m9: every retired note left sfld empty, so the 4,410 of them scattered
+    through the browser's frequency ordering instead of collecting in one block
+    -- in a package whose entire purpose is "search the tag, select all,
+    delete"."""
+    import importlib.util
+    import sqlite3
+    import zipfile
+
+    from ankidkdeck.util import write_json
+    spec = importlib.util.spec_from_file_location(
+        "retired_notes", Path(__file__).resolve().parents[1] / "tools"
+        / "retired_notes.py")
+    retired_notes = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(retired_notes)
+
+    guids = [S70.guid_for(w, "German") for w in ("huse", "husene")]
+    write_json(cfg.report_dir / "guid_diff.json",
+               {"language": "German",
+                "retired": [{"guid": guids[0], "query_word": "huse",
+                             "merged_into": "hus"},
+                            {"guid": guids[1], "query_word": "husene",
+                             "merged_into": None}]})
+    out = tmp_path / "retired.apkg"
+    rc = retired_notes.main(["--lang", "German", "--work", str(cfg.work_dir),
+                             "--out", str(out)])
+    assert rc == 0 and out.exists()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with zipfile.ZipFile(out) as z:
+            names = z.namelist()
+            db = ("collection.anki21" if "collection.anki21" in names
+                  else "collection.anki2")
+            z.extract(db, tmp)
+        con = sqlite3.connect(str(Path(tmp) / db))
+        rows = con.execute("SELECT guid, flds, sfld FROM notes").fetchall()
+        con.close()
+    assert len(rows) == 2
+    idx = S70.FIELD_NAMES.index("FrequencyRank")
+    for guid, flds, sfld in rows:
+        assert guid in guids
+        fields = flds.split("\x1f")
+        assert fields[idx] == retired_notes.RETIRED_RANK == "0"
+        # sfld is the sort column Anki derives from that field; it must not be
+        # blank, and it must be the SAME on every retired note so they sort
+        # together, ahead of every live rank (1..N).
+        assert str(sfld).strip() != ""
+        assert str(sfld) == "0"
+    assert len({str(r[2]) for r in rows}) == 1
 
 
 def test_g_det_compares_two_independently_derived_media_lists(cfg, fixtures_env):

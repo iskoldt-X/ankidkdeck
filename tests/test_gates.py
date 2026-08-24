@@ -502,7 +502,90 @@ def test_a_dead_gate_id_is_not_declared_and_gate_extra_is_used():
     assert G.row_label({"id": g.id, "extra": {}}) == "G-X"
 
 
+# --------------------------------------------- the net layer's own accounting
+
+class _Resp:
+    def __init__(self, status=200, content=b"id3"):
+        self.status_code = status
+        self.content = content
+        self.headers = {}
+        self.text = ""
+        self.history = []
+
+
+def _fake_net(cfg, monkeypatch, responses):
+    from ankidkdeck import net as N
+    monkeypatch.setattr(N.time, "sleep", lambda *a, **k: None)
+    n = N.Net(cfg)
+    seq = list(responses)
+    monkeypatch.setattr(n.session, "get",
+                        lambda *a, **k: seq.pop(0) if seq else _Resp())
+    return n
+
+
+def test_an_audio_fetch_is_counted_like_every_other_request(cfg, monkeypatch):
+    """R4 n5: get_audio bypassed request_count, so a stage-60 run that fetched
+    ~4,600 files reported 0 requests -- the one number a polite crawler is
+    judged on."""
+    n = _fake_net(cfg, monkeypatch, [_Resp(), _Resp(), _Resp()])
+    for i in range(3):
+        n.get_audio("https://static.ordnet.dk/mp3/11021/1102172%d_1.mp3" % i)
+    assert n.request_count == 3
+    assert n.circuit.results == [True, True, True]
+
+
+def test_a_degraded_audio_host_trips_the_circuit_breaker(cfg, monkeypatch):
+    """It also bypassed the breaker, so a dead audio host produced ~4,600
+    individual FatalErrors on every resume instead of one stop."""
+    from ankidkdeck.util import FatalError
+    n = _fake_net(cfg, monkeypatch, [_Resp(503), _Resp(503), _Resp(503)])
+    url = "https://static.ordnet.dk/mp3/11021/11021722_1.mp3"
+    for _ in range(2):
+        with pytest.raises(FatalError) as exc:
+            n.get_audio(url)
+        assert "audio fetch failed" in str(exc.value)
+    with pytest.raises(FatalError) as exc:
+        n.get_audio(url)
+    assert "circuit breaker" in str(exc.value)
+    assert n.request_count == 3
+
+
+def test_one_audio_failure_does_not_trip_the_breaker(cfg, monkeypatch):
+    from ankidkdeck.util import FatalError
+    n = _fake_net(cfg, monkeypatch, [_Resp(404), _Resp(), _Resp()])
+    with pytest.raises(FatalError):
+        n.get_audio("https://static.ordnet.dk/mp3/11021/11021722_1.mp3")
+    n.get_audio("https://static.ordnet.dk/mp3/11021/11021722_2.mp3")
+    assert n.circuit.consecutive_failures == 0
+
+
 # ------------------------------------------------------- stage 60 audio cache
+
+def test_the_audio_url_assertion_demands_eight_digits():
+    """Guide 4.11 asserts an 8-digit entry_id and the corpus agrees
+    (4,629/4,629). The looser 6-or-more form would have let a malformed slice
+    past the only free integrity check this stage has -- and the wrong sound on
+    a card is silent by construction."""
+    from ankidkdeck.stages.s60_audio import assert_url_belongs
+    from ankidkdeck.util import FatalError
+    ok = "https://static.ordnet.dk/mp3/11021/11021722_1.mp3"
+    assert assert_url_belongs(ok, "11021722", 1) == 1
+    for bad in ("https://static.ordnet.dk/mp3/11021/110217_1.mp3",
+                "https://static.ordnet.dk/mp3/11021/1102172_1.mp3",
+                "https://static.ordnet.dk/mp3/11021/110217223_1.mp3"):
+        eid = bad.rsplit("/", 1)[-1].split("_")[0]
+        with pytest.raises(FatalError) as exc:
+            assert_url_belongs(bad, eid, 1)
+        assert "does not match the DDO pattern" in str(exc.value), bad
+    # the other two halves of the assertion still fire
+    with pytest.raises(FatalError) as exc:
+        assert_url_belongs(ok, "11021722", 2)
+    assert "slot mismatch" in str(exc.value)
+    with pytest.raises(FatalError) as exc:
+        assert_url_belongs("https://static.ordnet.dk/mp3/11021/11021799_1.mp3",
+                           "11021722", 1)
+    assert "does not belong to entry" in str(exc.value)
+
 
 def test_the_audio_cache_hashes_only_what_the_cheap_check_flags(cfg, monkeypatch):
     """R3 m12: _sha_of() ran for every already-cached file on every invocation,

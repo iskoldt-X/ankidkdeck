@@ -68,8 +68,21 @@ class Net:
         return r
 
     def get_audio(self, url: str) -> requests.Response:
+        """static.ordnet.dk: plain nginx, no WAF, 1s sleep -- but the SAME
+        accounting as every other request.
+
+        It used to bypass both request_count and the circuit breaker, so a stage
+        60 run that fetched ~4,600 files reported 0 requests, and a degraded
+        audio host produced 4,600 individual FatalErrors on resume instead of one
+        breaker trip. The failure is recorded BEFORE it is raised, so three
+        consecutive failures trip the breaker with its own message rather than
+        the third file's.
+        """
         time.sleep(1.0)
+        self.request_count += 1
         r = self.session.get(url, timeout=30)
         if r.status_code != 200:
+            self.circuit.record(False)
             raise FatalError(f"audio fetch failed: {url} -> HTTP {r.status_code}")
+        self.circuit.record(True)
         return r

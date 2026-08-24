@@ -31,8 +31,13 @@ from ..util import FatalError, read_json, sha256_bytes, write_json
 # report keeps the later result. Two local copies of a gate id is how a typo
 # creates a second, invisible gate.
 
+# EIGHT digits, as guide 4.11 asserts and as the corpus shows: all 4,629 legacy
+# audio URLs carry an 8-digit entry_id (measured 4,629/4,629). `\d{6,}` was looser
+# than both the spec and the data, so a 6- or 7-digit id -- a malformed slice, or a
+# re-shaped DDO URL -- would have walked past the one free integrity check this
+# stage has, and the wrong sound on a card is silent by construction.
 AUDIO_URL_RE = re.compile(
-    r"^https://static\.ordnet\.dk/mp3/(\d{5})/(\d{6,})_(\d+)\.mp3$")
+    r"^https://static\.ordnet\.dk/mp3/(\d{5})/(\d{8})_(\d+)\.mp3$")
 ORPHAN_DIR = "_orphans"
 MANIFEST = "manifest.json"
 
@@ -46,7 +51,10 @@ def assert_url_belongs(url: str, entry_id: str, slot_n) -> int:
     entry we parsed it out of."""
     m = AUDIO_URL_RE.match(url)
     if m is None:
-        raise FatalError("audio URL does not match the DDO pattern: %r" % url)
+        raise FatalError(
+            "audio URL does not match the DDO pattern "
+            "https://static.ordnet.dk/mp3/<eid[:5]>/<8-digit eid>_<n>.mp3: %r"
+            % url)
     n = int(m.group(3))
     if slot_n is not None and int(slot_n) != n:
         raise FatalError("audio slot mismatch for %s: parsed %s, URL says %d"

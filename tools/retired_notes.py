@@ -7,8 +7,11 @@ a retired duplicate from a card they still need. This writes a second .apkg that
 re-uses the SAME notetype and the SAME GUIDs, so importing it OVERWRITES each
 retired note in place with one sentence and one tag:
 
-    Content = "This card was merged into <lemma>."
-    tag     = ankidkdeck::merged-into-lemma
+    Content       = "This card was merged into <lemma>."
+    tag           = ankidkdeck::merged-into-lemma
+    FrequencyRank = "0"   the sort field, identical on every retired note, so
+                          they arrive as one contiguous block in the browser
+                          instead of scattering through the live frequency order
 
 Release notes then say: import the companion, search
 tag:ankidkdeck::merged-into-lemma, select all, delete. One click instead of
@@ -32,6 +35,10 @@ if str(REPO_ROOT / "src") not in sys.path:
 
 TAG = "ankidkdeck::merged-into-lemma"
 UNKNOWN_TARGET = "This card was merged into another card."
+# The sort-field value every retired note carries. See the comment at the write
+# site: one constant, ahead of every live rank, so the retired block is
+# contiguous in the browser.
+RETIRED_RANK = "0"
 
 
 def main(argv=None) -> int:
@@ -86,6 +93,16 @@ def main(argv=None) -> int:
         fields = [""] * len(FIELD_NAMES)
         fields[0] = row.get("query_word") or ""
         fields[2] = content
+        # FrequencyRank is the SORT FIELD (sort_field_index = 7), and Anki stores
+        # it with SQLite integer affinity. Leaving it blank gave every retired
+        # note an empty sort column, so they scattered through the browser's
+        # frequency ordering instead of collecting in one block -- which is the
+        # opposite of what a package whose entire purpose is "select all, delete"
+        # wants. RETIRED_RANK is a constant, not a real rank: 0 sorts ahead of
+        # every live card (1..N) and is identical on every retired note, so they
+        # arrive as one contiguous run. It is also visibly not a rank, so nobody
+        # mistakes a retired card for card number 0.
+        fields[FIELD_NAMES.index("FrequencyRank")] = RETIRED_RANK
         deck.add_note(genanki.Note(model=model, fields=fields,
                                    guid=row["guid"], tags=[TAG]))
 
@@ -98,6 +115,8 @@ def main(argv=None) -> int:
     print("wrote %s" % out)
     print("  retired notes %d (%d name their merge target)"
           % (len(retired), n_known))
+    print("  sort field    FrequencyRank = %r on every note, so they sort "
+          "together" % RETIRED_RANK)
     print("  notetype id   %d (identical to the main package)" % model.model_id)
     print("  user cleanup  search 'tag:%s' -> select all -> delete" % TAG)
     return 0

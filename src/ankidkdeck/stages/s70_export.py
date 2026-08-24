@@ -1050,11 +1050,16 @@ def run(cfg: Config, registry, lang: str, check_determinism: bool = False) -> di
     write_json(cfg.report_dir / ("coverage_misses_%s.json" % lang),
                {"language": lang, "n": len(misses), "misses": misses})
 
-    # EVERY stage-70 gate carries the language in `extra`. These are verdicts
-    # about ONE language's deck, and merging them on the bare gate id let a
-    # passing German export overwrite a failing Chinese row -- so
-    # `ankidkdeck gates` reported the release all-green with the Chinese deck's
-    # coverage failure erased.
+    # A stage-70 gate carries the language in `extra` IF AND ONLY IF its verdict
+    # is per-language. Merging a per-language gate on the bare id is what let a
+    # passing German export overwrite a failing Chinese row, so `ankidkdeck
+    # gates` reported the release all-green with the Chinese coverage failure
+    # erased.
+    #
+    # G-SEED and G-RANK are the exceptions and stay UNSCOPED: the seeds come from
+    # the append-only registry and the ranks from words.json, so both verdicts are
+    # identical for every language by construction. Scoping them wrote four
+    # byte-identical rows per release, which reads like four separate checks.
     scope = {"lang": lang}
     # read_json() treats default=None as "required", so an absent report has to
     # be an empty dict here.
@@ -1073,13 +1078,14 @@ def run(cfg: Config, registry, lang: str, check_determinism: bool = False) -> di
              lambda: coverage_gate(misses, counts), stage="70", extra=scope),
         Gate(G_GUID, "every note GUID is unique",
              lambda: guid_gate(notes), stage="70", extra=scope),
+        # Language-independent (see the note above `scope`): one row, no extra.
         Gate(G_SEED, "every carried guid_seed is NFC and byte-equal to a v2.1 "
                      "QueryWord",
              lambda: registry_seed_bytes(registry.card_keys, v2_querywords,
-                                         family_ids), stage="70", extra=scope),
+                                         family_ids), stage="70"),
         Gate(G_RANK, "FrequencyRank is dense 1..N and unique over the notes",
              lambda: dense_unique_ranks([int(n["fields"][7]) for n in notes],
-                                        len(notes)), stage="70", extra=scope),
+                                        len(notes)), stage="70"),
         Gate(G_MEDIA, "every [sound:] tag resolves, media_files is a sorted "
                       "list, and the count clears the floor",
              lambda: media_gate(media, int(gates_cfg.get("media_floor", 0)),
