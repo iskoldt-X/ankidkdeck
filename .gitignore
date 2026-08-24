@@ -1,4 +1,27 @@
+# DDO-derived content and pipeline outputs must never be committed.
 *.html
 *.mp3
 *.json
 *.apkg
+*.anki2
+*.log
+wiktionary_danish_wordlist.txt
+
+# Registry files are the ONE tracked exception to the *.json rule above:
+# they contain only word identities and rules, never DDO text.
+!src/ankidkdeck/registry/*.json
+
+# Runtime workspace (corpus, parses, ledgers, fixtures) - lives on the run host.
+work/
+dist/
+audio/*
+!audio/.gitkeep
+ddo_html_all_versions/*
+!ddo_html_all_versions/.gitkeep
+
+# Python / OS noise
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.venv/
+.DS_Store
