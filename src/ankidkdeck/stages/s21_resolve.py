@@ -23,12 +23,48 @@ OWNER DECISION (2026-08-24): a word that still resolves to nothing is SKIPPED
 and recorded in unresolved.json for later human review -- the pipeline never
 stops for it. That decision only works if the file is readable, so every row
 carries an explicit `reason` and the counters are derived FROM the rows.
+
+THE OVERRIDE CHANNEL WAS SEALED SHUT (round 3, measured). Routing the override
+through classify_one() unchanged made the registry useless for the one job it
+exists to do. DDO's 2026 flex tables carry no imperative, no genitive, no
+middle-voice -s, no present participle and no definite superlative, so
+`vent`/`vente` walks the whole decision chain down to the final fallback and
+comes back ("reject", "unrelated") -- and 140 hand-verified mappings recovered
+exactly ZERO words while reporting themselves green. Two locks, both lifted
+here and only for `evidence == "override"`:
+
+  1. judged() dropped every candidate the classifier called `unrelated`.
+     `unrelated` is the classifier's LAST fallback: it means "the automatic
+     layers have nothing to say", which is precisely the case a curated mapping
+     is for. It is now accepted as bucket `form` -- `form`, not `variant`, so
+     s30._relation() calls it an inflection and s70.alt_forms_html keeps it out
+     of the visible Variants line: the imperative becomes an Anki search token,
+     not card-face text. affix / abbreviation / multiword_neighbour /
+     case_only_demoted_pos still reject: those are the classifier making a
+     positive claim about the article, not running out of ideas.
+  2. indexable() also refused any article in `rejected_everywhere`, and the
+     rejection that put the article there was the overriding word's OWN
+     `unrelated` -- a self-referential lockout that judged() cannot see,
+     because the candidate is filtered out before it is ever judged (no audit
+     row either: 174 recovery rejections covered only 136 of 140 words). That
+     filter exists to keep the erbium-class SYMBOL article out of the recovery
+     door; symbol articles are demoted, and the demoted and affix filters both
+     still apply on the override path.
+
+Exclusive exactness (godt/god) is not reachable through either: layer 2 only
+runs for a word whose forward classification produced NO members, and a word
+that is its own dictionary headword always has one.
+
+The remaining guard is the data itself, so every mapping that binds this way is
+written to review/override_accepted.json and the count of mappings that did NOT
+bind is a GATE (G-OVERRIDE). Before, override_problems could go 0 -> 140 with
+the gate report still all green, because stage 21 had no gate at all.
 """
 
 from collections import defaultdict
 
 from ..config import Config
-from ..gates import is_affix_entry
+from ..gates import G_OVERRIDE, Gate, curated_overrides_bind, is_affix_entry, run_gates
 from ..util import NFC, nk, read_json, write_json
 from .s22_classify import classify_one
 
@@ -74,17 +110,28 @@ def run(cfg: Config, registry) -> dict:
 
     rejected_everywhere = rejected_everywhere_ids(classification)
 
-    def indexable(eid: str) -> bool:
+    def indexable(eid: str, curated: bool = False) -> bool:
         """What layer 2 and layer 3 are allowed to hand a word.
 
         A demoted or affix article is never recovered: the classifier rejects it
         on the forward page for a reason, and re-admitting it here (with a
         fabricated demoted flag, as this stage used to do) is how the symbol
-        article gets a chance to head a family.
+        article gets a chance to head a family. Those two filters apply to the
+        curated layer too.
+
+        `rejected_everywhere` does NOT (curated=True). It is an automatic-layer
+        heuristic -- "no word that saw this article wanted it" -- and on the
+        override path the word that did not want it is usually the very word the
+        mapping is trying to rescue: `indstil` rejected `indstille` as unrelated,
+        which then disqualified `indstille` from being handed to `indstil`. Four
+        articles (planlaegge, oversaette, fascinere, indstille -- 10 senses, four
+        retired v2.1 cards) were unreachable this way, and invisibly: the
+        candidate never reaches judged(), so it leaves no `recovery_` audit row.
         """
         e = entries[eid]
-        return (eid not in rejected_everywhere
-                and e.get("pos_key") not in demoted_pos
+        if not curated and eid in rejected_everywhere:
+            return False
+        return (e.get("pos_key") not in demoted_pos
                 and not is_affix_entry(e))
 
     rev = defaultdict(set)
@@ -95,6 +142,7 @@ def run(cfg: Config, registry) -> dict:
             rev[f].add(eid)
 
     recovery_rejects: list = []
+    override_accepted: list = []
 
     def judged(word: str, c: dict, eids, evidence: str) -> list:
         """classify_one() on every candidate, exactly as the forward page does.
@@ -102,10 +150,26 @@ def run(cfg: Config, registry) -> dict:
         Returns [(entry_id, bucket, why)] for the survivors; a refusal is written
         into the word's own `rejected` list with a `recovery_` reason so the
         recovery door leaves the same audit trail the front door does.
+
+        One exception, module docstring lock 1: on the CURATED path a bare
+        `unrelated` is the classifier declining to have an opinion, so the human
+        mapping wins and the pair enters as bucket `form` (hidden searchable
+        form, never card-face Variants). Every other rejection still stands.
         """
         keep = []
         for eid in eids:
             bucket, why = classify_one(word, entries[eid], demoted_pos, alias_pairs)
+            if bucket == "reject" and evidence == "override" and why == "unrelated":
+                bucket, why = "form", "curated_override"
+                override_accepted.append({
+                    "word": word, "entry_id": eid,
+                    "override_lemma": entries[eid]["lemma"],
+                    "pos_key": entries[eid].get("pos_key"),
+                    "senses": len(entries[eid].get("senses") or ()),
+                    "in_paradigm_index": nk(word) in set(
+                        entries[eid].get("paradigm_index") or ()),
+                    "why": "registry/form_to_lemma.json says so; the classifier "
+                           "had no automatic evidence either way"})
             if bucket == "reject":
                 row = {"entry_id": eid, "headword": entries[eid]["lemma"],
                        "pos_key": entries[eid].get("pos_key"),
@@ -146,7 +210,9 @@ def run(cfg: Config, registry) -> dict:
         if override_lemma:
             key = nk(NFC(override_lemma))
             of_lemma = [e for e, v in entries.items() if v["lemma_key"] == key]
-            usable = judged(word, c, sorted(e for e in of_lemma if indexable(e)),
+            usable = judged(word, c,
+                            sorted(e for e in of_lemma
+                                   if indexable(e, curated=True)),
                             "override")
             if usable:
                 attach(c, usable, "override")
@@ -197,6 +263,12 @@ def run(cfg: Config, registry) -> dict:
     write_json(cfg.json_dir / "classification.json", classification)
     write_json(cfg.report_dir / "unresolved.json", unresolved)
     write_json(cfg.report_dir / "recovery_rejected.json", recovery_rejects)
+    # review/, not reports/: this is the audit face of the override channel, and
+    # it belongs next to rejected.json for the same reason -- a human has to be
+    # able to read what the human registry admitted. Accepting `unrelated` on the
+    # curated path means the classifier is no longer a second opinion on these
+    # edges, so the mappings that bound this way are the ones under review.
+    write_json(cfg.review_dir / "override_accepted.json", override_accepted)
     # Derived from the rows, so the counters and the file can never disagree.
     resolved["unresolved"] = len(unresolved)
     resolved["unresolved_by_reason"] = {r: by_reason.get(r, 0)
@@ -216,7 +288,23 @@ def run(cfg: Config, registry) -> dict:
     # the reverse index rescued the word, because otherwise it is invisible.
     resolved["override_problems"] = len(override_problems)
     resolved["override_problems_sample"] = override_problems[:20]
+    resolved["override_accepted"] = len(override_accepted)
+    resolved["override_mappings"] = len(registry.form_to_lemma)
     write_json(cfg.report_dir / "resolve_report.json", resolved)
+
+    # G-OVERRIDE runs AFTER the writes, which is the opposite of stages 20/22/30
+    # -- deliberately. Nothing this stage writes is immutable or human-ratified
+    # (stage 30's card_keys.json is, which is why its gates run first), and the
+    # three files above ARE the evidence for the bug this gate fires on. Failing
+    # before writing them would leave the curator with a count and no rows.
+    run_gates([
+        Gate(G_OVERRIDE, "every registry/form_to_lemma.json mapping actually "
+                         "bound a word to its lemma's article",
+             lambda: curated_overrides_bind(
+                 override_problems, len(override_accepted),
+                 int(registry.gates.get("override_problems_max", 0))),
+             stage="21"),
+    ], cfg, stage="21")
     return resolved
 
 

@@ -578,3 +578,230 @@ def test_expressions_alone_make_a_family_renderable(cfg, registry):
     merge_run(cfg, registry)
     fam = read_json(cfg.json_dir / "words.json")["11000020"]
     assert fam["freq_rank"] == 1
+
+
+# --------------------------------------------------------------------------
+# The alias branch of the head relation
+# --------------------------------------------------------------------------
+
+def _tjek_workspace(cfg, quarantine, alias_pairs=None):
+    """The measured shape of the alias/merge disagreement.
+
+    `check`(11007687) and `tjek`(12001518) are one dictionary word registered in
+    alias_pairs.json. The classifier admitted the pair through the ALIAS branch,
+    and this stage then compared heads with squash() alone -- which is only the
+    FIRST branch -- so it called the component two dictionary words and split it
+    back into two cards of the same word.
+    """
+    check = make_entry("11007687", "check", pos_key="sb.",
+                       senses=[make_sense("21007687", "kontrol")],
+                       source_words=["check"])
+    tjek = make_entry("12001518", "tjek", pos_key="sb.",
+                      senses=[make_sense("2200151%d" % i, "tjek %d" % i)
+                              for i in range(2)],
+                      source_words=["tjek"])
+    entries = {e["entry_id"]: e for e in (check, tjek)}
+    classification = {
+        "check": _c(_members("11007687", "exact_cs"),
+                    _members("12001518", "variant")),
+        "tjek": _c(_members("12001518", "exact_cs"),
+                   _members("11007687", "variant")),
+    }
+    write_workspace(cfg, entries, [(1126, "tjek"), (1707, "check")],
+                    classification=classification,
+                    v2_querywords={"tjek": 1126, "check": 1707})
+    from ankidkdeck.registry import Registry
+    reg = Registry(cfg)
+    # Set in place rather than through a work/registry overlay: a registry file
+    # that IS a list is APPENDED to by the overlay (that is what makes
+    # alias_pairs and demoted_pos_keys extensible), so an overlay can never
+    # shorten this one. Lifting the quarantine is therefore an edit to the
+    # shipped src/ankidkdeck/registry/alias_merge_pending.json -- reviewed and
+    # committed, which is the right weight for a decision that retires a GUID.
+    reg.data["alias_merge_pending"] = list(quarantine)
+    if alias_pairs is not None:
+        reg.data["alias_pairs"] = list(alias_pairs)
+    return reg
+
+
+def test_an_alias_pair_merges_into_one_family(cfg):
+    """The fix. Heads are grouped by is_variant(), the classifier's own
+    relation, so a pair the classifier admitted is no longer refused here."""
+    reg = _tjek_workspace(cfg, quarantine=[])
+    report = merge_run(cfg, reg)
+    assert report["refused_components"] == 0
+    assert report["dropped_components"] == 0
+    assert report["families"] == 1
+    assert read_json(cfg.review_dir / "merge_conflicts.json") == []
+    fams = read_json(cfg.json_dir / "words.json")
+    # `tjek` heads it: it is the lower-ranked wordlist word, so anchor_of's
+    # wordlist-spelling tie-break picks its article, and min(carried) picks its
+    # seed. `check`'s family_id -- and its frozen v2.1 GUID -- retires.
+    fam = fams["12001518"]
+    assert sorted(fam["entry_ids"]) == ["11007687", "12001518"]
+    assert sorted(m["word"] for m in fam["members"]) == ["check", "tjek"]
+    assert fam["guid_seed"] == "tjek"
+    assert "11007687" not in fams
+    # both spellings still reach the card through Anki search
+    assert {"check", "tjek"} <= set(fam["searchable_forms"])
+
+
+def test_a_quarantined_alias_pair_is_still_refused(cfg):
+    """The switch that keeps this round's rerun free of GUID churn.
+
+    Both sides of the three pre-existing pairs already hold a frozen
+    card_keys.json row, so landing the merge retires one of two frozen seeds --
+    a release decision with a deadline, not a build step. Quarantining keeps the
+    CLASSIFIER admitting the pair (or `naeh` and `o.k.` lose their only edge)
+    while the merge keeps two heads, i.e. exactly the pre-fix behaviour.
+    """
+    reg = _tjek_workspace(cfg, quarantine=[["check", "tjek"]])
+    report = merge_run(cfg, reg)
+    assert report["refused_components"] == 1
+    assert report["families"] == 2
+    conflicts = read_json(cfg.review_dir / "merge_conflicts.json")
+    assert conflicts[0]["heads"] == ["check", "tjek"]
+    assert conflicts[0]["fallback_heads"] == ["check", "tjek"]
+    fams = read_json(cfg.json_dir / "words.json")
+    assert set(fams) == {"11007687", "12001518"}
+    assert report["alias_pairs_quarantined_from_merge"] == [["check", "tjek"]]
+
+
+def test_a_cased_alias_pair_is_normalised_on_both_sides_of_the_quarantine(cfg):
+    """The quarantine key and the alias registry key must be normalised the SAME
+    way, because this comparison fails OPEN.
+
+    `quarantined` was built with nk() while registry.alias_pairs hands back the
+    raw strings, so the set difference only matched because all three live pairs
+    happen to be lowercase NFC already. A pair carrying one uppercase letter
+    would not match its own quarantine row -- and the failure direction is
+    "merge lands, a frozen v2.1 GUID retires, no error, no report line". Both
+    halves are asserted here: the quarantine holds through a case difference,
+    and (the discriminating half) a cased pair is still a live alias when it is
+    NOT quarantined, which the raw comparison got wrong in the other direction
+    -- is_variant() builds its lookup key with nk(), so a raw cased pair was
+    inert everywhere.
+    """
+    reg = _tjek_workspace(cfg, quarantine=[["check", "Tjek"]],
+                          alias_pairs=[["Check", "tjek"]])
+    report = merge_run(cfg, reg)
+    assert report["refused_components"] == 1
+    assert report["families"] == 2
+    assert set(read_json(cfg.json_dir / "words.json")) == {"11007687",
+                                                           "12001518"}
+    assert report["alias_pairs_quarantined_from_merge"] == [["check", "tjek"]]
+
+
+def test_a_cased_alias_pair_that_is_not_quarantined_still_merges(cfg):
+    """The other half of the normalisation: lifting the quarantine on a cased
+    pair has to actually land the merge, or the switch is a no-op that reads
+    like a decision."""
+    reg = _tjek_workspace(cfg, quarantine=[],
+                          alias_pairs=[["Check", "tjek"]])
+    report = merge_run(cfg, reg)
+    assert report["refused_components"] == 0
+    assert report["families"] == 1
+    fams = read_json(cfg.json_dir / "words.json")
+    assert set(fams) == {"12001518"}
+    assert fams["12001518"]["guid_seed"] == "tjek"
+
+
+def test_a_genuinely_different_lemma_is_still_two_heads(cfg, registry):
+    """The guard the alias branch must not weaken: `hav`/`have` and
+    `kan`/`khan` squash apart AND are not alias-registered, so they stay
+    refused."""
+    hav = make_entry("11000600", "hav", pos_key="sb.",
+                     senses=[make_sense("21001400", "saltvand")],
+                     source_words=["have"])
+    have = make_entry("11000601", "have", pos_key="vb.",
+                      senses=[make_sense("21001401", "besidde")],
+                      source_words=["have"])
+    write_workspace(cfg, {e["entry_id"]: e for e in (hav, have)}, [(1, "have")],
+                    classification={"have": _c(_members("11000601", "exact_cs"),
+                                               _members("11000600", "form"))},
+                    v2_querywords={})
+    assert merge_run(cfg, registry)["refused_components"] == 1
+
+
+def test_a_stale_guid_seed_is_reported_and_never_rewritten(cfg, registry):
+    """card_keys.json is append-only because those bytes are the users' study
+    progress -- so a seed frozen from a SMALLER member set (the freeze ran before
+    the unresolved list was curated) can never be corrected by a rerun. 22
+    families locked in the less frequent of two spellings that way, with no
+    error, no warning and no report line, because the freeze loop skipped an
+    already-frozen family before it computed a seed at all.
+    """
+    from ankidkdeck.util import write_json
+    hus = make_entry("11021722", "hus", pos_key="sb.", forms=["huse"],
+                     senses=[make_sense("21000300", "bygning")],
+                     source_words=["hus"])
+    write_workspace(cfg, {"11021722": hus}, [(1, "hus"), (40, "huse")],
+                    classification={
+                        "hus": _c(_members("11021722", "exact_cs")),
+                        "huse": _c(_members("11021722", "form"))},
+                    v2_querywords={"hus": 1, "huse": 40})
+    # A previous build froze this family on `huse` -- a real v2.1 QueryWord, so
+    # G-SEED is satisfied -- back when `hus` had not yet been resolved into the
+    # family. Today's data would choose `hus` (v2 rank 1 beats 40).
+    write_json(cfg.registry_local / "card_keys.json",
+               {"11021722": {"guid_seed": "huse", "lemma_at_freeze": "hus",
+                             "since": "3.0", "carried_from_v2": True}})
+    from ankidkdeck.registry import Registry
+    report = merge_run(cfg, Registry(cfg))
+    rows = read_json(cfg.review_dir / "stale_guid_seeds.json")
+    assert rows == [{"family_id": "11021722", "frozen_seed": "huse",
+                     "seed_today": "hus", "frozen_since": "3.0",
+                     "lemma_at_freeze": "hus"}]
+    assert report["registry_freeze"]["stale_seeds"] == 1
+    assert report["registry_freeze"]["added"] == 0
+    # unchanged on disk: reporting is not rewriting
+    assert read_json(cfg.registry_local / "card_keys.json")[
+        "11021722"]["guid_seed"] == "huse"
+    assert read_json(cfg.json_dir / "words.json")["11021722"]["guid_seed"] == "huse"
+
+
+def test_the_freeze_report_says_what_is_uncommitted_when_added_is_zero(
+        cfg, monkeypatch):
+    """`added: 0` is correct on a rerun and useless as evidence.
+
+    Round 2 appended 4 rows, then two idempotent reruns overwrote
+    registry_freeze_report.json with `added: 0` -- so the file an owner opens
+    said this workspace had frozen nothing, and the append-only invariant could
+    only be shown by diffing a snapshot taken outside the pipeline. The count
+    that survives a rerun is the overlay's diff against the COMMITTED registry
+    (src/ankidkdeck/registry/card_keys.json, still `{}`), which is also the
+    diff a human has to review before release.
+    """
+    from ankidkdeck.registry import Registry
+    from ankidkdeck.util import write_json
+    hus = make_entry("11021722", "hus", pos_key="sb.", forms=["huse"],
+                     senses=[make_sense("21000300", "bygning")],
+                     source_words=["hus"])
+    write_workspace(cfg, {"11021722": hus}, [(1, "hus"), (40, "huse")],
+                    classification={
+                        "hus": _c(_members("11021722", "exact_cs")),
+                        "huse": _c(_members("11021722", "form"))},
+                    v2_querywords={"hus": 1, "huse": 40})
+    # first run: the overlay does not exist yet, so this row is appended here
+    first = merge_run(cfg, Registry(cfg))["registry_freeze"]
+    assert first["added"] == 1
+    assert first["rows_not_in_the_committed_registry"] == 1
+    # the idempotent rerun: nothing to append, and the row is still uncommitted
+    again = merge_run(cfg, Registry(cfg))["registry_freeze"]
+    assert again["added"] == 0
+    assert again["stale_seeds"] == 0
+    assert again["rows_not_in_the_committed_registry"] == 1
+    assert again["total"] == 1
+    # and after release, when the row IS committed, the diff is empty again
+    from ankidkdeck import registry as R
+    committed = {"11021722": {"guid_seed": "hus", "lemma_at_freeze": "hus",
+                              "since": "3.0", "carried_from_v2": True}}
+    orig = R._package_default
+    monkeypatch.setattr(R, "_package_default",
+                        lambda name: (dict(committed)
+                                      if name == "card_keys.json"
+                                      else orig(name)))
+    write_json(cfg.registry_local / "card_keys.json", {})
+    shipped = merge_run(cfg, Registry(cfg))["registry_freeze"]
+    assert shipped["added"] == 0
+    assert shipped["rows_not_in_the_committed_registry"] == 0

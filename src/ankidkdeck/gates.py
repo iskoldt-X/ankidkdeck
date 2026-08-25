@@ -59,6 +59,40 @@ G_LABEL = "G-LABEL"          # #results-label reconciles against the article cou
 G_REL = "G-REL"              # the release-note churn numbers are computed, not estimated
 G_SITEMAP_INV = "G-SITEMAP-INV"   # the sitemap inventory is inside its declared range
 G_CASE = "G-CASE"            # the case-only membership population is baselined
+# The guide names no id for stage 21, which is how override_problems went 0 ->
+# 140 -- every curated mapping in the registry failing to bind -- with
+# gates_report.json still reporting every row ok. Stage 21 had no gate at all.
+G_OVERRIDE = "G-OVERRIDE"
+
+# The declared set, so a report can say what it did NOT check. "11 gates PASS"
+# was read as a release verdict when it meant "11 rows are on file, 8 of them
+# written by this run, and 12 of the 24 declared gates have never executed on
+# this workspace at all" -- G-SITEMAP among them, which is the one that
+# adjudicates merge_report.sitemap_shortfall_families. A gate that never ran is
+# not a gate that passed.
+ALL_GATE_IDS = (
+    G_AFFIX, G_ANCHOR, G_ASSIGN, G_BIND, G_CASE, G_COV, G_DET, G_EMPTY_C,
+    G_GUID, G_LABEL, G_MEDIA, G_NOTE, G_ORDER, G_ORPH, G_OVERRIDE, G_RANK,
+    G_RATE, G_REGKEY, G_REL, G_SEED, G_SEP, G_SITEMAP, G_SITEMAP_INV, G_TIE,
+)
+
+# Gates that are a HUMAN signature, not a script; they can never appear in
+# gates_report.json, so they are named here rather than silently missing.
+MANUAL_GATE_IDS = ("G-IMPORT", "G-REVIEW")
+
+# (report path, row_key) for every row a gate in THIS invocation actually
+# produced. The report is a merged ledger by design -- stage 20 through stage 41
+# all append to it, and rows survive across runs -- so "12 rows recorded, 0
+# failing" was read as "12 gates just passed" when two of those rows (G-TIE at
+# stage 40, G-SITEMAP-INV at stage 10) were left by an earlier run that touched
+# stages this build never executed. Nothing else in the file can tell those two
+# apart from the 10 that ran, so the running stage marks its own rows here.
+#
+# Deliberately process-scoped rather than a timestamp or a run counter: the
+# value is a function of WHICH stages the invocation executed, so two identical
+# `build` runs still write byte-identical bytes, and it only changes when the
+# set of executed stages changes -- which is exactly when it should.
+_ROWS_EXECUTED_THIS_RUN: set[tuple[str, str]] = set()
 
 # The closed set of translation drop reason codes. A drop carrying anything
 # else is an unexplained loss, which is what G-BIND exists to forbid.
@@ -145,6 +179,9 @@ def run_gates(gates: Iterable[Gate], cfg, stage: str = "") -> list[dict]:
 def _write_report(cfg, results: list[dict]) -> None:
     path = cfg.report_dir / "gates_report.json"
     prev = read_json(path, default={"results": []})
+    for row in results:
+        row.setdefault("extra", {})
+        _ROWS_EXECUTED_THIS_RUN.add((str(path), row_key(row)))
     rows = list(prev.get("results", [])) + results
     merged: dict[str, dict] = {}
     order: list[str] = []
@@ -154,6 +191,12 @@ def _write_report(cfg, results: list[dict]) -> None:
         if key not in merged:
             order.append(key)
         merged[key] = row      # a later run of the SAME scope wins
+    # Provenance, per row, recomputed from this process every time -- never
+    # trusted from the file, or an earlier run's `true` would be carried forward
+    # as if this run had produced it.
+    for key in order:
+        merged[key]["executed_this_run"] = (
+            (str(path), key) in _ROWS_EXECUTED_THIS_RUN)
     out = {"results": [merged[k] for k in order]}
     # `failed` stays a list of bare ids (that is what the release checklist and
     # the tests read); `failed_rows` carries the scope, so a Chinese-only
@@ -161,6 +204,30 @@ def _write_report(cfg, results: list[dict]) -> None:
     out["failed"] = sorted({r["id"] for r in out["results"] if not r["ok"]})
     out["failed_rows"] = [row_label(r) for r in out["results"] if not r["ok"]]
     out["n_gates"] = len(out["results"])
+    # RAN vs NEVER-RUN. `n_gates` counts ROWS ON FILE, which is not the same
+    # question as "which gates have a verdict on this workspace" -- the report
+    # accumulates across stages and across runs by design, so 11 passing rows
+    # coexisted with 12 declared gates that had never executed. No timestamps
+    # and no run counters: this file has to stay byte-stable across a repeated
+    # run for the determinism check to mean anything.
+    have = {r["id"] for r in out["results"]}
+    out["gates_declared"] = len(ALL_GATE_IDS)
+    out["gate_ids_with_a_verdict"] = sorted(have)
+    out["gate_ids_never_run"] = sorted(set(ALL_GATE_IDS) - have)
+    out["stages_reported"] = sorted({str(r.get("stage") or "?")
+                                     for r in out["results"]})
+    # Three states, not two: RAN here, CARRIED from an earlier run, and NEVER
+    # RUN on this workspace (gate_ids_never_run above). Row LABELS, not bare
+    # ids, so a per-language gate that ran for German and carries a stale
+    # Chinese row is not summarised as if both were fresh.
+    out["gate_rows_executed_this_run"] = [
+        row_label(r) for r in out["results"] if r["executed_this_run"]]
+    out["gate_rows_carried_from_an_earlier_run"] = [
+        row_label(r) for r in out["results"] if not r["executed_this_run"]]
+    out["stages_executed_this_run"] = sorted(
+        {str(r.get("stage") or "?") for r in out["results"]
+         if r["executed_this_run"]})
+    out["manual_gates_not_recorded_here"] = list(MANUAL_GATE_IDS)
     write_json(path, out)
 
 
@@ -400,6 +467,42 @@ def sitemap_inventory(total: int, total_range, affix_slugs: int, affix_range):
                                                  "range": [a_lo, a_hi]}
     detail["violations"] = problems
     return not problems, detail
+
+
+def curated_overrides_bind(problems: list, n_edges_admitted: int,
+                           max_problems: int = 0):
+    """G-OVERRIDE. A registry/form_to_lemma.json row that binds nothing is a
+    CURATION BUG and must stop the build.
+
+    Measured failure this replaces: 140 hand-verified mappings were added, every
+    one of them was refused by the recovery door, `override_problems` went from 0
+    to 140, `no_survivor` went from 0 to 140 -- and the gate report stayed
+    all-green, because stage 21 shipped without a single gate. The registry that
+    exists to correct the automatic layer could therefore be 100% dead and the
+    release checklist could not tell.
+
+    Baselined (registry/gates.json:override_problems_max) rather than hard-zero
+    for one honest reason: a mapping whose lemma page was never crawled
+    (override_lemma_not_crawled) is a fetch problem, not a bad mapping, and an
+    owner may knowingly carry a few. The default is 0.
+
+    The two counts are NOT the same unit, which is why they are named apart. One
+    mapping can admit several (word, entry_id) EDGES -- `vent` binds both
+    homograph articles of `vente` -- so 140 mappings admitted 177 edges. Calling
+    that number `mappings_that_bound` in a file the release checklist reads
+    invited "140 mappings, 177 of which bound", which is not a sentence.
+    `mappings_that_bound_nothing` really is per mapping: it is one row per
+    registry mapping that reached no article at all.
+    """
+    by_reason: dict[str, int] = {}
+    for p in problems:
+        r = str(p.get("reason"))
+        by_reason[r] = by_reason.get(r, 0) + 1
+    over = len(problems) > max_problems
+    return not over, {"edges_admitted_by_the_curated_path": n_edges_admitted,
+                      "mappings_that_bound_nothing": len(problems),
+                      "max": max_problems, "by_reason": dict(sorted(by_reason.items())),
+                      "sample": problems[:20]}
 
 
 def case_only_members(rows: list, max_n: int | None = None):

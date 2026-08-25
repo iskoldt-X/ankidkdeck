@@ -247,3 +247,48 @@ def test_a_settable_field_still_loads(tmp_path):
     assert cfg.langs == ["German"] and cfg.copyright_year == 2027
     assert "gemini_model_expressions" in settable_fields()
     assert "json_dir" not in settable_fields()
+
+
+def test_freeze_reports_a_stale_seed_without_touching_the_row(cfg, registry):
+    """`proposed_seeds` is what today's data WOULD choose for every family,
+    already-frozen ones included. Without it this method never saw them: stage
+    30 filtered existing family_ids out before calling, so the guard above was
+    dead code and the append-only rule had no voice -- which is how 22 families
+    locked in the less frequent of two spellings silently."""
+    path = cfg.registry_local / "card_keys.json"
+    registry.freeze_card_keys(
+        {"11021722": {"guid_seed": "huse", "lemma_at_freeze": "hus",
+                      "since": "3.0", "carried_from_v2": True}}, path)
+    counts = registry.freeze_card_keys({}, path,
+                                       proposed_seeds={"11021722": "hus"})
+    assert counts["added"] == 0
+    assert counts["stale_seeds"] == [{"family_id": "11021722",
+                                      "frozen_seed": "huse",
+                                      "seed_today": "hus",
+                                      "frozen_since": "3.0",
+                                      "lemma_at_freeze": "hus"}]
+    # REPORTED, not rewritten
+    assert read_json(path)["11021722"]["guid_seed"] == "huse"
+
+
+def test_freeze_reports_no_stale_seed_when_the_choice_still_agrees(cfg, registry):
+    path = cfg.registry_local / "card_keys.json"
+    registry.freeze_card_keys(
+        {"11021722": {"guid_seed": "hus", "lemma_at_freeze": "hus",
+                      "since": "3.0", "carried_from_v2": True}}, path)
+    counts = registry.freeze_card_keys({}, path,
+                                       proposed_seeds={"11021722": "hus"})
+    assert counts["stale_seeds"] == []
+    assert counts["unchanged"] == 1
+
+
+def test_the_alias_merge_quarantine_ships_and_holds_the_three_frozen_pairs(
+        registry):
+    """These three are the pairs where BOTH sides own a DDO article AND an
+    already-frozen card_keys row, so merging them retires a frozen guid_seed.
+    The classifier keeps admitting them; the merge keeps two heads until the
+    owner's single re-freeze."""
+    pairs = {tuple(p) for p in registry.alias_merge_pending}
+    assert pairs == {("ok", "o.k."), ("næ", "næh"), ("check", "tjek")}
+    # every quarantined pair must actually BE an alias pair, or it is a no-op
+    assert pairs <= registry.alias_pairs

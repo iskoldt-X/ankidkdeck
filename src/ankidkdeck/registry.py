@@ -17,6 +17,7 @@ FILES = [
     "form_to_lemma.json",
     "known_no_entry.json",
     "alias_pairs.json",
+    "alias_merge_pending.json",
     "demoted_pos_keys.json",
     "paradigm_slots.json",
     "pos_translations.json",
@@ -91,6 +92,26 @@ class Registry:
         return {tuple(p) for p in self.data["alias_pairs"]}
 
     @property
+    def alias_merge_pending(self) -> list:
+        """Alias pairs the CLASSIFIER honours but the MERGE must keep as two
+        heads -- for now.
+
+        Both sides of these three pairs have their own DDO article and their own
+        already-frozen card_keys.json row, so merging them retires one of the two
+        guid_seeds (`check`, a real v2.1 QueryWord, disappears into `tjek`).
+        card_keys.json is append-only, so the pipeline can neither rewrite nor
+        un-retire that row: which GUID retires is a release decision with a
+        deadline, and it belongs in the same single re-freeze as the 22 families
+        whose seed was frozen before the unresolved list was curated.
+
+        Emptying this file is the switch that lands the merge -- one line, and
+        the re-freeze procedure names it as its first step. It is deliberately
+        NOT the alias registry: the classifier must keep admitting these pairs,
+        or `naeh` and `o.k.` lose the only edge that reaches them at all.
+        """
+        return [list(p) for p in (self.data.get("alias_merge_pending") or [])]
+
+    @property
     def demoted_pos_keys(self) -> set:
         return set(self.data["demoted_pos_keys"])
 
@@ -121,17 +142,46 @@ class Registry:
     def gates(self) -> dict:
         return self.data["gates"]
 
-    def freeze_card_keys(self, new_entries: dict, source_path: Path) -> dict:
+    def freeze_card_keys(self, new_entries: dict, source_path: Path,
+                         proposed_seeds: dict | None = None) -> dict:
         """Append-only merge of new families into card_keys.json.
 
         Existing family_ids are NEVER modified (re-anchoring silently destroys
-        review history). Returns {added, carried, unchanged} counts and writes
-        the merged file to source_path for human review + commit.
+        review history). Returns {added, total, unchanged, stale_seeds,
+        not_in_the_committed_registry} and writes the merged file to source_path
+        for human review + commit.
+
+        `added` counts what THIS call appended, which is 0 on any rerun: the rows
+        were appended by an earlier run and append-only means they stay. That is
+        correct and it is also unreadable as evidence -- round 2 appended 4 rows
+        and then two idempotent reruns overwrote the report with `added: 0`, so
+        the file an owner opens says this workspace froze nothing. The count that
+        survives a rerun is `not_in_the_committed_registry`: rows the overlay
+        holds that src/ankidkdeck/registry/card_keys.json does not. It is the
+        size of the diff a human still has to review and commit, so it answers
+        "what has this workspace frozen" no matter how many times the chain ran.
+
+        `proposed_seeds` is {family_id: seed} for EVERY family in this build,
+        already-frozen ones included -- i.e. what today's data would choose. It
+        exists because this method could not previously see them: the caller
+        filtered every existing family_id out before calling, so the guard below
+        was dead code AND the append-only rule had no voice. That combination is
+        how 22 families froze the LESS frequent of two spellings -- the freeze
+        ran before the unresolved list was curated, so the more frequent member
+        word did not exist yet -- and locked it in with no error, no warning and
+        no report line. The rows still do not change (append-only is the point;
+        the users' study progress is in those bytes), but the divergence is now
+        RETURNED, so stage 30 can write it out and a re-freeze decision can be
+        made on evidence instead of on a re-derivation nobody had run.
         """
         current = dict(self.card_keys)
         added = 0
         for fid, row in new_entries.items():
             if fid in current:
+                # Reachable: a caller may hand over a family that is already
+                # frozen (tests do, and any future single-pass freeze would).
+                # Refusing loudly is right here -- unlike proposed_seeds below,
+                # this dict is a WRITE request.
                 if current[fid]["guid_seed"] != row["guid_seed"]:
                     raise FatalError(
                         f"registry violation: family {fid} would change guid_seed "
@@ -140,6 +190,22 @@ class Registry:
                 continue
             current[fid] = row
             added += 1
+        stale = []
+        for fid, seed in sorted((proposed_seeds or {}).items()):
+            row = current.get(fid)
+            if row is not None and row.get("guid_seed") != seed:
+                stale.append({"family_id": fid, "frozen_seed": row.get("guid_seed"),
+                              "seed_today": seed,
+                              "frozen_since": row.get("since"),
+                              "lemma_at_freeze": row.get("lemma_at_freeze")})
         write_json(source_path, current)
         self.data["card_keys"] = current
-        return {"added": added, "total": len(current)}
+        # Re-read the SHIPPED default rather than remembering it: self.card_keys
+        # is the merged view, and the question here is exactly what the overlay
+        # adds on top of what is committed.
+        committed = _package_default("card_keys.json")
+        return {"added": added, "total": len(current),
+                "unchanged": len(current) - added,
+                "not_in_the_committed_registry":
+                    sum(1 for fid in current if fid not in committed),
+                "stale_seeds": stale}

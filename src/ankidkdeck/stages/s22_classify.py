@@ -49,9 +49,11 @@ def squash(s: str) -> str:
     """Orthographic identity: casefold, then drop spaces and hyphens.
 
     This is the relation that makes `uden for` a variant of `udenfor` and `I` the
-    same headword as `i`. Stage 30 uses the SAME relation to decide whether a
-    component holds one dictionary word or two, so the classifier cannot admit a
-    member the merge then refuses.
+    same headword as `i`. It is the FIRST of is_variant()'s three branches, not
+    all of it -- stage 30 groups component heads with is_variant() so that the
+    classifier cannot admit a member the merge then refuses. This docstring used
+    to claim that property for squash() alone, and it was false for the alias and
+    official-alt-spelling branches: three admitted pairs were split back apart.
     """
     return nk(s).replace(" ", "").replace("-", "")
 
@@ -66,7 +68,17 @@ def _official_forms(e: dict) -> set:
             if a.get("official")}
 
 
-def _is_variant(word: str, e: dict, alias_pairs: set) -> bool:
+def is_variant(word: str, e: dict, alias_pairs: set) -> bool:
+    """The orthographic-variant relation, in three branches: squash equality,
+    DDO's OFFICIAL alternative spellings, and the curated alias registry.
+
+    Public, because stage 30 has to group component heads by exactly this
+    relation. squash() alone is only the FIRST branch, and using it as the whole
+    test is what made the merge refuse components the classifier had already
+    admitted: `check`+`tjek`, `naeh`+`nae`, `ok`+`o.k.` squash apart, so each of
+    the three registered alias pairs was split back into two heads and one side's
+    article shipped on no card at all.
+    """
     if nk(word) == nk(e["lemma"]):
         # A case-only pair is bucket 1's business. _squash() casefolds, so
         # without this guard every ('er','Er') pair is "already a variant" and
@@ -98,7 +110,7 @@ def classify_one(word: str, e: dict, demoted_pos: set, alias_pairs: set):
         return "exact_ci", "case_only"
     if nk(q) in set(e.get("paradigm_index") or ()):
         return "form", "flex_table"
-    if _is_variant(q, e, alias_pairs):
+    if is_variant(q, e, alias_pairs):
         return "variant", "orthographic_variant"
     if " " in hw and " " not in q:
         return "reject", "multiword_neighbour"        # en bloc, alle sammen

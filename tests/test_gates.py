@@ -215,6 +215,122 @@ def test_the_same_gate_id_at_two_stages_keeps_two_rows(cfg):
     assert sorted(r["stage"] for r in rows) == ["30", "70"]
 
 
+def test_the_report_separates_rows_this_run_ran_from_rows_it_inherited(cfg):
+    """RAN / CARRIED / NEVER-RUN are three states, and the report could only
+    tell two of them apart.
+
+    The report is a merged ledger on purpose -- stages 20..41 all append to it
+    and rows survive across runs -- so "12 gate row(s) recorded, 0 failing" was
+    read as a 12-gate verdict when 10 rows had just been executed and two
+    (G-TIE at stage 40, G-SITEMAP-INV at stage 10) were inherited from an
+    earlier run at stages `build` never touches. gate_ids_with_a_verdict counts
+    an inherited row as a verdict, and nothing else in the file said otherwise.
+    """
+    from ankidkdeck.util import read_json, write_json
+    write_json(cfg.report_dir / "gates_report.json",
+               {"results": [{"id": G.G_TIE, "description": "tie-breaks",
+                             "stage": "40", "extra": {}, "ok": True,
+                             "detail": {}, "executed_this_run": True}]})
+    G.run_gates([G.Gate(G.G_SEED, "seeds", lambda: (True, {}), stage="30")], cfg)
+    rep = read_json(cfg.report_dir / "gates_report.json")
+    rows = {r["id"]: r for r in rep["results"]}
+    assert rows[G.G_SEED]["executed_this_run"] is True
+    # the inherited row asserted `true` about itself; provenance is recomputed
+    # from this process, never read back out of the file
+    assert rows[G.G_TIE]["executed_this_run"] is False
+    assert rep["gate_rows_executed_this_run"] == [G.G_SEED]
+    assert rep["gate_rows_carried_from_an_earlier_run"] == [G.G_TIE]
+    assert rep["stages_executed_this_run"] == ["30"]
+    assert rep["stages_reported"] == ["30", "40"]
+    # both rows still count as "has a verdict here"; the third state is the
+    # declared gates with no row at all
+    assert rep["gate_ids_with_a_verdict"] == sorted([G.G_SEED, G.G_TIE])
+    assert G.G_GUID in rep["gate_ids_never_run"]
+    assert G.G_SEED not in rep["gate_ids_never_run"]
+
+
+def test_the_provenance_field_keeps_a_repeated_run_byte_identical(cfg,
+                                                                 monkeypatch):
+    """Why this is a per-row flag and not a timestamp or a run counter.
+
+    gates_report.json has to stay byte-stable when the same chain runs twice, or
+    the workspace determinism check means nothing. Provenance is a function of
+    WHICH stages the invocation executed, so a repeat of the same chain writes
+    the same bytes -- it moves only when the executed set moves, which is
+    exactly when a reader needs it to.
+    """
+    from ankidkdeck.util import read_json
+    path = cfg.report_dir / "gates_report.json"
+    G.run_gates([G.Gate(G.G_SEED, "seeds", lambda: (True, {"n": 1}),
+                        stage="30")], cfg)
+    first = path.read_bytes()
+    # a second process, same chain: no memory of the first run's rows
+    monkeypatch.setattr(G, "_ROWS_EXECUTED_THIS_RUN", set())
+    G.run_gates([G.Gate(G.G_SEED, "seeds", lambda: (True, {"n": 1}),
+                        stage="30")], cfg)
+    assert path.read_bytes() == first
+    # ...and a run that executes a DIFFERENT subset does move the field
+    monkeypatch.setattr(G, "_ROWS_EXECUTED_THIS_RUN", set())
+    G.run_gates([G.Gate(G.G_RANK, "ranks", lambda: (True, {}), stage="30")], cfg)
+    rep = read_json(path)
+    assert rep["gate_rows_executed_this_run"] == [G.G_RANK]
+    assert rep["gate_rows_carried_from_an_earlier_run"] == [G.G_SEED]
+
+
+def test_the_gates_command_marks_a_carried_row(cfg, capsys):
+    """`ankidkdeck gates` reads the report, it never runs a gate -- so the
+    distinction has to come out of the file, or the release checklist reads an
+    inherited PASS as a fresh one."""
+    from ankidkdeck.cli import gates_report
+    from ankidkdeck.util import write_json
+    write_json(cfg.report_dir / "gates_report.json",
+               {"results": [{"id": G.G_TIE, "description": "tie-breaks",
+                             "stage": "40", "extra": {}, "ok": True,
+                             "detail": {}}]})
+    G.run_gates([G.Gate(G.G_SEED, "seeds", lambda: (True, {}), stage="30")], cfg)
+    assert gates_report(cfg) == 0
+    out = capsys.readouterr().out
+    assert "[CARRIED]" in out
+    assert "1 row(s) were executed by the run that wrote this report" in out
+    assert "1 carried from an earlier run: G-TIE" in out
+    seed_line = [ln for ln in out.splitlines() if ln.startswith("PASS G-SEED")]
+    assert seed_line and "[CARRIED]" not in seed_line[0]
+
+
+def test_the_gates_command_says_so_when_the_report_predates_the_accounting(
+        cfg, capsys):
+    """A gates_report.json written before this accounting existed has no
+    provenance to show; saying so beats printing "0 carried"."""
+    from ankidkdeck.cli import gates_report
+    from ankidkdeck.util import write_json
+    write_json(cfg.report_dir / "gates_report.json",
+               {"results": [{"id": G.G_TIE, "description": "tie-breaks",
+                             "stage": "40", "extra": {}, "ok": True,
+                             "detail": {}}]})
+    assert gates_report(cfg) == 0
+    out = capsys.readouterr().out
+    assert "predates the executed-here accounting" in out
+    # "unknown" must not print as "carried"
+    assert "[CARRIED]" not in out
+
+
+def test_the_override_gate_counts_edges_and_mappings_apart():
+    """One curated mapping can admit several (word, entry_id) edges -- `vent`
+    binds both homograph articles of `vente` -- so 140 mappings admitted 177
+    edges. The detail field called that number `mappings_that_bound`, in a file
+    the release checklist reads."""
+    ok, detail = G.curated_overrides_bind([], 177)
+    assert ok is True
+    assert detail["edges_admitted_by_the_curated_path"] == 177
+    assert detail["mappings_that_bound_nothing"] == 0
+    assert "mappings_that_bound" not in detail
+    bad, detail = G.curated_overrides_bind(
+        [{"word": "dan", "reason": "no_survivor"}], 0)
+    assert bad is False
+    assert detail["mappings_that_bound_nothing"] == 1
+    assert detail["by_reason"] == {"no_survivor": 1}
+
+
 def test_the_cli_gates_command_exits_non_zero_when_any_row_fails(cfg, capsys):
     from ankidkdeck.cli import gates_report
     from ankidkdeck.util import FatalError

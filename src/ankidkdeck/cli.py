@@ -341,12 +341,44 @@ def gates_report(cfg) -> int:
     rows = data.get("results", [])
     width = max((len(row_label(r)) for r in rows), default=12)
     for row in rows:
-        print("%-4s %-*s %-10s %s"
+        # No marker at all on a report written before this accounting existed:
+        # "unknown" must not print as "carried".
+        carried_marker = ("" if row.get("executed_this_run", True)
+                          else "   [CARRIED]")
+        print("%-4s %-*s %-10s %s%s"
               % ("PASS" if row.get("ok") else "FAIL", width, row_label(row),
-                 "stage " + str(row.get("stage") or "?"), row.get("description")))
+                 "stage " + str(row.get("stage") or "?"), row.get("description"),
+                 carried_marker))
     bad = [row_label(r) for r in rows if not r.get("ok")]
     print("%d gate row(s) recorded, %d failing%s"
           % (len(rows), len(bad), (": " + ", ".join(bad)) if bad else ""))
+    # The row count is NOT a release verdict. Rows accumulate across stages AND
+    # across runs, so an all-PASS list can coexist with declared gates that have
+    # never executed on this workspace -- and G-SITEMAP, one of them, is what
+    # adjudicates merge_report.sitemap_shortfall_families.
+    never = data.get("gate_ids_never_run") or []
+    print("stages represented: %s ; %d of %d declared gates have a verdict here"
+          % (", ".join(data.get("stages_reported") or ["?"]),
+             len(data.get("gate_ids_with_a_verdict") or []),
+             data.get("gates_declared") or 0))
+    # `gates` READS the report, it does not run gates -- so from its own point of
+    # view every row is carried. The distinction that matters is inside the file:
+    # which rows the run that produced it actually executed. 12 recorded rows
+    # were 10 executed plus 2 left by an earlier run at stages that build never
+    # touches.
+    carried = data.get("gate_rows_carried_from_an_earlier_run")
+    if carried is None:
+        print("(this report predates the executed-here accounting: it cannot say "
+              "which rows the run that wrote it actually executed)")
+    else:
+        fresh = data.get("gate_rows_executed_this_run") or []
+        print("%d row(s) were executed by the run that wrote this report "
+              "(stages %s); %d carried from an earlier run%s"
+              % (len(fresh), ", ".join(data.get("stages_executed_this_run")
+                                       or ["-"]),
+                 len(carried), (": " + ", ".join(carried)) if carried else ""))
+    if never:
+        print("NOT RUN on this workspace (%d): %s" % (len(never), ", ".join(never)))
     print("manual gates are never recorded here: G-IMPORT (the Anki smoke test, "
           "tools/import_smoke_test.md) and G-REVIEW (a human reading "
           "review/rejected.json) need a signature, not a script.")

@@ -16,5 +16,6 @@
   "sitemap_shortfall_max_rate": 0.01,
   "all_demoted_families_max": 40,
   "case_only_members_max": 80,
+  "override_problems_max": 0,
   "tie_break_byte_order_max": 3
 }
