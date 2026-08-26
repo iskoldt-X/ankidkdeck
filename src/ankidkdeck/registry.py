@@ -16,6 +16,7 @@ FILES = [
     "card_keys.json",
     "form_to_lemma.json",
     "known_no_entry.json",
+    "wordlist_invalid.json",
     "alias_pairs.json",
     "alias_merge_pending.json",
     "demoted_pos_keys.json",
@@ -85,7 +86,50 @@ class Registry:
 
     @property
     def known_no_entry(self) -> dict:
+        """Words DDO genuinely has no entry for. Stage 21 stops reporting them.
+
+        Filled 2026-08-26 (owner decision, round-2 open item 10.45) from the 545
+        verified nohit rows: every one had fetch status `nohit`, its archived page
+        carries DDO's own "matcher ingen opslag i ordbogen" string, and none of
+        them appears among the 96,956 lemma keys of DDO's published sitemap. The
+        67 OCR-corrupted wordlist rows are deliberately NOT here -- 53 of them are
+        in wordlist_invalid.json and 14 stay visible in reports/unresolved.json,
+        because "DDO has no such word" is the wrong thing to record about a row
+        that is a misspelling of a word DDO does have.
+
+        The population is baselined (gates.json:known_no_entry_max, G-SUPPRESS):
+        this file removes words from the ONLY report that shows them, so it must
+        not be able to grow silently.
+        """
         return self.data["known_no_entry"]
+
+    @property
+    def wordlist_invalid(self) -> dict:
+        """Wordlist rows that are not words: OCR damage in the frozen 5,000-row
+        subtitle wordlist. {row: {correct, reason, rule}}.
+
+        Only the KEY is read by code. Stage 21 skips these rows before any layer
+        runs, so they never bind and never reach unresolved.json.
+
+        This is the registry route for owner decision 10.5, chosen over editing
+        the wordlist because wordlist_sha256 is the foundation of every GUID:
+        the file stays byte-identical, so no row's rank moves and no family's
+        guid_seed can change. Each row's `correct` field names the word the OCR
+        damaged, and 52 of the 53 corrections already ship a card at a BETTER
+        rank -- which is the proof that invalidating the row loses no Danish
+        content.
+
+        The one exception is `fbl` -> `fbi`, where the correction is itself a DDO
+        nohit and ships nothing: neither string is a word in any language, so
+        that row is invalid on its own terms rather than by the ships-a-card
+        rule, and it carries a `note` saying so. `vei` also carries a `note`, but
+        about WHICH correction (`vel`, rank 188; `vej` would need an i->j rule
+        this registry does not have) -- `vel` ships a card normally, so `vei` is
+        not an exception to the rule above. `ali` -> `all` fails the same test as
+        `fbl` and is deliberately NOT here: `Ali` is a name, so that row stays
+        visible in reports/unresolved.json for a human.
+        """
+        return self.data["wordlist_invalid"]
 
     @property
     def alias_pairs(self) -> set:

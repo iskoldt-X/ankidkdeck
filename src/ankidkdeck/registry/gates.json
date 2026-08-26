@@ -17,5 +17,12 @@
   "all_demoted_families_max": 40,
   "case_only_members_max": 80,
   "override_problems_max": 0,
+  "known_no_entry_max": 479,
+  "wordlist_invalid_max": 53,
+  "abbreviation_accepted_max": 19,
+  "abbreviation_accepted_words": [
+    "Dr", "Mrs", "ca", "frk", "hr", "kl", "kr", "ma", "mia", "mio", "mr",
+    "no", "nr", "on", "oz", "pga", "phil", "st", "th"
+  ],
   "tie_break_byte_order_max": 3
 }

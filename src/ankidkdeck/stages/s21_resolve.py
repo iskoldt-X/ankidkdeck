@@ -1,8 +1,46 @@
 """Stage 21: resolve wordlist words that classified to zero entries.
 
-Layers, in order: (1) forward page already gave members; (2) curated
+Layers, in order: (0) registry/wordlist_invalid.json drops OCR-damaged wordlist
+rows before anything else; (1) forward page already gave members; (2) curated
 registry/form_to_lemma.json overrides; (3) reverse form index over every kept
-article's flex table (this is what recovers er -> vaere); (4) known_no_entry.
+article's flex table (this is what recovers er -> vaere); (4) DDO's dotted
+abbreviation entry; (5) known_no_entry.
+
+LAYER 4 IS LAST FOR A REASON, AND THE REASON IS MEASURED. Owner policy B
+(2026-08-26) adopts the 19 wordlist words whose only reachable DDO article is the
+abbreviation entry spelled with a period -- mr, Dr, Mrs, hr, kl, nr, st, frk,
+phil, ca, pga, mia, kr, th, mio, no, on, oz, ma, every one of which shipped a
+v2.1 card. 42 words in the corpus reach such an article, not 19:
+
+  * 20 of them are WORDLIST ROWS that already own a card through an exactness
+    bucket (min/min., med/med., to/to., ti, tv, par, port, red, art, da, den,
+    do, eks, el, fa, man, pr, soe, soen, aarh) -- 19 by `exact_cs` and `pr` by
+    `exact_ci`, which binds the unrelated article `PR`(sb.). Admitting the dotted
+    article for those would staple a second, unrelated dictionary word's meaning
+    block onto 20 existing cards -- `min.` is `minut` -- and policy B says
+    INDEPENDENT abbreviation cards. They never reach layer 4 at all, because
+    layer 1 returns first: exclusive exactness is protected by the layer order,
+    not by a new filter that could later be weakened.
+  * `vaer` reaches `vaer.`(fork., 2 senses) AND is the imperative of `vaere`,
+    which a curated override already binds at layer 2. An abbreviation layer
+    placed before the override or the reverse index would steal it.
+  * 2 more (`net`, `sen`) reach a dotted article but are NOT wordlist rows: they
+    are off-list `source_words`. This loop iterates the wordlist, so those two
+    are excluded by the LOOP and never depended on the layer order at all
+    (reviewer A/B, round 4). 20 + 1 + 2 + 19 = 42.
+
+Layer 4 therefore admits exactly the 19 words and nothing else, and that is a
+property of the ORDER rather than of a hand-maintained word list.
+
+Layer 4 also deliberately drops the demoted filter that layers 2 and 3 keep: 18
+of the 19 dotted entries are `fork.` or `symbol`, i.e. demoted, which is the
+whole reason the policy needed an owner decision. is_dotted_abbreviation() is
+what makes that safe -- it admits ONLY a headword that is the query plus trailing
+periods, and the element-symbol articles that put `symbol` in demoted_pos_keys
+(`Th`, `No`, `Ca`, `Kr`, `mA` for th/no/ca/kr/ma) are case-only matches with no
+period, so they are still rejected. An all-demoted family is not new either:
+`cal`, `cm`, `kg`, `km`, `ms` and `www` are already six of them and they ship
+cards; G-ANCHOR baselines the count.
 
 The override moved AHEAD of the reverse index (round 2). Guide 4.7 lists the
 index first, but a curated override was then unreachable whenever the automatic
@@ -64,9 +102,11 @@ the gate report still all green, because stage 21 had no gate at all.
 from collections import defaultdict
 
 from ..config import Config
-from ..gates import G_OVERRIDE, Gate, curated_overrides_bind, is_affix_entry, run_gates
+from ..gates import (G_ADMIT, G_OVERRIDE, G_SUPPRESS, Gate,
+                     abbreviation_admissions, curated_overrides_bind,
+                     is_affix_entry, run_gates, suppression_registries)
 from ..util import NFC, nk, read_json, write_json
-from .s22_classify import classify_one
+from .s22_classify import classify_one, is_dotted_abbreviation
 
 # Reason codes for unresolved.json. Closed set, one row per skipped word.
 REASON_NOHIT = "nohit"                     # DDO has no such word
@@ -75,6 +115,47 @@ REASON_OVERRIDE_NOT_CRAWLED = "override_lemma_not_crawled"
 REASON_NO_SURVIVOR = "no_survivor"         # nothing left to attach
 UNRESOLVED_REASONS = (REASON_NOHIT, REASON_ALL_REJECTED,
                       REASON_OVERRIDE_NOT_CRAWLED, REASON_NO_SURVIVOR)
+
+# The one sentence every review/abbreviation_accepted.json row carries. Module
+# level because the row is now DERIVED from classification.json rather than
+# appended while layer 4 runs -- see abbreviation_admission_rows().
+ABBREVIATION_WHY = ("DDO has no entry for this wordlist spelling; the only "
+                    "article it answers with is the abbreviation written with "
+                    "its period (owner policy B, 2026-08-26)")
+
+
+def abbreviation_admission_rows(wordlist: list, classification: dict,
+                                entries: dict, demoted_pos: set) -> list:
+    """The layer-4 audit table, derived from the STATE rather than from the run.
+
+    review/abbreviation_accepted.json is the sheet a human signs for the 19
+    edges owner policy B admits against the classifier's own verdict, and the
+    admission baseline gate (G-ADMIT) counts its rows. Built by appending while
+    layer 4 ran, it emptied itself on a retry: a second standalone `resolve`
+    reads back the classification.json this stage wrote, sees the members layer 4
+    already attached, returns at layer 1 -- and wrote `[]` over all 19 rows with
+    no gate looking (reviewer B, round 4, MINOR-4). override_accepted.json has
+    the same shape and the same defect; this is the fix for the table round 4
+    added.
+
+    Deriving it also makes the file a function of what is on disk, so it is
+    byte-identical across reruns, and it cannot disagree with the members it
+    describes. Iterates the wordlist so the row order is rank order.
+    """
+    rows = []
+    for w in wordlist:
+        c = classification.get(w["word"]) or {}
+        for m in (c.get("members") or ()):
+            if m.get("evidence") != "abbreviation":
+                continue
+            e = entries[m["entry_id"]]
+            rows.append({"word": w["word"], "entry_id": m["entry_id"],
+                         "abbreviation_lemma": e["lemma"],
+                         "pos_key": e.get("pos_key"),
+                         "demoted_pos": e.get("pos_key") in demoted_pos,
+                         "senses": len(e.get("senses") or ()),
+                         "why": ABBREVIATION_WHY})
+    return rows
 
 
 def rejected_everywhere_ids(classification: dict) -> set:
@@ -141,6 +222,16 @@ def run(cfg: Config, registry) -> dict:
         for f in entries[eid]["form_index"]:
             rev[f].add(eid)
 
+    # Every article parsed from the word's OWN page, which is the only place
+    # layer 4 looks. Same construction stage 22 uses for its candidate lists: a
+    # dotted abbreviation is adopted because it is what DDO answered for THAT
+    # query, never because some article elsewhere in the corpus happens to be
+    # spelled that way.
+    own_page: dict[str, set] = defaultdict(set)
+    for eid, e in entries.items():
+        for w in e.get("source_words", []):
+            own_page[w].add(eid)
+
     recovery_rejects: list = []
     override_accepted: list = []
 
@@ -170,6 +261,22 @@ def run(cfg: Config, registry) -> dict:
                         entries[eid].get("paradigm_index") or ()),
                     "why": "registry/form_to_lemma.json says so; the classifier "
                            "had no automatic evidence either way"})
+            if (bucket == "reject" and evidence == "abbreviation"
+                    and why == "abbreviation"):
+                # Owner policy B. The classifier's `abbreviation` rejection is a
+                # POSITIVE claim -- "this headword is the query plus a period" --
+                # so unlike the override channel there is no guessing here: the
+                # reason code IS the evidence. Bucket `abbreviation`, which
+                # s30._relation() renders as relation "abbreviation": not an
+                # inflection (the dotless form is not a paradigm cell of the
+                # dotted headword) and not a variant spelling (s70's Variants
+                # line would then print `hr` on a card already headlined `hr.`,
+                # which is noise, not information). It stays a hidden searchable
+                # form, which is what makes Anki find the card by typing `hr`.
+                # No audit row is appended here on purpose: it is DERIVED from
+                # the resulting members afterwards, so a rerun that returns at
+                # layer 1 cannot blank the table -- abbreviation_admission_rows().
+                bucket, why = "abbreviation", "dotted_abbreviation_entry"
             if bucket == "reject":
                 row = {"entry_id": eid, "headword": entries[eid]["lemma"],
                        "pos_key": entries[eid].get("pos_key"),
@@ -195,12 +302,43 @@ def run(cfg: Config, registry) -> dict:
     unresolved = []
     by_reason: dict[str, int] = {}
     override_problems: list = []
+    invalid_rows_that_bound: list = []
     resolved = {"forward": 0, "reverse_index": 0, "override": 0,
-                "known_no_entry": 0}
+                "abbreviation": 0, "wordlist_invalid": 0, "known_no_entry": 0}
     for w in wordlist:
         word = w["word"]
         c = classification.setdefault(
             word, {"members": [], "xrefs": [], "rejected": [], "resolved_by": None})
+        # Layer 0: the row is not a word. OCR damage in the frozen wordlist
+        # (registry/wordlist_invalid.json, owner decision 10.5). Checked BEFORE
+        # layer 1 so an invalid row can never bind by any route; every one of the
+        # 53 rows is a DDO nohit today, so this subtracts nothing, and a row that
+        # DID have members is a curation bug G-SUPPRESS fails on rather than a
+        # card this registry deletes quietly.
+        #
+        # THE EVIDENCE HAS TO OUTLIVE THE CLEARING. classification.json is this
+        # stage's INPUT and also one of its outputs, and it is rewritten below --
+        # before the gates run. Clearing `members` without recording what was
+        # cleared therefore destroyed the only trace of the condition: a second
+        # standalone `resolve` read the already-emptied row, found nothing to
+        # report, and G-SUPPRESS PASSED on the retry with the binding still
+        # deleted (reviewer A, round 4, MAJOR-1, reproduced end to end). The
+        # suppressed entry_ids are written into the row instead, so the gate's
+        # third assertion is re-derivable from the artifact on every later run.
+        # Write-once: an id recorded here is never dropped, because the run that
+        # can still see it is the first one.
+        if word in registry.wordlist_invalid:
+            suppressed = sorted(
+                {m["entry_id"] for m in c["members"]}
+                | set(c.get("suppressed_by_wordlist_invalid") or ()))
+            if suppressed:
+                c["suppressed_by_wordlist_invalid"] = suppressed
+                invalid_rows_that_bound.append(
+                    {"word": word, "rank": w["rank"], "entry_ids": suppressed})
+            c["members"] = []
+            c["resolved_by"] = "wordlist_invalid"
+            resolved["wordlist_invalid"] += 1
+            continue
         if c["members"]:
             resolved["forward"] += 1
             continue
@@ -233,6 +371,22 @@ def run(cfg: Config, registry) -> dict:
             attach(c, hits, "reverse_index")
             c["resolved_by"] = "reverse_index"
             resolved["reverse_index"] += 1
+            continue
+        # Layer 4: DDO's dotted abbreviation entry, from the word's OWN page.
+        # LAST of the rescue layers on purpose -- see the module docstring for
+        # the 20 + 1 words the order protects. The affix filter still applies;
+        # the demoted filter deliberately does not, which is the whole content of
+        # owner policy B, and is_dotted_abbreviation() is the guard that keeps it
+        # from reaching an element-symbol article.
+        abbr = judged(word, c,
+                      sorted(eid for eid in own_page.get(word, ())
+                             if is_dotted_abbreviation(word, entries[eid])
+                             and not is_affix_entry(entries[eid])),
+                      "abbreviation")
+        if abbr:
+            attach(c, abbr, "abbreviation")
+            c["resolved_by"] = "abbreviation"
+            resolved["abbreviation"] += 1
             continue
         if word in registry.known_no_entry:
             c["resolved_by"] = "known_no_entry"
@@ -269,6 +423,15 @@ def run(cfg: Config, registry) -> dict:
     # curated path means the classifier is no longer a second opinion on these
     # edges, so the mappings that bound this way are the ones under review.
     write_json(cfg.review_dir / "override_accepted.json", override_accepted)
+    # review/, same argument as override_accepted.json: layer 4 admits an article
+    # the classifier rejects on the forward page, on the strength of an owner
+    # policy rather than of automatic evidence, so the edges it admits are edges
+    # a human signs for. 19 rows, one per abbreviation card. Derived from the
+    # classification (not from this run's admissions) so a retry cannot empty it.
+    abbreviation_accepted = abbreviation_admission_rows(
+        wordlist, classification, entries, demoted_pos)
+    write_json(cfg.review_dir / "abbreviation_accepted.json",
+               abbreviation_accepted)
     # Derived from the rows, so the counters and the file can never disagree.
     resolved["unresolved"] = len(unresolved)
     resolved["unresolved_by_reason"] = {r: by_reason.get(r, 0)
@@ -283,13 +446,19 @@ def run(cfg: Config, registry) -> dict:
     resolved["recovered_buckets"] = _count(
         m["bucket"] for c in classification.values()
         for m in (c.get("members") or [])
-        if m.get("evidence") in ("reverse_index", "override"))
+        if m.get("evidence") in ("reverse_index", "override", "abbreviation"))
     # An override that could not be used is a CURATION bug: reported even when
     # the reverse index rescued the word, because otherwise it is invisible.
     resolved["override_problems"] = len(override_problems)
     resolved["override_problems_sample"] = override_problems[:20]
     resolved["override_accepted"] = len(override_accepted)
     resolved["override_mappings"] = len(registry.form_to_lemma)
+    resolved["abbreviation_accepted"] = len(abbreviation_accepted)
+    resolved["abbreviation_words"] = sorted(
+        {r["word"] for r in abbreviation_accepted})
+    resolved["known_no_entry_registry_rows"] = len(registry.known_no_entry)
+    resolved["wordlist_invalid_registry_rows"] = len(registry.wordlist_invalid)
+    resolved["invalid_rows_that_bound"] = len(invalid_rows_that_bound)
     write_json(cfg.report_dir / "resolve_report.json", resolved)
 
     # G-OVERRIDE runs AFTER the writes, which is the opposite of stages 20/22/30
@@ -303,6 +472,26 @@ def run(cfg: Config, registry) -> dict:
              lambda: curated_overrides_bind(
                  override_problems, len(override_accepted),
                  int(registry.gates.get("override_problems_max", 0))),
+             stage="21"),
+        Gate(G_SUPPRESS, "the two registries that remove words from "
+                         "unresolved.json are inside their baselines, disjoint, "
+                         "and delete no binding",
+             lambda: suppression_registries(
+                 registry.known_no_entry, registry.wordlist_invalid,
+                 invalid_rows_that_bound,
+                 int(registry.gates.get("known_no_entry_max", 0)),
+                 int(registry.gates.get("wordlist_invalid_max", 0))),
+             stage="21"),
+        # Fail-closed the same way G-SUPPRESS is: a MISSING baseline key is an
+        # empty word list, so every admission is "beyond the baseline" and the
+        # gate fires. A channel that mints cards from rejected articles must not
+        # be able to go unbaselined by deleting a registry line.
+        Gate(G_ADMIT, "the layer-4 abbreviation admissions are the words the "
+                      "owner signed for, and no more of them",
+             lambda: abbreviation_admissions(
+                 abbreviation_accepted,
+                 registry.gates.get("abbreviation_accepted_words") or (),
+                 int(registry.gates.get("abbreviation_accepted_max", 0))),
              stage="21"),
     ], cfg, stage="21")
     return resolved

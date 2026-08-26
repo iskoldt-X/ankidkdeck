@@ -63,6 +63,25 @@ G_CASE = "G-CASE"            # the case-only membership population is baselined
 # 140 -- every curated mapping in the registry failing to bind -- with
 # gates_report.json still reporting every row ok. Stage 21 had no gate at all.
 G_OVERRIDE = "G-OVERRIDE"
+# Round 4 added two registries (owner decisions 10.45 and 10.5) that SILENTLY
+# REMOVE words from reports/unresolved.json -- the only artifact that shows them.
+# known_no_entry went 0 -> 479 rows and wordlist_invalid 0 -> 53 in one step, and
+# round 1 section 4.1 and round 2 section 9.4 both made a baseline the explicit
+# precondition for doing that, for the same reason all_demoted_families_max and
+# case_only_members_max exist: an unbaselined suppression list is how a
+# population grows with nobody noticing.
+G_SUPPRESS = "G-SUPPRESS"
+# Round 4's OTHER new channel, and the one it forgot to baseline. Layer 4 is an
+# ADMISSION channel: it mints cards from articles the classifier rejects, on the
+# strength of an owner policy rather than of automatic evidence. Every other
+# human-policy channel here is baselined -- G-OVERRIDE + override_problems_max,
+# case_only_members_max, all_demoted_families_max, and G-SUPPRESS for the two
+# registries added in the same change -- so the argument that produced those
+# applies verbatim to this one (reviewer A, round 4, MAJOR-2). Indirect cover was
+# partial and would have missed the interesting case: 18 of the 19 admissions are
+# demoted and land in G-ANCHOR's all_demoted_families, but `hr.` is `sb.` and is
+# invisible there.
+G_ADMIT = "G-ADMIT"
 
 # The declared set, so a report can say what it did NOT check. "11 gates PASS"
 # was read as a release verdict when it meant "11 rows are on file, 8 of them
@@ -71,9 +90,10 @@ G_OVERRIDE = "G-OVERRIDE"
 # adjudicates merge_report.sitemap_shortfall_families. A gate that never ran is
 # not a gate that passed.
 ALL_GATE_IDS = (
-    G_AFFIX, G_ANCHOR, G_ASSIGN, G_BIND, G_CASE, G_COV, G_DET, G_EMPTY_C,
-    G_GUID, G_LABEL, G_MEDIA, G_NOTE, G_ORDER, G_ORPH, G_OVERRIDE, G_RANK,
-    G_RATE, G_REGKEY, G_REL, G_SEED, G_SEP, G_SITEMAP, G_SITEMAP_INV, G_TIE,
+    G_ADMIT, G_AFFIX, G_ANCHOR, G_ASSIGN, G_BIND, G_CASE, G_COV, G_DET,
+    G_EMPTY_C, G_GUID, G_LABEL, G_MEDIA, G_NOTE, G_ORDER, G_ORPH, G_OVERRIDE,
+    G_RANK, G_RATE, G_REGKEY, G_REL, G_SEED, G_SEP, G_SITEMAP, G_SITEMAP_INV,
+    G_SUPPRESS, G_TIE,
 )
 
 # Gates that are a HUMAN signature, not a script; they can never appear in
@@ -503,6 +523,89 @@ def curated_overrides_bind(problems: list, n_edges_admitted: int,
                       "mappings_that_bound_nothing": len(problems),
                       "max": max_problems, "by_reason": dict(sorted(by_reason.items())),
                       "sample": problems[:20]}
+
+
+def suppression_registries(known_no_entry: dict, wordlist_invalid: dict,
+                           invalid_rows_that_bound: list,
+                           known_max: int | None = None,
+                           invalid_max: int | None = None):
+    """G-SUPPRESS. The two registries that DELETE words from unresolved.json are
+    baselined, disjoint, and cannot hide a binding.
+
+    Three assertions, each with a measured failure behind it:
+
+      1. Both populations are inside a baseline. reports/unresolved.json is the
+         whole enforcement surface for the owner's skip-and-record ruling -- G-ZERO
+         was downgraded to a report on the condition that the report lists every
+         unresolved word. A registry that silently subtracts from it needs the same
+         baseline `case_only_members_max` and `all_demoted_families_max` have, and
+         round 1 section 4.1 made that the explicit precondition for filling
+         known_no_entry at all.
+      2. The two files are DISJOINT. They make contradictory claims about a word --
+         "DDO has no such word" versus "this row is not a word" -- and a row in
+         both means one of the two is wrong. It is also the shape a copy-paste
+         mistake takes: the OCR rows were carved OUT of the nohit population.
+      3. No invalidated row bound anything. wordlist_invalid is consumed before
+         every resolve layer, so a row appearing in it should have had no members
+         to begin with; if it did, the registry is deleting a real card edge and
+         the only visible symptom would be a card quietly disappearing.
+    """
+    both = sorted(set(known_no_entry) & set(wordlist_invalid))
+    over_known = known_max is not None and len(known_no_entry) > known_max
+    over_invalid = invalid_max is not None and len(wordlist_invalid) > invalid_max
+    ok = (not both and not invalid_rows_that_bound
+          and not over_known and not over_invalid)
+    return ok, {"known_no_entry": len(known_no_entry),
+                "known_no_entry_max": known_max,
+                "wordlist_invalid": len(wordlist_invalid),
+                "wordlist_invalid_max": invalid_max,
+                "over_baseline": {"known_no_entry": bool(over_known),
+                                  "wordlist_invalid": bool(over_invalid)},
+                "in_both_registries": both[:20],
+                "invalid_rows_that_bound_an_article": invalid_rows_that_bound[:20]}
+
+
+def abbreviation_admissions(rows: list, baseline_words=None,
+                            max_rows: int | None = None):
+    """G-ADMIT. The layer-4 abbreviation admission channel is BASELINED.
+
+    Layer 4 (owner policy B, 2026-08-26) is the only place in the pipeline where
+    an article the classifier REJECTED becomes a card anyway. Round 4 baselined
+    the two suppression registries it added in the same change (G-SUPPRESS) and
+    left this channel unbaselined, so a future admission -- a new dotted DDO
+    entry, a wordlist swap, a relaxed guard -- would mint a card with nothing to
+    fire (reviewer A, round 4, MAJOR-2).
+
+    Two assertions:
+
+      1. Every admitted WORD is one the owner signed for. The baseline is the 19
+         words themselves (registry/gates.json:abbreviation_accepted_words), not
+         just a count, so a swap -- one admission lost, another gained -- cannot
+         pass on an unchanged total. Growing the channel means editing that list
+         in the same commit as the change that grew it, which is the whole point.
+      2. The EDGE count is inside its max. One word can admit more than one
+         dotted article -- `pr` reaches both `pr.`(fork., 1 sense) and
+         `pr.`(praep., 6 senses), and layer 4 does not pick between them -- so a
+         word already on the baseline list could still double its cards.
+
+    SHRINKING is reported, not failed, and the asymmetry is deliberate: the day
+    DDO gives one of these 19 words a real entry, layers 1-3 bind it first and
+    this channel correctly stops firing for it. That is the mechanism working,
+    not a regression, and it is exactly the case known_no_entry's layer order was
+    designed for. The rows that disappeared are named in the detail so the
+    release notes can pick them up.
+    """
+    words = sorted({str(r.get("word")) for r in rows})
+    baseline = sorted({str(x) for x in (baseline_words or ())})
+    beyond = [w for w in words if w not in set(baseline)]
+    gone = [w for w in baseline if w not in set(words)]
+    over = max_rows is not None and len(rows) > max_rows
+    ok = not beyond and not over
+    return ok, {"rows": len(rows), "max_rows": max_rows,
+                "over_max_rows": bool(over),
+                "words": words, "baseline_words": len(baseline),
+                "admitted_beyond_the_baseline": beyond,
+                "baseline_words_not_admitted": gone}
 
 
 def case_only_members(rows: list, max_n: int | None = None):

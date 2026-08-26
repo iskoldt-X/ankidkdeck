@@ -2,7 +2,8 @@
 
 Buckets, in headline order: exact_cs (NFC codepoint-equal) > form (in the
 article's own flex table) > variant (orthographic variant / alias) > exact_ci
-(equal only after casefold -- where Er(erbium)/er lives). Decisive bucket-2
+(equal only after casefold -- where Er(erbium)/er lives) > abbreviation (stage
+21's last-resort layer only, never returned here). Decisive bucket-2
 signal is flex-table containment; tab labels are refuted (kan->khan). Exactness
 is EXCLUSIVE: a word that is its own dictionary headword is never absorbed as a
 form of another lemma (godt has 15 senses of its own AND sits in god's flex
@@ -12,7 +13,7 @@ sitemap shard.
 DECISION ORDER (this is the part the guide's own pseudocode got wrong):
 
     affix reject          headword shape / data-pos-key
-    abbreviation reject   min. (min), i.e. hw.rstrip('.') == q
+    abbreviation reject   min. (min), i.e. nk(hw).rstrip('.') == nk(q)
     exact_cs              NFC(hw) == q
     case-only             nk(hw) == nk(q)  ->  reject if demoted, else exact_ci
     form                  nk(q) in PARADIGM CELLS   (not the lemma key, not
@@ -42,7 +43,13 @@ from ..config import Config
 from ..gates import G_AFFIX, Gate, no_affix_members, run_gates
 from ..util import NFC, nk, read_json, write_json
 
-BUCKET_ORDER = {"exact_cs": 0, "form": 1, "variant": 2, "exact_ci": 3}
+# `abbreviation` is a stage-21 LAST-RESORT bucket, never returned by
+# classify_one(); it is registered here because it is the weakest binding in the
+# pipeline and stage 30 reads this table for both best_member() and the anchor
+# rule. Ranking it after exact_ci is what guarantees an abbreviation article can
+# never outrank a real one for the card headline. See s21_resolve layer 4.
+BUCKET_ORDER = {"exact_cs": 0, "form": 1, "variant": 2, "exact_ci": 3,
+                "abbreviation": 4}
 
 
 def squash(s: str) -> str:
@@ -92,13 +99,60 @@ def is_variant(word: str, e: dict, alias_pairs: set) -> bool:
     return pair in alias_pairs or (pair[1], pair[0]) in alias_pairs
 
 
+def is_dotted_abbreviation(word: str, e: dict) -> bool:
+    """DDO's own abbreviation entry for `word`: the headword is the query plus
+    one or more trailing periods and nothing else (`hr.` for `hr`, `dr.` for
+    `Dr`, `st.` for `st`).
+
+    Compared through nk(), which is the round-2 case-sensitivity fix (reviewer B
+    N-1): DDO spells the doctor abbreviation `dr.` in lower case, so the raw-NFC
+    test called `Dr`(rank 358) and `Mrs`(598) `unrelated` -- the classifier's
+    "I have no opinion" fallback -- while claiming to have a rule for exactly
+    that shape. Two rejection REASON codes change; no edge changes verdict, and
+    the relation is strictly weaker than the raw test (a match under it implies
+    nk(hw) == nk(q) + dots, so it can never steal an edge from exact_cs,
+    case-only, form or variant).
+
+    It also cannot admit an element-symbol article, which is the hazard that put
+    `symbol` and `fork.` in demoted_pos_keys: `Th`(thorium), `No`(nobelium),
+    `Ca`, `Kr` and `mA` are CASE-ONLY matches for th/no/ca/kr/ma and carry no
+    period, so they still reject as case_only_demoted_pos.
+
+    THIS IS A SHAPE TEST, NOT A POS TEST, and the difference has a live
+    counterexample: `11040665 'pr.'` is `praep.` with 6 senses -- a full
+    preposition article, not an abbreviation -- and it passes this relation,
+    because the relation only asks whether the headword is the query plus
+    periods. "A period inside a DDO headword IS the abbreviation mark" is
+    therefore a claim about this corpus, not a property of this function. It is
+    unreachable today: `pr` binds `PR` by exact_ci at layer 1, so stage 21's
+    layer 4 never runs for it (reviewer A, round 4, minor). Anything that lets a
+    word past layer 1 to layer 4 has to re-check that assumption.
+
+    NOT o.k./ok: nk("o.k.").rstrip(".") is "o.k", which is why that pair lives
+    in the alias registry instead.
+
+    Public because stage 21's layer 4 (owner policy B, 2026-08-26) adopts
+    exactly this relation, and the two must not be able to drift apart.
+    """
+    a, b = nk(e["lemma"]), nk(word)
+    return a.rstrip(".") == b and a != b
+
+
 def classify_one(word: str, e: dict, demoted_pos: set, alias_pairs: set):
     q, hw = NFC(word), e["lemma"]
     if hw.startswith("-") or hw.endswith("-"):
         return "reject", "affix"                      # -kvinde (kvinder), -ske (sker)
-    if hw.rstrip(".") == q and hw != q:
-        # min. (min), nr. (nr). NOT o.k./ok -- "o.k.".rstrip(".") is "o.k",
-        # which is why that pair lives in the alias registry instead.
+    if is_dotted_abbreviation(q, e):
+        # min. (min), nr. (nr), dr. (Dr). The FORWARD page still rejects: an
+        # abbreviation entry is a different dictionary word from the word that
+        # happens to spell it without the period, and 20 WORDLIST ROWS that
+        # already own a card (min, med, to, ti, tv, par, port, red, art, da, den,
+        # do, eks, el, fa, man, pr, soe, soen, aarh) reach a dotted article this
+        # way -- plus `net` and `sen`, which reach one but are off-list
+        # source_words rather than wordlist rows. Owner policy B adopts the 19
+        # words for which the dotted entry is the ONLY thing DDO offers, and
+        # stage 21 does that as a last-resort layer so exclusive exactness is
+        # untouched by construction.
         return "reject", "abbreviation"
     demoted = e.get("pos_key") in demoted_pos
     if NFC(hw) == q:

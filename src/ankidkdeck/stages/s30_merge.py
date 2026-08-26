@@ -86,12 +86,26 @@ def best_member(word: str, members: list, entries: dict) -> tuple:
 
 
 def _relation(word: str, bucket: str, fam: dict) -> str:
+    """How this member word relates to the family's headword.
+
+    `abbreviation` is its own relation and not a fall-through to `alias`, because
+    the fall-through is what s70.alt_forms_html renders on the card's Variants
+    line: `hr` would then print as a variant spelling on a card already headlined
+    `hr.`, which tells the reader nothing and costs a line. It is neither an
+    inflection (the dotless spelling is not a paradigm cell of the dotted
+    headword; DDO abbreviation entries have no flex table at all) nor a variant
+    spelling (the period is the abbreviation mark, not an orthographic choice).
+    It still enters searchable_forms, which is what makes typing `hr` in Anki
+    find the card -- the same treatment the curated-override imperatives get.
+    """
     if nk(word) == nk(fam["lemma"]):
         return "anchor"
     if bucket == "form":
         return "inflection"
     if bucket == "variant":
         return "variant"
+    if bucket == "abbreviation":
+        return "abbreviation"
     return "alias"
 
 

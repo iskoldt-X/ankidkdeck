@@ -805,3 +805,73 @@ def test_the_freeze_report_says_what_is_uncommitted_when_added_is_zero(
     shipped = merge_run(cfg, Registry(cfg))["registry_freeze"]
     assert shipped["added"] == 0
     assert shipped["rows_not_in_the_committed_registry"] == 0
+
+
+def test_an_abbreviation_member_is_not_a_variant_on_the_card_face(cfg, registry):
+    """The abbreviation card, end to end (owner policy B, 2026-08-26).
+
+    Four properties, each one a decision that could have gone the other way:
+
+      * the card is HEADLINED by DDO's own dotted spelling (`hr.`), because the
+        dotted article is the family's only entry and therefore its anchor;
+      * the member's relation is `abbreviation`, not the `alias` fall-through
+        _relation() used to give any unknown bucket -- s70.alt_forms_html renders
+        variant/alias members, so the fall-through would have printed `hr` as a
+        variant spelling on a card already headlined `hr.`;
+      * the dotless wordlist spelling is still in searchable_forms, which is what
+        makes typing `hr` in Anki find the card;
+      * the guid_seed is the v2.1 QueryWord, so the retired 2.1 card comes back
+        with its own GUID instead of a new one.
+    """
+    from ankidkdeck.stages.s70_export import alt_forms_html, headword_html
+    hr = make_entry("11021497", "hr.", pos_key="sb.", source_words=["hr"],
+                    senses=[make_sense("21000400", "titel")])
+    write_workspace(cfg, {"11021497": hr}, [(179, "hr")],
+                    classification={"hr": {"members": [
+                        {"entry_id": "11021497", "bucket": "abbreviation",
+                         "demoted": False, "evidence": "abbreviation",
+                         "why": "dotted_abbreviation_entry"}],
+                        "xrefs": [], "rejected": [],
+                        "resolved_by": "abbreviation"}},
+                    v2_querywords={"hr": 179})
+    merge_run(cfg, registry)
+    fam = read_json(cfg.json_dir / "words.json")["11021497"]
+    assert fam["lemma"] == "hr."
+    assert [(m["word"], m["relation"]) for m in fam["members"]] == [
+        ("hr", "abbreviation")]
+    assert fam["searchable_forms"] == ["hr.", "hr"]
+    assert fam["guid_seed"] == "hr"
+    assert headword_html(hr) == "hr."
+    # the whole point: NOT on the Variants line
+    assert alt_forms_html(fam, [hr]) == ""
+    # ...and it would have been, under the alias fall-through
+    aliased = dict(fam, members=[{"word": "hr", "wiktionary_rank": 179,
+                                  "relation": "alias"}])
+    assert "hr" in alt_forms_html(aliased, [hr])
+
+
+def test_an_abbreviation_article_never_outranks_a_real_one_for_the_anchor(
+        cfg, registry):
+    """BUCKET_ORDER puts `abbreviation` last, after exact_ci, so a mixed family
+    is still headlined by the real word. Unreachable on the 2026 corpus -- layer
+    4 only fires for a word with no other member at all -- and asserted anyway,
+    because the table is what stage 30 reads for both best_member() and the
+    anchor rule."""
+    from ankidkdeck.stages.s22_classify import BUCKET_ORDER
+    assert BUCKET_ORDER["abbreviation"] == max(BUCKET_ORDER.values())
+    real = make_entry("11033715", "min", pos_key="pron.", source_words=["min"],
+                      senses=[make_sense("21000401", "tilhoerende mig")])
+    abbrev = make_entry("11033713", "min.", pos_key="fork.",
+                        source_words=["min"],
+                        senses=[make_sense("21000402", "minut")])
+    write_workspace(cfg, {"11033715": real, "11033713": abbrev},
+                    [(53, "min")],
+                    classification={"min": _c(
+                        _members("11033715", "exact_cs"),
+                        _members("11033713", "abbreviation", demoted=True))},
+                    v2_querywords={"min": 53})
+    merge_run(cfg, registry)
+    fams = read_json(cfg.json_dir / "words.json")
+    assert list(fams) == ["11033715"]
+    assert fams["11033715"]["lemma"] == "min"
+    assert fams["11033715"]["members"][0]["relation"] == "anchor"
