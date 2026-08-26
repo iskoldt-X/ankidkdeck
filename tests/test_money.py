@@ -549,6 +549,124 @@ def test_g_cache_counts_the_whole_wave_not_just_the_hits():
     assert detail["cached_kinds"] == ["definition"]
 
 
+# ---- G-CACHE under the batch transport's recovery paths -------------------
+#
+# CROSS-OWNER TESTS (made for the batch transport; the gate lives in this file). The denominator change these pin
+# shipped without one test of its own: `grep rows_that_never_executed tests/`
+# found nothing, and the two tests above only proved the change had not BROKEN
+# them. Both directions are asserted here, plus the two holes the acceptance
+# reviewers measured.
+
+def test_g_cache_does_not_count_a_row_that_never_executed():
+    """The denominator change, pinned in the direction it was made for.
+
+    On the batch surface a per-row failure is a bare gRPC status at prompt=0,
+    billed $0 (probe W3-4: a cache deleted after a successful submit failed all
+    21 rows that way), and the wave RETRIES it. Counting the failed attempt in
+    the denominator scored one error plus one successful retry at
+    1135/(1135 x 2) = 0.5 against a 0.95 threshold and condemned a healthy wave.
+    """
+    dead = usage_row(label="attempt 1", prompt_tokens=0, cached_tokens=0,
+                     cache_name="caches/x", error="batch_row_error")
+    retried = usage_row(label="attempt 2", prompt_tokens=1350,
+                        cached_tokens=DECLARED, cache_name="caches/x")
+    ok, detail = gates.cache_hit_is_complete([dead, retried], DECLARED,
+                                             cache_expected=True)
+    assert ok is True
+    assert detail["rows_that_never_executed"] == 1
+    assert detail["rows_checked"] == 1
+    assert detail["sum_cached_over_declared_x_requests"] == 1.0
+
+    # the arithmetic the OLD denominator produced, for the record
+    assert round(DECLARED / float(DECLARED * 2), 4) == 0.5
+
+    # and a whole wave of them is STILL a refusal: those rows are of a cacheable
+    # kind, so the wave declared something to cache and got nothing back
+    allof = [usage_row(label="r%d" % i, prompt_tokens=0, cached_tokens=0,
+                       cache_name="caches/x", error="batch_row_error")
+             for i in range(21)]
+    ok, detail = gates.cache_hit_is_complete(allof, DECLARED,
+                                             cache_expected=True)
+    assert ok is False
+    assert detail["rows_that_never_executed"] == 21
+    assert detail["rows_of_a_cacheable_kind"] == 21
+
+
+def test_g_cache_counts_a_billed_row_that_also_reported_an_error():
+    """The exclusion is `prompt_tokens > 0`, and nothing else.
+
+    It used to be `prompt_tokens > 0 and not error`, which is wider than the
+    reason needs and unsafe in the one direction that matters: a row that was
+    BILLED, used no cache and also carried an error -- a truncation, an
+    unparseable body -- did miss the cache, and dropping it from the denominator
+    hides exactly the full-price row this gate looks for. Measured by an
+    acceptance reviewer: twenty such rows left rows_checked at 1 and the gate
+    PASSED.
+    """
+    hit = usage_row(label="hit", prompt_tokens=1350, cached_tokens=DECLARED,
+                    cache_name="caches/x")
+    billed_and_broken = [usage_row(label="miss-%d" % i, prompt_tokens=2485,
+                                   cached_tokens=0, error="batch_row_error")
+                         for i in range(20)]
+    ok, detail = gates.cache_hit_is_complete([hit] + billed_and_broken,
+                                             DECLARED, cache_expected=True)
+    assert ok is False, "20 billed uncached rows are not a healthy wave"
+    assert detail["rows_checked"] == 21
+    assert detail["requests_without_a_cache"] == 20
+
+
+def test_g_cache_passes_a_wave_with_nothing_cacheable_in_it():
+    """cache_expected is scoped to waves that DECLARED a cacheable request.
+
+    The expression prompt is ~336 tokens against a measured 1,024-token floor,
+    so it is uncached BY DESIGN -- which means an incremental wave with only
+    expression cells left has nothing to cache. Failing it made the
+    documented recovery path unreachable: "the unrecovered cells stay missing and
+    the next run picks them up" was followed by a run with no definition rows,
+    which died on this gate before it could write anything.
+    """
+    exprs = [usage_row(label="e%d" % i, kind="expression", prompt_tokens=700,
+                       cached_tokens=0) for i in range(12)]
+    ok, detail = gates.cache_hit_is_complete(exprs, None, cache_expected=True)
+    assert ok is True
+    assert detail["rows_of_a_cacheable_kind"] == 0
+    assert detail["verdict"] == "n/a: no request of a cacheable kind in this wave"
+
+    # ONE definition row is enough to bring the criterion back
+    with_one = exprs + [usage_row(label="d", prompt_tokens=1350,
+                                  cached_tokens=0)]
+    ok, detail = gates.cache_hit_is_complete(with_one, None,
+                                             cache_expected=True)
+    assert ok is False
+    assert detail["rows_of_a_cacheable_kind"] == 1
+
+
+def test_g_cache_still_fails_the_original_failure_at_every_real_denominator():
+    """The denominator is now this LANGUAGE's own declaration.
+
+    So the values that can reach the gate are the measured prompt sizes -- and at
+    every one of them the failure the gate was rewritten for still fails. The
+    values that made it PASS (a stale declaration of 5, pulled in by a min()
+    across every job the workspace ever ran) are no longer reachable, and the
+    direction is the whole point: a smaller divisor RAISES the share, so the
+    unsafe error was the one that used to be the normal path.
+    """
+    hit = usage_row(label="hit", prompt_tokens=1350, cached_tokens=DECLARED,
+                    cache_name="caches/x")
+    missed = [usage_row(label="miss-%d" % i, prompt_tokens=1350,
+                        cached_tokens=0) for i in range(99)]
+    for declared in (1135, 1092, 500, 100):
+        ok, detail = gates.cache_hit_is_complete([hit] + missed, declared,
+                                                 cache_expected=True)
+        assert ok is False, declared
+        assert detail["sum_cached_over_declared_x_requests"] < 0.15, declared
+    # the stale-denominator PASS, kept as the record of what was wrong
+    ok, _ = gates.cache_hit_is_complete([hit] + missed, 5, cache_expected=True)
+    assert ok is True, ("a denominator of 5 passes the broken wave -- which is "
+                        "why the transport may no longer take min() across "
+                        "languages and across history")
+
+
 def test_g_think_predicate():
     """A measured zero passes; a MEDIUM-scale row fails.
 
@@ -696,7 +814,7 @@ def test_g_budget_refuses_a_run_that_would_break_the_cap():
     assert ok is False
 
 
-def test_g_scope_frozen_refuses_without_a_stamp(cfg):
+def test_g_scope_frozen_refuses_without_a_stamp(cfg, not_refrozen):
     """Spec 2.7. No refreeze signature, no spending -- and the signature is a
     signature: nothing in this package writes it."""
     stamp, where = gates.read_refreeze_stamp(cfg)
@@ -1169,7 +1287,7 @@ def test_the_money_path_imports_no_llm_module():
 
 
 def test_the_required_constants_are_one_list():
-    """Crew A owns REQUIRED_STATS_KEYS; N-09 reuses it rather than writing a
+    """REQUIRED_STATS_KEYS is defined elsewhere; N-09 reuses it rather than writing a
     second list that can drift out of step."""
     import importlib.util
     from pathlib import Path

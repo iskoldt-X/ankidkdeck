@@ -395,6 +395,7 @@ def doctor(cfg) -> int:
     non-zero when the run is not fit to spend.
     """
     from .config import VERIFIED_MODELS
+    from .gates import read_refreeze_stamp
     from .stages.s42_translate import (CACHEABLE_KINDS, REQUIRED_STATS_KEYS,
                                        missing_stats_keys, prompt_shas,
                                        rate_card_for, thinking_per_request,
@@ -554,17 +555,40 @@ def doctor(cfg) -> int:
                     "spend anyway -- it means \"I know the output-cap math "
                     "ignores thinking\"" % (cfg.thinking_level, level, pinned))
 
-    # The two states where the configuration promises something the code cannot
-    # deliver yet. translate refuses them outright; doctor has to say so, or its
-    # verdict would contradict the stage's.
+    # The one state left where the configuration promises something the code
+    # cannot deliver. translate refuses it outright (s42.transport_guard); doctor
+    # has to say so, or its verdict would contradict the stage's. The two other
+    # entries that used to be here -- mode = batch and cache_enabled -- are gone
+    # because the transport and the cache lifecycle exist now.
+    if cfg.cache_enabled and cfg.mode != "batch":
+        problems.append("cache_enabled = true with mode = %s: the "
+                        "explicit-cache lifecycle is driven by the batch wave, "
+                        "so on this transport nothing would create the cache "
+                        "and the run would pay the full uncached rate while the "
+                        "bill quoted the cached one" % cfg.mode)
     if cfg.mode == "batch":
-        problems.append("mode = batch: the batch transport is not wired into "
-                        "stage 42 yet, so a confirmed run would place "
-                        "standard-rate calls and file them as batch")
-    if cfg.cache_enabled:
-        problems.append("cache_enabled = true: nothing creates or attaches an "
-                        "explicit cache yet, so a confirmed run would pay the "
-                        "full uncached rate")
+        print("  batch transport       jobs and results under %s; one job in "
+              "flight (across invocations too), results downloaded on "
+              "completion, a drain that dies is resumed and never resubmitted"
+              % (cfg.work_dir / "batch"))
+
+    # The two pre-spend gates. Reported rather than adjudicated: this command
+    # places no call, so it must not absorb a refusal that belongs to the run.
+    # But G-SCOPE-FROZEN refuses every --confirm-spend until the refreeze has
+    # happened, and finding that out by being refused is worse than being told.
+    stamp, where = read_refreeze_stamp(cfg)
+    if isinstance(stamp, dict):
+        print("  refreeze stamp        %s (%s families, %s card_keys rows, by "
+              "%s)" % (stamp.get("refrozen_at"), stamp.get("families"),
+                       stamp.get("card_keys_rows"), stamp.get("by")))
+    else:
+        print("  refreeze stamp        NOT PRESENT (%s). G-SCOPE-FROZEN will "
+              "refuse every --confirm-spend until the release refreeze is done "
+              "and signed: paying to translate a scope that is about to change "
+              "is paying twice." % where)
+    print("  spend cap             $%s/month, checked by G-BUDGET against "
+          "month-to-date PLUS this run's forecast SUMMED over the languages in "
+          "the run" % cfg.spend_cap_usd)
 
     print("--- prices ---")
     rates, rates_note = rate_card_for(cfg)
@@ -578,8 +602,11 @@ def doctor(cfg) -> int:
             print("  BLOCKED: %s" % p)
         print("  this configuration is NOT fit to spend on.")
         return 1
-    print("  fit to spend, as far as this command can see. It does not check "
-          "the refreeze stamp or the month-to-date ledger; the gates do that.")
+    print("  fit to spend, as far as this command can see. It REPORTS the "
+          "refreeze stamp and the cap above but adjudicates neither: this "
+          "command places no call, so G-SCOPE-FROZEN and G-BUDGET stay with the "
+          "run that would spend, and a missing stamp above means the next "
+          "--confirm-spend is refused.")
     return 0
 
 

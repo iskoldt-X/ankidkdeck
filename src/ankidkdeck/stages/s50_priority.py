@@ -71,6 +71,86 @@ MAX_PERMUTATION_ATTEMPTS = 5
 RANK_MODE = "standard"
 
 
+def ranking_bill(cfg, stats, entries: dict, families: dict, queue: list) -> dict:
+    """A forecast-shaped quote for the ranking wave, so G-BUDGET has a number.
+
+    Shaped as {lang: {"dollars": {scenario: usd}}} because that is what
+    billing.forecast reads and pre_spend_gates is the only consumer. Filed under
+    "-" for the same reason the CallContext is: the ranking is
+    language-independent (a permutation of entry ids), so pretending it belongs
+    to a language would double-count it across four.
+
+    Every term is measured or estimated with its own label, and a MISSING
+    constant yields None rather than a plausible number -- G-BUDGET then refuses,
+    which is the correct answer to "will this fit under the cap" when the answer
+    is unknown. The ranking is the one non-definition prompt family anybody has
+    probed (236 and 275 thought tokens at LOW, field present, finishReason STOP),
+    so its thinking term is a real measurement rather than a prior.
+    """
+    from .. import billing, prices                     # noqa: PLC0415
+    from .s42_translate import (expected_output_tokens, output_fit,
+                                unmeasured_thinking_prior)
+    requests = len(queue)
+    system = rank_prompt()
+    thinking, thinking_basis = unmeasured_thinking_prior(stats, "other")
+    out = {"requests": requests, "mode": RANK_MODE,
+           "thinking_per_request": thinking,
+           "thinking_basis": thinking_basis,
+           "basis": ("input is ESTIMATED from the rank prompt plus each family's "
+                     "payload at the measured chars/token; output is the measured "
+                     "EXPECTED_OUTPUT fit; the ranking is priced at the STANDARD "
+                     "rate because that is the surface it runs on")}
+    if not requests:
+        out["dollars"] = {"cache_works": 0.0, "lean_uncached": 0.0,
+                          "rich_uncached": 0.0}
+        return {"-": out}
+    system_tokens = billing.estimated_prompt_tokens(system, stats)
+    try:
+        fit = output_fit(stats=stats)
+    except FatalError as exc:
+        out["dollars"] = {"why": str(exc)}
+        return {"-": out}
+    if system_tokens is None:
+        out["dollars"] = {"why": ("missing measured constant(s): "
+                                  "CHARS_PER_TOKEN -- the rank prompt's size "
+                                  "cannot be estimated offline")}
+        return {"-": out}
+    uncached = output = think_total = 0
+    for row in queue:
+        fam = families.get(row.get("family_id")) or {}
+        ids = list(fam.get("entry_ids") or [])
+        payload = _rank_payload(entries, ids) if ids else []
+        text = json.dumps(payload, ensure_ascii=False)
+        uncached += int(system_tokens) \
+            + int(billing.estimated_prompt_tokens(text, stats) or 0)
+        output += expected_output_tokens(max(1, len(ids)), fit)
+        think_total += int(thinking)
+    try:
+        rates = prices.rate_card(cfg.expressions_model, RANK_MODE)
+    except Exception as exc:                           # noqa: BLE001
+        out["dollars"] = {"why": str(exc)[:200]}
+        return {"-": out}
+    try:
+        value = billing.usd_for_tokens(uncached_input=uncached, cached_input=0,
+                                       output=output + think_total, rates=rates)
+    except FatalError as exc:
+        out["dollars"] = {"why": str(exc)[:300]}
+        return {"-": out}
+    out.update({"uncached_input_tokens": uncached, "output_tokens": output,
+                "thinking_tokens": think_total,
+                # The same figure under all three scenario names: the ranking
+                # prompt is 1,503 characters, far under the measured 1,024-TOKEN
+                # explicit-cache floor, so there is no cached scenario for it and
+                # no enriched one either.
+                "dollars": {"cache_works": value, "lean_uncached": value,
+                            "rich_uncached": value,
+                            "note": ("the ranking prompt cannot be cached "
+                                     "(under the measured explicit-cache floor) "
+                                     "and is never enriched, so the three "
+                                     "scenarios are one number")}})
+    return {"-": out}
+
+
 def dedupe_keep_first(seq) -> list:
     seen, out = set(), []
     for x in seq:
@@ -366,23 +446,31 @@ def run(cfg: Config, registry=None, confirm: bool = False) -> dict:
 
     # ---------------- past this line, money is spent ----------------
     from .s42_translate import (CallContext, UsageLog, _pool_from_env,
-                                _provenance, output_fit, probe_stats,
-                                spend_gate, transport_guard)
+                                _pre_spend, _provenance, output_fit,
+                                probe_stats, spend_gate, transport_guard)
 
     cfg.validate()
-    # The same gate stage 42 has. This stage never runs in batch mode
-    # (RANK_MODE), but `doctor` says "NOT fit to spend" on mode=batch or
-    # cache_enabled while this stage used to spend anyway -- two commands
-    # disagreeing about whether a configuration may place calls is worse than
-    # either answer.
+    # The same gate stage 42 has, so `doctor` and this stage cannot disagree
+    # about whether a configuration may place calls. Its batch branch is gone
+    # now that the transport exists (mode=batch is a legitimate configuration
+    # and this stage simply stays on the standard surface, filing its ledger
+    # rows as RANK_MODE); what is left refuses cache_enabled on a transport
+    # where nothing creates a cache.
     transport_guard(cfg)
     stats = probe_stats(cfg)
     cfg.validate(spending=True, stats=stats)
-    # CROSS-OWNER EDIT (crew B owns billing.py): the N-09 consumption rules had
+    # CROSS-OWNER EDIT (this module does not own billing.py): the N-09 consumption rules had
     # no production caller. Same call as stage 42's paid path, for the same
     # reason -- doctor and the spend gate must not disagree about whether a
     # configuration may place calls.
     report["consumption_rules"] = spend_gate(cfg, stats, list(cfg.langs))
+    # CROSS-OWNER EDIT (this module does not own gates.py): `pre_spend_gates` had no
+    # production call site anywhere, so G-SCOPE-FROZEN and G-BUDGET could not
+    # refuse anything on any path. This stage places up to 621 paid requests and
+    # draws on the same monthly cap as a translate wave, so it is quoted (see
+    # ranking_bill) and adjudicated here, next to the N-09 rules.
+    report["bill"] = ranking_bill(cfg, stats, entries, families, queue)
+    report["pre_spend_gates"] = _pre_spend(cfg, report["bill"], families)
     # The ranking is a short permutation, not prose: it shares the expressions
     # model rather than the definition model (config.expressions_model), and it
     # always runs on the standard surface (see the module docstring).

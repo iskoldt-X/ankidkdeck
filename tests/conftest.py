@@ -90,6 +90,67 @@ def registry(cfg):
 
 
 # --------------------------------------------------------------------------
+# the refreeze signature, faked for every test
+# --------------------------------------------------------------------------
+#
+# G-SCOPE-FROZEN is wired into every confirmed path (stage 42 run and review,
+# stage 50), and it REFUSES on a real checkout today: the packaged
+# registry/card_keys.json is `{}` and the refreeze -- 22 guid_seed reselections
+# plus three alias merges -- has not happened. That refusal is the correct
+# behaviour for this program, so it is pinned by its own tests
+# (test_a_confirmed_run_refuses_until_the_scope_is_refrozen and the unit tests in
+# test_money.py) rather than by making every other test carry it.
+#
+# This fixture stands in for the state AFTER the freeze. It is autouse because
+# the alternative is the same four lines in forty-odd tests, and it synthesises
+# the stamp AT CALL TIME from words.json, because the count the stamp signs for
+# is len(words.json) and each test writes its own workspace after the fixtures
+# have run.
+CARD_KEYS_ROWS = 2922
+
+# Captured at import, BEFORE any fixture has patched them, so `not_refrozen` can
+# put the real functions back however the fixtures happen to be ordered.
+from ankidkdeck import gates as _gates                          # noqa: E402
+_REAL_REFREEZE_STAMP = _gates.read_refreeze_stamp
+_REAL_PACKAGED_REGISTRY = _gates._packaged_registry
+
+
+def _refrozen_stamp(cfg):
+    from ankidkdeck.util import read_json
+    families = read_json(Path(cfg.json_dir) / "words.json", default={}) or {}
+    return ({"refrozen_at": "2026-08-27", "families": len(families),
+             "card_keys_rows": CARD_KEYS_ROWS,
+             "by": "tests/conftest.py refrozen fixture"},
+            "tests/conftest.py refrozen fixture")
+
+
+def _refrozen_packaged(name):
+    if name == "card_keys.json":
+        return {"card-%05d" % i: i for i in range(CARD_KEYS_ROWS)}
+    return _REAL_PACKAGED_REGISTRY(name)
+
+
+@pytest.fixture(autouse=True)
+def refrozen(monkeypatch):
+    """Pretend the release refreeze has happened. See the note above."""
+    monkeypatch.setattr(_gates, "read_refreeze_stamp", _refrozen_stamp)
+    monkeypatch.setattr(_gates, "_packaged_registry", _refrozen_packaged)
+    return _refrozen_stamp
+
+
+@pytest.fixture
+def not_refrozen(monkeypatch):
+    """The REAL state of the package: no stamp, `{}` card_keys.
+
+    Overrides `refrozen` for the tests that check the refusal, and it puts the
+    genuine functions back rather than a second imitation of them -- so the
+    refusal those tests see is the one a real checkout produces today.
+    """
+    monkeypatch.setattr(_gates, "read_refreeze_stamp", _REAL_REFREEZE_STAMP)
+    monkeypatch.setattr(_gates, "_packaged_registry", _REAL_PACKAGED_REGISTRY)
+
+
+# --------------------------------------------------------------------------
 # the measured LLM constants, and a fake SDK
 # --------------------------------------------------------------------------
 #
@@ -112,6 +173,15 @@ MEASURED_CONSTANTS = {
     "PROMPT_TOKENS_fit": {"a": 23.917, "b": 1164.2, "r2": 0.9325, "points": 75},
     "PROMPT_TOKENS_system_only": {"Chinese": 1135, "English": 1092,
                                   "German": 1135, "Spanish": 1135},
+    # Measured chars/token, per language. Present in the real artifact and it was
+    # missing here, which was invisible until the paid paths started sizing
+    # prompts offline: billing.estimated_prompt_tokens returns None without it,
+    # so anything that has to quote a prompt (the explicit-cache floor check, the
+    # ranking wave's forecast, N-09 rule 6's size band) answered "unknown" in the
+    # test suite and "a number" in production. Verbatim from
+    # work/probes/stats.json, measured 2026-08-26.
+    "CHARS_PER_TOKEN": {"Chinese": 4.314, "English": 4.322, "German": 4.295,
+                        "Spanish": 4.314},
     "thinking": {
         "THINKING_SOURCE": "derived",
         "THINKING_PER_REQUEST_LOW": {"mean": 0, "p95": 0.0, "max": 0,
@@ -165,7 +235,15 @@ class FakeUsage:
     reading the field.
     """
 
-    def __init__(self, prompt=1135, cached=0, candidates=120, thoughts=0,
+    # The defaults are the MEASURED model's own answer for a one-cell definition
+    # request: prompt = the measured system-prompt size, candidates =
+    # ceil(EXPECTED_OUTPUT.a * 1 + b) = ceil(35.964 + 23.07) = 60. They used to
+    # be 1135/120, and the 120 was twice what the fit predicts -- invisible until
+    # the four money gates were wired onto the interactive path, at which point
+    # G-BILL correctly reported that a "healthy" one-request wave cost 18% more
+    # than its own quote. A fake whose token counts contradict the measured token
+    # model cannot be used to test a gate that compares the two.
+    def __init__(self, prompt=1135, cached=0, candidates=60, thoughts=0,
                  tool_use=0):
         self.prompt_token_count = prompt
         self.cached_content_token_count = cached

@@ -288,21 +288,28 @@ def test_the_ranking_call_sends_thinking_and_no_temperature(cfg, registry,
 
 
 def test_ranking_refuses_a_transport_that_does_not_exist(cfg, registry, ranker):
-    """F6. `doctor` said "NOT fit to spend" on mode=batch or cache_enabled while
-    this stage spent anyway. The ranking is always RANK_MODE=standard so nothing
-    was mislabelled, but two commands disagreeing about whether a configuration
-    may place calls is worse than either answer."""
+    """F6. `doctor` and this stage must not disagree about whether a
+    configuration may place calls.
+
+    UPDATED for the batch transport: mode = batch is now a legitimate configuration,
+    and this stage's answer to it is to stay on the standard surface and SAY SO
+    on every ledger row (RANK_MODE) -- 621 requests at most, language
+    independent, one short permutation each. What the guard still refuses is
+    cache_enabled on a transport where nothing creates a cache.
+    """
     _workspace(cfg)
     cfg.mode = "batch"
-    with pytest.raises(FatalError) as exc:
-        S50.run(cfg, registry, confirm=True)
-    assert "batch transport" in str(exc.value)
-    assert ranker.calls == []
+    done = S50.run(cfg, registry, confirm=True)
+    assert done["mode"] == "standard"
+    assert len(ranker.calls) == 2
+    rows = [json.loads(x) for x in
+            (cfg.report_dir / "priority_usage.jsonl")
+            .read_text(encoding="utf-8").splitlines() if x.strip()]
+    assert rows and {r["mode"] for r in rows} == {"standard"}
     cfg.mode, cfg.cache_enabled = "standard", True
     with pytest.raises(FatalError) as exc:
         S50.run(cfg, registry, confirm=True)
     assert "cache_enabled" in str(exc.value)
-    assert ranker.calls == []
 
 
 def test_an_interrupted_ranking_leaves_its_usage_on_disk(cfg, registry, ranker):
@@ -330,3 +337,48 @@ def test_the_dry_path_imports_no_llm_module(cfg, registry):
     _workspace(cfg)
     S50.run(cfg, registry, confirm=False)
     assert [m for m in sys.modules if m.startswith("google")] == []
+
+
+# ==========================================================================
+# FIXER round -- the ranking wave is a paid path and now says so
+# ==========================================================================
+
+def test_the_ranking_asks_the_pre_spend_gates(cfg, registry, ranker,
+                                              not_refrozen):
+    """This stage places up to 621 paid requests and draws on the same monthly
+    cap as a translate wave. `pre_spend_gates` had no production call site
+    anywhere, so neither G-SCOPE-FROZEN nor G-BUDGET could refuse it."""
+    _workspace(cfg)
+    S50.run(cfg, registry, confirm=False)
+    with pytest.raises(FatalError) as exc:
+        S50.run(cfg, registry, confirm=True)
+    assert "G-SCOPE-FROZEN" in str(exc.value)
+
+
+def test_the_ranking_quotes_itself_so_the_budget_gate_has_a_number(
+        cfg, registry, ranker):
+    """G-BUDGET refuses a run it cannot price. The ranking prompt is 1,503
+    characters -- far under the measured 1,024-TOKEN explicit-cache floor -- so
+    the three scenario figures are one number and the quote says so."""
+    _workspace(cfg)
+    S50.run(cfg, registry, confirm=False)
+    report = S50.run(cfg, registry, confirm=True)
+    quote = report["bill"]["-"]
+    assert quote["requests"] >= 1
+    assert quote["mode"] == "standard"
+    assert quote["dollars"]["lean_uncached"] > 0
+    assert quote["dollars"]["cache_works"] == quote["dollars"]["lean_uncached"]
+    assert "cannot be cached" in quote["dollars"]["note"]
+    ids = {row["id"] for row in report["pre_spend_gates"]}
+    assert {"G-SCOPE-FROZEN", "G-BUDGET"} == ids
+    assert all(row["ok"] for row in report["pre_spend_gates"])
+
+
+def test_the_ranking_is_refused_when_it_does_not_fit_under_the_cap(
+        cfg, registry, ranker):
+    _workspace(cfg)
+    S50.run(cfg, registry, confirm=False)
+    cfg.spend_cap_usd = 0.0000001
+    with pytest.raises(FatalError) as exc:
+        S50.run(cfg, registry, confirm=True)
+    assert "G-BUDGET" in str(exc.value)

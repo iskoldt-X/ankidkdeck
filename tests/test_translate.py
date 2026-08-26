@@ -864,7 +864,7 @@ def test_the_dry_path_imports_no_llm_module(cfg, registry):
     assert [m for m in sys.modules if m.startswith("google")] == []
 
 
-# ------------------------------------- crew C fix round: F2 and F7 (cross-crew)
+# ------------------------------- prompt/ledger fix round: F2 and F7 (cross-owner)
 
 def test_a_failing_script_gate_still_leaves_the_paid_run_on_disk(cfg, registry,
                                                                 translator):
@@ -874,7 +874,7 @@ def test_a_failing_script_gate_still_leaves_the_paid_run_on_disk(cfg, registry,
     and left the PREVIOUS run's file on disk, describing a different run.
 
     Order now: evaluate, record the verdict in the report, write the report,
-    then raise. The drift ledger's success-only consumption (crew A's 1.11) is
+    then raise. The drift ledger's success-only consumption (guide 1.11) is
     unchanged: it is still written before this, only on a run that got that far.
     """
     _workspace(cfg)
@@ -943,7 +943,7 @@ def test_a_failing_script_gate_on_the_dry_path_still_writes_the_bill(cfg,
 
 def test_the_consumption_rules_actually_refuse_a_confirmed_run(cfg, registry,
                                                               translator):
-    """F7 (cross-owner: crew B owns billing.py). billing.assert_ready_to_spend
+    """F7 (cross-owner: this file does not own billing.py). billing.assert_ready_to_spend
     and billing.consumption_rules had NO production caller -- the only importer
     was tests/test_money.py, s42 did not import billing at all, and the paid
     path's pre-flight was transport_guard + probe_stats + cfg.validate, none of
@@ -1015,3 +1015,152 @@ def test_the_bill_and_the_provenance_carry_the_pack_version(cfg, registry,
     assert report["waves"][0]["effective_prompt_id"] == {"German": "v4-frozen"}
     prov = report["languages"]["German"]["provenance"]
     assert prov.startswith("gemini:gemini-3.7-flash+v4-frozen+LOW@")
+
+
+# ==========================================================================
+# FIXER round -- the money gates now have production call sites
+# ==========================================================================
+#
+# Both acceptance reviewers found the same two wiring holes, and neither was a
+# defect in a gate: `grep -rn pre_spend_gates src/` matched only the definition
+# and its own docstring, so G-SCOPE-FROZEN and G-BUDGET could not refuse
+# anything anywhere; and post_wave_gates had exactly one caller, inside the batch
+# transport, so a confirmed standard or flex wave placed real calls and
+# adjudicated none of them.
+
+
+def test_a_confirmed_run_refuses_until_the_scope_is_refrozen(
+        cfg, registry, translator, not_refrozen):
+    """G-SCOPE-FROZEN, on the real state of the package.
+
+    This refusal is CORRECT for this program right now: the packaged
+    registry/card_keys.json is `{}` and the refreeze -- 22 guid_seed reselections
+    plus three alias merges -- has not happened, so every paid cell would be paid
+    for again afterwards. What was wrong was that nothing asked. The dry path is
+    deliberately unaffected: a human still has to be able to read the bill.
+    """
+    _workspace(cfg)
+    dry = S42.run(cfg, registry, lang="German", confirm=False)
+    assert dry["bill"]["German"]["cells_total"] > 0
+
+    with pytest.raises(FatalError) as exc:
+        S42.run(cfg, registry, lang="German", confirm=True)
+    assert "G-SCOPE-FROZEN" in str(exc.value)
+    assert "no refreeze stamp" in str(exc.value)
+    # and it refused BEFORE a single call was placed
+    assert translator.calls == []
+
+
+def test_the_review_pass_asks_the_pre_spend_gates_too(cfg, registry,
+                                                      translator,
+                                                      not_refrozen):
+    """`review --fix` is a smaller paid path, not a free one: it draws on the same
+    monthly cap and it redoes cells inside the same scope."""
+    entry = _workspace(cfg)
+    write_json(cfg.review_dir / "review_flags_German.json",
+               [{"key": "11021722:21000001", "reasons": ["wrong gloss"]}])
+    del entry
+    with pytest.raises(FatalError) as exc:
+        S42.review(cfg, registry, lang="German",
+                   keys=["11021722:21000001"], confirm=True)
+    assert "G-SCOPE-FROZEN" in str(exc.value)
+    assert translator.calls == []
+
+
+def test_the_review_pass_quotes_itself_so_the_budget_gate_has_a_number(
+        cfg, registry, translator):
+    """G-BUDGET refuses an unpriced run on purpose ("an unpriced run is not a
+    cheap run"), so the review path has to carry a bill of its own."""
+    _workspace(cfg)
+    write_json(cfg.review_dir / "review_flags_German.json",
+               [{"key": "11021722:21000001", "reasons": ["wrong gloss"]}])
+    report = S42.review(cfg, registry, lang="German",
+                        keys=["11021722:21000001"], confirm=True)
+    quote = report["bill"]["German"]["dollars"]
+    assert quote["lean_uncached"] is not None and quote["lean_uncached"] > 0
+    assert report["redone"]["definitions"] == 1
+    ids = {row["id"] for row in report["pre_spend_gates"]}
+    assert {"G-SCOPE-FROZEN", "G-BUDGET"} == ids
+    assert all(row["ok"] for row in report["pre_spend_gates"])
+
+
+def test_g_budget_sums_the_languages_before_the_first_call(cfg, registry,
+                                                           translator):
+    """The bill's own ceiling check is PER LANGUAGE ($4.09 against $10 on the real
+    corpus); four times $4.09 is $16.37, which is 164% of the cap. The only thing
+    in the package that sums across languages is billing.forecast, whose only
+    consumer is G-BUDGET -- so until it was wired, the cap was a number in a toml
+    file."""
+    _workspace(cfg)
+    cfg.spend_cap_usd = 0.0001
+    with pytest.raises(FatalError) as exc:
+        S42.run(cfg, registry, lang="German", confirm=True)
+    assert "G-BUDGET" in str(exc.value)
+    assert "the only thing that does" in str(exc.value) \
+        or "cap" in str(exc.value)
+    assert translator.calls == []
+    # ...and with room, the same run goes through and records the verdict
+    cfg.spend_cap_usd = 10.0
+    report = S42.run(cfg, registry, lang="German", confirm=True)
+    budget = [r for r in report["pre_spend_gates"] if r["id"] == "G-BUDGET"][0]
+    assert budget["ok"] is True
+    assert budget["detail"]["forecast_usd"] > 0
+    assert budget["detail"]["cap_usd"] == 10.0
+
+
+def test_the_money_gates_run_on_the_interactive_surface_too(cfg, registry,
+                                                            translator):
+    """G-BILL / G-THINK / G-PROMPT / G-CACHE had one call site and it was inside
+    the batch transport. `--mode standard --confirm-spend` adjudicated nothing at
+    all, which made spec 4.2(6) false on the interactive path."""
+    _workspace(cfg)
+    report = S42.run(cfg, registry, lang="German", confirm=True)
+    ids = {row["id"] for row in report["wave_gates"]["rows"]}
+    assert {"G-BILL", "G-THINK", "G-PROMPT", "G-CACHE"} == ids
+    assert report["wave_gates"]["ok"] is True
+    assert report["wave_gates"]["usage_rows_by_language"]["German"][1] > 0
+    # G-CACHE reports n/a rather than passing quietly: nothing on this surface
+    # creates a cache, so there is no denominator and no discount was claimed
+    cache = [r for r in report["wave_gates"]["rows"] if r["id"] == "G-CACHE"][0]
+    assert cache["ok"] is True
+    recorded = read_json(cfg.report_dir / "gates_report.json")["results"]
+    assert {"G-BILL", "G-CACHE"} <= {r["id"] for r in recorded}
+
+
+def test_an_interactive_wave_that_costs_more_than_its_quote_is_refused(
+        cfg, registry, fake_genai, no_sleep, probe_stats):
+    """The gate has to be able to fail, and the report has to reach disk first.
+
+    The order is the one the review round asked for: a failing money gate that raised ahead
+    of write_json left translate_report.json describing the PREVIOUS run.
+    """
+    _workspace(cfg)
+
+    @fake_genai.respond
+    def _expensive(call):
+        from conftest import FakeResponse, FakeUsage
+        props = call["config"].kwargs["response_schema"]["properties"]
+        if "definitions" in props:
+            n = props["definitions"]["minItems"]
+            body = {"headword": "hus",
+                    "definitions": [{"lemma": "L%d" % i, "gloss": "G%d" % i}
+                                    for i in range(n)]}
+        elif "fixed_expressions" in props:
+            n = props["fixed_expressions"]["minItems"]
+            body = {"fixed_expressions": [{"lemma": "X%d" % i,
+                                           "gloss": "Y%d" % i}
+                                          for i in range(n)]}
+        else:
+            body = {k: "POS-%s" % k for k in props}
+        import json as _json
+        return FakeResponse(_json.dumps(body),
+                            usage=FakeUsage(prompt=1135, candidates=4000))
+
+    with pytest.raises(FatalError) as exc:
+        S42.run(cfg, registry, lang="German", confirm=True)
+    assert "G-BILL" in str(exc.value)
+    report = read_json(cfg.report_dir / "translate_report.json")
+    assert report["confirmed"] is True
+    assert report["wave_gates"]["ok"] is False
+    assert report["usage"]["candidates_tokens"] > 0, \
+        "the paid wave's own numbers reached disk before the failure continued"

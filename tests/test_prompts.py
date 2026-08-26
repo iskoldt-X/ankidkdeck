@@ -37,7 +37,7 @@ FROZEN_DEF_CHARS = {"Chinese": 5160, "English": 4985, "German": 5134,
 FROZEN_EXPR_CHARS = {"Chinese": 1382, "English": 953, "German": 1376,
                      "Spanish": 1382}
 # THE BYTES, not their count. sha256 of the UTF-8 of the frozen prompts, taken
-# from the pre-crew-C function bodies at 027cc10 and independently reproduced by
+# from the earlier function bodies at 027cc10 and independently reproduced by
 # both reviewers. A character COUNT was what this table used to be, and a count
 # cannot see an equal-length edit: changing "senior lexicographer" to "SENIOR
 # lexicographer" inside the byte-frozen core left the whole suite green.
@@ -556,7 +556,7 @@ def test_the_danish_reading_block_is_written_by_measured_frequency():
 
 
 def test_the_grammar_payload_is_explained_in_the_prompt_not_the_core():
-    """Q-C landed in the user payload (crew A). 38.8% of senses carry a
+    """Q-C landed in the user payload. 38.8% of senses carry a
     `grammar` note that had never reached the model at all, so the rich prompt
     says how to read one -- and the frozen core still says nothing, because a
     core edit is a style change to 22,734 cells."""
@@ -573,7 +573,7 @@ def test_the_grammar_payload_is_explained_in_the_prompt_not_the_core():
 # --------------------------------------------------------------------------
 
 def test_swapping_the_prompt_moves_the_bill_the_cache_key_and_doctor_together():
-    """Crew A's F5 contract: _SYSTEM_PROMPTS is the single source.
+    """The F5 contract: _SYSTEM_PROMPTS is the single source.
 
     Before it, the bill computed prompt_sha256(definition_prompt(lang)) at its
     own call site while the request built its system instruction at another, so

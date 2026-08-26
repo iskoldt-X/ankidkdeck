@@ -1734,12 +1734,41 @@ def cache_hit_is_complete(rows, declared_cache_tokens=None,
     the gate is for.
     """
     kinds = tuple(cached_kinds or ())
-    scope = [r for r in rows if (r.get("kind") or "") in kinds]
-    scope_basis = "kind in %s" % (list(kinds),)
-    if kinds and not scope and rows and not any(r.get("kind") for r in rows):
+    # CROSS-OWNER EDIT (made for the batch transport; this file is the money gates): a row that
+    # produced NO PROMPT TOKENS never executed, so it neither hit nor missed the
+    # cache. On the batch surface that is a per-row gRPC error -- measured at
+    # prompt=0 and billed $0 (probe W3-4: a cache deleted after submit made all
+    # 21 rows fail that way) -- and the wave then retries it. Counting the failed
+    # attempt in the denominator failed a healthy wave: one error plus one
+    # successful retry scored 1135/(1135 x 2) = 0.5 against a 0.95 threshold.
+    # The failure this gate exists for is untouched: a row that silently fell
+    # back to an inlined system prompt has prompt tokens and no cache, so it is
+    # still counted, and a wave whose cache is dead for EVERY row leaves the
+    # scope empty, which with cache_expected is still a refusal.
+    #
+    # `prompt_tokens > 0` is the WHOLE test. An earlier version also excluded any
+    # row carrying an `error` field, which is wider than the reason above needs
+    # and unsafe in the one direction that matters: a row that was BILLED (real
+    # prompt tokens), used no cache, and also reported an error -- a truncation,
+    # an unparseable body -- did hit or miss the cache, and dropping it from the
+    # denominator hides exactly the full-price row this gate is looking for.
+    executed = [r for r in rows if int(r.get("prompt_tokens") or 0) > 0]
+    not_executed = len(rows) - len(executed)
+    # Every row of a cacheable kind, executed or not. This is what decides
+    # whether the wave DECLARED anything to cache, which is a different question
+    # from whether the cache worked: an incremental wave with only expression
+    # cells left, or the run after an unrecovered definition request, has nothing
+    # to cache and must not be failed for it.
+    declared_rows = [r for r in rows if (r.get("kind") or "") in kinds]
+    kindless = bool(rows) and not any(r.get("kind") for r in rows)
+    scope = [r for r in executed if (r.get("kind") or "") in kinds]
+    scope_basis = ("kind in %s, among the %d row(s) that produced prompt tokens"
+                   % (list(kinds), len(executed)))
+    if kinds and not scope and executed \
+            and not any(r.get("kind") for r in executed):
         # Rows with no kind at all (a synthetic or legacy wave): hold the whole
         # wave to the criterion rather than silently checking nothing.
-        scope, scope_basis = list(rows), "every row (no kind on any row)"
+        scope, scope_basis = list(executed), "every row (no kind on any row)"
     with_cache = [r for r in scope if r.get("cache_name")]
     cached = [int(r.get("cached_tokens") or 0) for r in with_cache]
     prompts = [int(r.get("prompt_tokens") or 0) for r in with_cache]
@@ -1748,6 +1777,11 @@ def cache_hit_is_complete(rows, declared_cache_tokens=None,
               # The disclosure fields: what the denominator was and how much of
               # it was actually looked at. A share without these cannot be read.
               "cached_kinds": list(kinds),
+              "rows_that_never_executed": not_executed,
+              "rows_that_never_executed_note": ("a per-row error is prompt=0 and "
+                                                "$0 billed, so it neither hit "
+                                                "nor missed the cache"),
+              "rows_of_a_cacheable_kind": len(declared_rows),
               "rows_checked": len(scope),
               "rows_checked_basis": scope_basis,
               "requests_with_a_cache": len(with_cache),
@@ -1763,12 +1797,26 @@ def cache_hit_is_complete(rows, declared_cache_tokens=None,
     if not with_cache or not declared_cache_tokens:
         detail["checked"] = False
         detail["verdict"] = "n/a"
-        if cache_expected:
-            detail["why"] = ("cache_enabled is set but no row carries a cache "
-                             "name or the wave declared no cached tokens, so "
-                             "this wave paid the full uncached rate while the "
-                             "configuration said otherwise")
+        if cache_expected and (declared_rows or kindless or not kinds):
+            detail["why"] = ("cache_enabled is set and this wave placed %d "
+                             "request(s) of a cacheable kind, but no row carries "
+                             "a cache name or the wave declared no cached "
+                             "tokens, so it paid the full uncached rate while "
+                             "the configuration said otherwise"
+                             % len(declared_rows or rows))
             return False, detail
+        if cache_expected:
+            # cache_enabled with NOTHING CACHEABLE IN THE WAVE. Not a failure:
+            # the expression prompt is under the measured 1,024-token floor by
+            # design, so an incremental wave with only expression cells left has
+            # nothing to cache. Failing it made the documented recovery path
+            # ("the cells stay missing and the next run picks them up")
+            # unreachable -- the next run was the one with no definition rows.
+            detail["verdict"] = "n/a: no request of a cacheable kind in this wave"
+            detail["why"] = ("cache_enabled is set, but not one request of this "
+                             "wave was of a cacheable kind (%s), so there was "
+                             "nothing to cache and nothing to check"
+                             % list(kinds))
         return True, detail
     declared = int(declared_cache_tokens)
     exact = [c == declared for c in cached]

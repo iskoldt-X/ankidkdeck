@@ -433,8 +433,49 @@ def _group_by_entry(todo: list, kind: str, max_batch: int) -> list:
 # longer applies.
 REQUEST_CEILING_FACTOR = MAX_COUNT_LOCK_ATTEMPTS * MAX_RETRIES
 
+# The same ceiling for the BATCH transport: the first submit plus the retry
+# waves. Spelled out here rather than imported from ankidkdeck.batch.waves,
+# because bill_row runs on the DRY path and the dry path asserts that neither
+# `google*` nor `ankidkdeck.batch*` has been imported -- an import here would
+# break that assertion for the sake of one integer. The coupling is pinned by
+# test_the_batch_request_ceiling_matches_the_transports_own_bound instead.
+BATCH_REQUEST_CEILING_FACTOR = 4
 
-def bill_row(todo: list, pos_todo: list) -> dict:
+
+def request_ceiling(mode: str = "standard") -> tuple:
+    """(factor, why) for the "at most this many requests" figure on the bill.
+
+    The two transports have genuinely different ceilings and the bill used to
+    quote the interactive one for both:
+
+      interactive  the count-lock ladder inside _translate_*_batch multiplied by
+                   the transport retry ladder inside _generate: 5 x 5 = 25.
+      batch        the batch path NEVER goes through _generate, so there is no
+                   transport ladder. The bound is the first submit plus
+                   MAX_RETRY_WAVES, and it is enforced twice -- once by the wave
+                   loop and once by the per-cell attempt counter that survives
+                   the process. That is 1 + 3 = 4, a little over 6x smaller than
+                   25.
+
+    Quoting 25 on a batch run is conservative for the money and wrong for the
+    human: `requests_max` is a number somebody reads before pressing
+    --confirm-spend, and 139,125 where the true bound is 22,260 is not a
+    reassurance, it is noise.
+    """
+    if mode == "batch":
+        return BATCH_REQUEST_CEILING_FACTOR, (
+            "1 first submit + %d retry wave(s); the batch path does not go "
+            "through _generate, so the interactive transport ladder does not "
+            "apply. Bounded twice: by the wave loop and by the per-cell attempt "
+            "counter in the job registry, which survives the process"
+            % (BATCH_REQUEST_CEILING_FACTOR - 1))
+    return REQUEST_CEILING_FACTOR, (
+        "count-lock ladder %d x transport ladder %d; INCLUDES transport "
+        "retries, i.e. attempts that returned an error and produced no output"
+        % (MAX_COUNT_LOCK_ATTEMPTS, MAX_RETRIES))
+
+
+def bill_row(todo: list, pos_todo: list, mode: str = "standard") -> dict:
     defs = [r for r in todo if r["kind"] == "definition"]
     exprs = [r for r in todo if r["kind"] == "expression"]
     chars = sum(len(r["text"]) + len(r.get("grammar") or "") + len(r["hint"])
@@ -443,6 +484,7 @@ def bill_row(todo: list, pos_todo: list) -> dict:
     expr_batches = len(_group_by_entry(todo, "expression", MAX_EXPR_PER_BATCH))
     pos_calls = 1 if pos_todo else 0
     requests_min = def_calls + expr_batches + pos_calls
+    ceiling, ceiling_why = request_ceiling(mode)
     return {
         "definitions": len(defs),
         "definitions_new": sum(1 for r in defs if r["reason"] == "missing"),
@@ -465,12 +507,12 @@ def bill_row(todo: list, pos_todo: list) -> dict:
         "expression_requests": expr_batches,
         "pos_requests": pos_calls,
         "requests_min": requests_min,
-        "requests_max": requests_min * REQUEST_CEILING_FACTOR,
-        "requests_max_basis": ("%d x (count-lock ladder %d x transport ladder %d); "
-                              "INCLUDES transport retries, i.e. attempts that "
-                              "returned an error and produced no output"
-                              % (requests_min, MAX_COUNT_LOCK_ATTEMPTS,
-                                 MAX_RETRIES)),
+        # PER TRANSPORT. The batch path does not go through _generate, so
+        # quoting the interactive 25x ladder there over-stated the ceiling by
+        # about 6x on the one line a human reads before --confirm-spend.
+        "requests_max": requests_min * ceiling,
+        "requests_max_transport": mode,
+        "requests_max_basis": "%d x (%s)" % (requests_min, ceiling_why),
         "source_chars": chars,
         "source_tokens_estimate": math.ceil(chars / CHARS_PER_TOKEN_ESTIMATE),
         # The Danish payload is a FRACTION of the input: the system prompt, the
@@ -543,26 +585,80 @@ UNMEASURED_THINKING_BASIS = "unmeasured_conservative_prior"
 MEASURED_THINKING_BASIS = "measured_p95"
 
 
-def unmeasured_thinking_prior(stats: dict | None) -> tuple:
-    """(tokens per request, where it came from) for an unmeasured request kind.
+# The prompt-family key THINKING_AT_LOW_BY_PROMPT_FAMILY is written under, and
+# the one the expression canary writes into. The character count is part of the
+# STRING but must never be part of the LOOKUP: the artifact on disk carries
+# `LOW|definition(5123)` while the four live definition prompts are 5,160 /
+# 4,985 / 5,134 / 5,160 characters, so an exact-key lookup misses all four and
+# would throw away a measured zero from 62 observations. The key is matched on
+# (level, family) and the count is disclosure.
+THINKING_FAMILY_RE = re.compile(r"^([A-Z]+)\|([a-z_]+)\((\d+)\)$")
+
+
+def thinking_family_key(kind: str, lang: str, level: str = "LOW") -> str:
+    """The family key a measurement for (level, kind, lang) is filed under.
+
+    Lives here rather than in the transport because the BILL reads it and the
+    bill path may not import ankidkdeck.batch: the dry path asserts that neither
+    `google*` nor `ankidkdeck.batch*` is in sys.modules, and an import from the
+    transport into bill_tokens would break that assertion the moment it landed.
+    The transport reuses this function.
+    """
+    return "%s|%s(%d)" % (level, kind, len(system_prompt(kind, lang)))
+
+
+def _thinking_families(stats: dict | None, level: str = "LOW") -> dict:
+    """{family: max thought tokens} at `level`, keyed by FAMILY not by key."""
+    node = ((stats or {}).get("thinking") or {}) \
+        .get("THINKING_AT_LOW_BY_PROMPT_FAMILY") or {}
+    out: dict = {}
+    for key, value in node.items():
+        match = THINKING_FAMILY_RE.match(str(key))
+        if not match or match.group(1) != level:
+            continue
+        top = (value or {}).get("max") if isinstance(value, dict) else None
+        if not isinstance(top, (int, float)):
+            continue
+        family = match.group(2)
+        # The highest measurement wins within a family: two entries for the same
+        # family are two prompt sizes, and the conservative direction is up.
+        out[family] = max(float(top), out.get(family, float(top)))
+    return out
+
+
+def unmeasured_thinking_prior(stats: dict | None, kind: str | None = None,
+                              level: str = "LOW") -> tuple:
+    """(tokens per request, where it came from) for one request KIND.
 
     Prefers the artifact: THINKING_AT_LOW_BY_PROMPT_FAMILY carries the per-prompt
     split the probe ledger actually supports, so a re-measurement reaches the
-    bill by landing on disk. The module constant is the floor under that, with
-    the same provenance, for an artifact written before the split existed.
+    bill by landing on disk. That is the whole point of the expression canary --
+    it measures the one family nobody probed and writes it where the bill reads
+    it.
+
+    KIND-AWARE, and it has to be. The lookup used to be "the highest max across
+    every non-definition family", so `LOW|other(1503) = 275` (the ranking prompt)
+    dominated for ever: the canary could write `LOW|expression(1376) = 0` and the
+    bill would not move by a cent, because max(275, 0) is still 275. Reading the
+    family that corresponds to the kind is what makes a measurement worth
+    paying for.
+
+    A MISS FALLS BACK, never to zero: an unmeasured family has to be booked at
+    the highest LOW anyone has measured, because a run with a re-worded prompt
+    (a new family) that silently booked zero thinking would under-state the one
+    column that decides go/no-go. `kind=None` asks for that conservative figure
+    directly.
     """
-    families = ((stats or {}).get("thinking") or {}) \
-        .get("THINKING_AT_LOW_BY_PROMPT_FAMILY") or {}
-    seen = []
-    for key, value in families.items():
-        if not str(key).startswith("LOW|") or "definition" in str(key):
-            continue
-        top = (value or {}).get("max") if isinstance(value, dict) else None
-        if isinstance(top, (int, float)):
-            seen.append(float(top))
-    if seen:
-        return int(math.ceil(max(seen))), \
-            "THINKING_AT_LOW_BY_PROMPT_FAMILY (highest non-definition family)"
+    families = _thinking_families(stats, level)
+    if kind and kind in families:
+        return int(math.ceil(families[kind])), \
+            ("THINKING_AT_LOW_BY_PROMPT_FAMILY[%s|%s] (measured for this "
+             "request kind)" % (level, kind))
+    others = [v for family, v in families.items() if family != "definition"]
+    if others:
+        return int(math.ceil(max(others))), \
+            ("THINKING_AT_LOW_BY_PROMPT_FAMILY (highest non-definition family; "
+             "no measurement for %s)" % (kind or "this kind"))
     return UNMEASURED_THINKING_PRIOR, ("s42.UNMEASURED_THINKING_PRIOR (the "
                                        "ranking prompt's measured maximum at "
                                        "LOW)")
@@ -601,6 +697,33 @@ def bill_requests(todo: list, pos_todo: list, lang: str) -> list:
                          math.ceil(chars / CHARS_PER_TOKEN_ESTIMATE),
                      "prompt_sha256": prompt_sha256(system_prompt("pos", lang))})
     return rows
+
+
+def request_input_tokens(kind: str, n: int, chars: int, *, system_tokens: int,
+                         measured_system_tokens: int, prompt_fit,
+                         cached: bool) -> dict:
+    """{"cached", "uncached"} INPUT tokens for one request. One arithmetic.
+
+    CROSS-OWNER NOTE (the batch transport): extracted from bill_tokens so the wave
+    splitter and the bill cannot disagree about how big a request is. The
+    splitter's answer decides how many jobs a wave becomes, and the enqueued
+    limit is a hard refusal at submit -- so a second copy of this formula would
+    be discovered as a rejected submit in the middle of a paid drain.
+
+    `system_tokens` is the prompt size being PRICED (lean or rich);
+    `measured_system_tokens` is the lean size the prompt fit was measured with,
+    which is what has to come off the fit to leave the payload. They differ only
+    in the rich_uncached scenario, and conflating them would price the rich
+    prompt while subtracting it too.
+    """
+    if kind == "definition":
+        payload = max(0, math.ceil(prompt_fit[0] * n + prompt_fit[1])
+                      - int(measured_system_tokens))
+    else:
+        payload = math.ceil(chars / CHARS_PER_TOKEN_ESTIMATE)
+    if cached:
+        return {"cached": int(system_tokens), "uncached": int(payload)}
+    return {"cached": 0, "uncached": int(system_tokens) + int(payload)}
 
 
 def bill_tokens(todo: list, pos_todo: list, lang: str,
@@ -657,7 +780,12 @@ def bill_tokens(todo: list, pos_todo: list, lang: str,
                                              MAX_DEFS_PER_BATCH)),
                ("expression", _group_by_entry(todo, "expression",
                                               MAX_EXPR_PER_BATCH)))
-    prior, prior_source = unmeasured_thinking_prior(stats)
+    # PER KIND. The expression canary exists to replace the expression figure
+    # with a measurement, and a single cross-family max() meant the measurement
+    # could never reach the bill (the ranking prompt's 275 dominated for ever).
+    priors = {kind: unmeasured_thinking_prior(stats, kind)
+              for kind in ("expression", "pos")}
+    prior, prior_source = priors["expression"]
     expr_offline = math.ceil(len(system_prompt("expression", lang))
                              / CHARS_PER_TOKEN_ESTIMATE)
     out: dict = {"available": True, "thinking_per_request_p95": think,
@@ -671,6 +799,8 @@ def bill_tokens(todo: list, pos_todo: list, lang: str,
                                       "pay the uncached input rate in EVERY "
                                       "scenario" % lean),
                  "thinking_per_request_unmeasured_kinds": prior,
+                 "thinking_per_request_by_kind": {
+                     kind: value for kind, (value, _why) in priors.items()},
                  "thinking_basis": {"definition": MEASURED_THINKING_BASIS,
                                     "expression": UNMEASURED_THINKING_BASIS,
                                     "pos": UNMEASURED_THINKING_BASIS},
@@ -678,6 +808,8 @@ def bill_tokens(todo: list, pos_todo: list, lang: str,
                      MEASURED_THINKING_BASIS:
                          "thinking.THINKING_PER_REQUEST_LOW.p95",
                      UNMEASURED_THINKING_BASIS: prior_source},
+                 "thinking_basis_source_by_kind": {
+                     kind: why for kind, (_value, why) in priors.items()},
                  "thinking_basis_note": (
                      "the measured 0 is a property of the DEFINITION prompt, "
                      "not of thinkingLevel=LOW: the ranking prompt produced "
@@ -710,7 +842,8 @@ def bill_tokens(todo: list, pos_todo: list, lang: str,
         for kind, groups in batches:
             # A measured constant is enforced only on the kind it was measured
             # on; every other kind carries the prior.
-            per_request = (think if kind in MEASURED_OUTPUT_KINDS else prior)
+            per_request = (think if kind in MEASURED_OUTPUT_KINDS
+                           else priors[kind][0])
             cacheable = (scenario == "cache_works"
                          and kind in CACHEABLE_KINDS)
             for _eid, batch in groups:
@@ -718,22 +851,19 @@ def bill_tokens(todo: list, pos_todo: list, lang: str,
                 requests += 1
                 output += expected_output_tokens(n, fit)
                 thinking += int(math.ceil(per_request))
-                if kind == "definition":
-                    payload = max(0, math.ceil(pfit[0] * n + pfit[1]) - lean)
-                else:
-                    chars = sum(len(r["text"]) + len(r.get("grammar") or "")
-                                + len(r["hint"]) for r in batch)
-                    payload = math.ceil(chars / CHARS_PER_TOKEN_ESTIMATE)
-                if cacheable:
-                    cached += system
-                    uncached += payload
-                else:
-                    uncached += system + payload
+                chars = sum(len(r["text"]) + len(r.get("grammar") or "")
+                            + len(r["hint"]) for r in batch)
+                part = request_input_tokens(kind, n, chars,
+                                            system_tokens=system,
+                                            measured_system_tokens=lean,
+                                            prompt_fit=pfit, cached=cacheable)
+                cached += part["cached"]
+                uncached += part["uncached"]
         if pos_todo:
             # "pos" is not in CACHEABLE_KINDS or in MEASURED_OUTPUT_KINDS: one
             # request per language, uncached system prompt, prior thinking.
             requests += 1
-            thinking += int(math.ceil(prior))
+            thinking += int(math.ceil(priors["pos"][0]))
             payload = math.ceil(sum(len(k) for k in pos_todo)
                                 / CHARS_PER_TOKEN_ESTIMATE)
             output += expected_output_tokens(len(pos_todo), fit)
@@ -2290,6 +2420,30 @@ def archive_everything(defs: dict, exprs: dict, archive: dict, reason: str,
     return {**moved, "kept": kept}
 
 
+def archive_for_redo(cfg: Config, lang: str, st: dict, done_prefix: str) -> dict:
+    """The destructive half of a clean retranslation, for ONE language.
+
+    CROSS-OWNER NOTE (the batch transport): lifted out of run()'s interactive loop
+    so the batch transport performs the SAME archive step rather than a second
+    implementation of it. The batch path does it on the submit invocation, which
+    is where the money is committed.
+
+    `keep_prefix` is the resume half: rows this redo already produced stay live
+    instead of being retired and bought again.
+    """
+    moved = archive_everything(st["defs"], st["exprs"], st["archive"],
+                               cfg.retranslate_reason, keep_prefix=done_prefix)
+    write_json(st["dir"] / "definitions.json", st["defs"])
+    write_json(st["dir"] / "expressions.json", st["exprs"])
+    write_json(st["dir"] / "archive.json", st["archive"])
+    print("  %s: archived %d definition and %d expression row(s) with "
+          "reason=%r; kept %d + %d already redone in this wave"
+          % (lang, moved["definitions"], moved["expressions"],
+             cfg.retranslate_reason, moved["kept"]["definitions"],
+             moved["kept"]["expressions"]))
+    return moved
+
+
 def _drift_report(cfg: Config, entries: dict, write: bool = False) -> dict:
     """Guide 4.10 stage42_retranslate_changed: the article_sha ledger, so a DDO
     edit is detected by content and never by DDO's own lastmod (hus kept
@@ -2485,6 +2639,19 @@ def review(cfg: Config, registry=None, lang: str | None = None,
     stats = probe_stats(cfg)
     cfg.validate(spending=True, stats=stats)
     report["consumption_rules"] = spend_gate(cfg, stats, [lang])
+    # A review pass is small but it is not free, and it draws on the same monthly
+    # cap as a translate wave -- so it is quoted (from the same money stack, on
+    # the cells it will actually redo) and then adjudicated by G-BUDGET and
+    # G-SCOPE-FROZEN. Redoing cells inside a scope that is about to be refrozen
+    # is the same "paying twice" this program refuses on the translate path.
+    rates, rates_note = rate_card_for(cfg)
+    tokens = bill_tokens(rows, [], lang, stats)
+    bill = {lang: dict(bill_row(rows, [], cfg.mode), tokens=tokens,
+                       dollars=dict(dollar_figures(tokens, rates,
+                                                   cfg.spend_cap_usd),
+                                    rate_card_source=rates_note))}
+    report["bill"] = bill
+    report["pre_spend_gates"] = _pre_spend(cfg, bill, families)
     fit = output_fit(stats=stats)
     pool = _pool_from_env(cfg)
     usage = UsageLog(sink=usage_sink,
@@ -2541,7 +2708,7 @@ def review(cfg: Config, registry=None, lang: str | None = None,
 def spend_gate(cfg: Config, stats: dict, langs) -> list:
     """Refuse the spend unless every blocking N-09 consumption rule passes.
 
-    CROSS-OWNER EDIT (crew B owns billing.py): `assert_ready_to_spend` and
+    CROSS-OWNER EDIT (this module does not own billing.py): `assert_ready_to_spend` and
     `consumption_rules` had NO production caller at all. The only importer was
     tests/test_money.py, this module did not import billing, and the paid path's
     pre-flight was transport_guard + probe_stats + cfg.validate(spending=True)
@@ -2563,30 +2730,106 @@ def spend_gate(cfg: Config, stats: dict, langs) -> list:
     return billing.assert_ready_to_spend(cfg, stats, prompts=texts)
 
 
-def transport_guard(cfg: Config) -> None:
-    """Refuse to spend on a transport that is not wired up yet.
+def _pre_spend(cfg: Config, bill: dict, families) -> list:
+    """G-SCOPE-FROZEN + G-BUDGET, on every path that is about to place a call.
 
-    Without this, `--mode batch --confirm-spend` would place ordinary
-    interactive calls and label every ledger row "batch" -- i.e. pay standard
-    rates and record half of them. Same class of problem as cache_enabled with
-    no cache: believing a discount applies is more expensive than knowing it
-    does not.
+    CROSS-OWNER EDIT (this module does not own gates.py or billing.py): `pre_spend_gates`
+    had NO production call site anywhere in the package -- `grep -rn
+    pre_spend_gates src/` found only its own definition and its docstring, which
+    told the reader exactly where to call it. So the two things it decides were
+    both unenforced:
 
-    The batch module owns the removal of these two checks. Delete a branch when
-    (and only when) the thing it is standing in for actually exists.
+      G-SCOPE-FROZEN  no refreeze signature, no spending. It refuses today, on
+                      purpose: card_keys.json inside the package is `{}` and the
+                      refreeze (22 guid_seed reselections plus three alias
+                      merges) has not happened. Paying to translate a scope that
+                      is about to change is paying twice, and "the refreeze has
+                      not happened yet" is precisely the state this gate exists
+                      to refuse. It is wired anyway, because a gate whose call
+                      site is added at release time is a gate nobody has ever
+                      seen run.
+      G-BUDGET        month-to-date plus this run's forecast against
+                      cfg.spend_cap_usd. This is the ONLY place the four
+                      languages are SUMMED: the bill's own ceiling check is per
+                      language ($4.09 each against $10), and four times $4.09 is
+                      $16.37, which is 164% of the cap. Nothing in the package
+                      made that comparison, so the cap was a number in a toml
+                      file.
+
+    `families` is len(words.json), the count the refreeze stamp signed for.
     """
-    if cfg.mode == "batch":
+    from ..gates import pre_spend_gates                # noqa: PLC0415
+    count = families if isinstance(families, int) else len(families or {})
+    return run_gates(pre_spend_gates(cfg, bill, families=count), cfg,
+                     stage="42")
+
+
+def _interactive_wave_gates(cfg, bill, usage, ranges, stats) -> dict:
+    """G-BILL / G-THINK / G-PROMPT / G-CACHE for a wave that ran INTERACTIVELY.
+
+    The four money gates had exactly one call site and it was inside the batch
+    transport, so `--mode standard --confirm-spend` and `--mode flex
+    --confirm-spend` placed real calls and adjudicated none of them. The gates
+    are transport-agnostic by construction -- they read usage rows -- so the
+    interactive path hands them the same thing the batch path does: this
+    language's slice of the ledger.
+
+    `declared_cache_tokens` is None here and that is correct rather than missing:
+    nothing on the interactive surface creates a cache (transport_guard refuses
+    the combination), so G-CACHE has no denominator, reports n/a, and passes --
+    which is the honest verdict for a wave that never claimed a discount.
+
+    Evaluated with raise_on_failure=False for the same reason the batch path
+    does it: this run's report has to reach disk before the failure propagates.
+    """
+    from ..gates import failure_message as _fail       # noqa: PLC0415
+    from ..gates import post_wave_gates                # noqa: PLC0415
+    results = []
+    for lang, (start, end) in sorted(ranges.items()):
+        rows = usage.rows[start:end]
+        if not rows:
+            continue
+        results += run_gates(
+            post_wave_gates(cfg, bill, rows, lang=lang,
+                            declared_cache_tokens=None,
+                            cache_prompt_shas=None, stats=stats),
+            cfg, stage="42", raise_on_failure=False)
+    message = _fail(results)
+    return {"ok": not message, "error": message,
+            "rows": [{"id": r["id"], "ok": r["ok"], "extra": r["extra"]}
+                     for r in results],
+            "usage_rows_by_language": {lg: list(rng)
+                                       for lg, rng in sorted(ranges.items())}}
+
+
+def transport_guard(cfg: Config) -> None:
+    """Refuse to spend on a transport that is not wired up.
+
+    Two branches used to live here and both are GONE, because the things they
+    stood in for exist now: `mode = batch` reaches
+    ankidkdeck.batch.transport (JSONL writer, job registry, wave splitter,
+    positional reconciliation, retry waves) and `cache_enabled` reaches
+    ankidkdeck.batch.caches. The rule the branches encoded is kept: a
+    configuration that promises a discount the code cannot deliver must refuse
+    rather than pay the full rate and file the row as if it had not.
+
+    What is left is the ONE combination still in that state. The cache lifecycle
+    is transport-agnostic but it is only DRIVEN by the batch wave: on the
+    interactive surface nothing creates a cache, nothing extends its TTL, and
+    nothing recovers from the 403 when it expires -- so cache_enabled there
+    would pay the uncached rate on every request while the bill quoted
+    cache_works. stage 50 calls this too, and the ranking always runs on the
+    standard surface by design.
+    """
+    if cfg.cache_enabled and cfg.mode != "batch":
         raise FatalError(
-            "mode = batch: the batch transport (JSONL writer, job registry, "
-            "wave splitter, cache lifecycle) is not part of this stage yet. "
-            "Running it would place standard-rate calls and file them as batch. "
-            "Use --mode standard (or flex) for now.")
-    if cfg.cache_enabled:
-        raise FatalError(
-            "cache_enabled = true: nothing creates or attaches an explicit "
-            "cache yet, so this run would pay the full uncached rate while the "
-            "configuration says otherwise. Turn it off until the cache "
-            "lifecycle is wired up.")
+            "cache_enabled = true with mode = %s: the explicit-cache lifecycle "
+            "(create, extend before each submit, recreate on the 403, delete at "
+            "the end of the wave) is driven by the BATCH wave. On the "
+            "interactive surface nothing would create the cache, so this run "
+            "would pay the full uncached rate while the bill quoted the cached "
+            "one. Use --mode batch, or set cache_enabled = false."
+            % cfg.mode)
 
 
 # Spec 5.9, first half: the bind audit is frozen before the first paid call.
@@ -2771,7 +3014,7 @@ def run(cfg: Config, registry=None, lang: str | None = None,
         pos_todo = [k for k in pos_wanted if k not in have_pos]
         state[lg] = {"dir": tdir, "defs": defs, "exprs": exprs, "pos": pos,
                      "todo": todo, "pos_todo": pos_todo, "archive": archive}
-        bill[lg] = bill_row(todo, pos_todo)
+        bill[lg] = bill_row(todo, pos_todo, cfg.mode)
         bill[lg]["restored_from_archive"] = len(restored)
         bill[lg]["resume"] = dict(resume)
         tokens = bill_tokens(todo, pos_todo, lg, bill_stats)
@@ -2867,6 +3110,9 @@ def run(cfg: Config, registry=None, lang: str | None = None,
     cfg.validate(spending=True, stats=stats)
     # And the N-09 consumption rules, which nothing on this path used to ask.
     report["consumption_rules"] = spend_gate(cfg, stats, langs)
+    # G-SCOPE-FROZEN + G-BUDGET. `bill` is the same dict print_bill() just
+    # printed, so the gate adjudicates the number the human read.
+    report["pre_spend_gates"] = _pre_spend(cfg, bill, families)
     fit = output_fit(stats=stats)
     pool = _pool_from_env(cfg)
     model = cfg.gemini_model
@@ -2886,9 +3132,34 @@ def run(cfg: Config, registry=None, lang: str | None = None,
     usage = UsageLog(sink=usage_sink,
                      path=cfg.report_dir / "translate_usage.jsonl")
     violations_by_lang: dict = {}
+    batch_wave: dict = {}
+    interactive_rows: dict = {}
     _snapshot_bind_audit(cfg)
     try:
-        for lg in langs:
+        if cfg.mode == "batch":
+            # The transport replaces this loop and nothing else: the pre-flight
+            # above, the spend records below and the gates at the end are the
+            # same on all three transports, which is what "the modes are
+            # interchangeable mid-run" means. It runs INSIDE this try so a crash
+            # in the middle of a drain still writes every paid call to disk.
+            from ..batch import transport as batch_transport  # noqa: PLC0415
+            batch_wave = batch_transport.translate_wave(
+                cfg, langs=langs, state=state, report=report, usage=usage,
+                fit=fit, pool=pool, provs=provs, provs_expr=provs_expr,
+                stats=stats, bill=bill, phase=phase,
+                retranslate_all=retranslate_all, done_prefixes=done_prefixes,
+                pos_wanted=pos_wanted, violations_by_lang=violations_by_lang)
+            report["batch"] = batch_wave
+            for lg in langs:
+                archived_for_redo[lg] = (batch_wave.get("languages", {})
+                                         .get(lg, {}).get("archived_for_redo"))
+        interactive_langs = [] if cfg.mode == "batch" else list(langs)
+        for lg in interactive_langs:
+            # Where this language's ledger rows start. The money gates are
+            # adjudicated per language and the range is how they are told apart
+            # -- the same split the batch transport uses, for the same reason:
+            # one language's cost must not be checked against another's quote.
+            interactive_rows[lg] = [len(usage.rows), len(usage.rows)]
             st = state[lg]
             tdir, defs, exprs = st["dir"], st["defs"], st["exprs"]
             if retranslate_all:
@@ -2897,21 +3168,8 @@ def run(cfg: Config, registry=None, lang: str | None = None,
                 # language (compute_todo above), which is what makes the redo
                 # actually happen -- deleting definitions.json by hand only ever
                 # worked once, because the next run silently restored it all.
-                # keep_prefix is the resume half: rows this redo already
-                # produced stay live instead of being retired and bought again.
-                moved = archive_everything(defs, exprs, st["archive"],
-                                           cfg.retranslate_reason,
-                                           keep_prefix=done_prefixes[lg])
-                write_json(tdir / "definitions.json", defs)
-                write_json(tdir / "expressions.json", exprs)
-                write_json(tdir / "archive.json", st["archive"])
-                archived_for_redo[lg] = moved
-                print("  %s: archived %d definition and %d expression row(s) "
-                      "with reason=%r; kept %d + %d already redone in this "
-                      "wave" % (lg, moved["definitions"], moved["expressions"],
-                                cfg.retranslate_reason,
-                                moved["kept"]["definitions"],
-                                moved["kept"]["expressions"]))
+                archived_for_redo[lg] = archive_for_redo(
+                    cfg, lg, st, done_prefixes[lg])
             prov, prov_expr = provs[lg], provs_expr[lg]
             ctx = CallContext(cfg=cfg, pool=pool, fit=fit, lang=lg, usage=usage,
                               prompt_id=cfg.prompt_id, mode=cfg.mode,
@@ -2967,6 +3225,7 @@ def run(cfg: Config, registry=None, lang: str | None = None,
                 "count_lock_violations": len(ctx.violations),
                 "archived_for_redo": archived_for_redo.get(lg),
             }
+            interactive_rows[lg][1] = len(usage.rows)
     except BaseException as exc:             # noqa: BLE001 - re-raised below
         # Money has been spent by now. Every record goes down BEFORE the
         # exception continues on its way: five paid calls then a FatalError used
@@ -2977,7 +3236,17 @@ def run(cfg: Config, registry=None, lang: str | None = None,
     # One record per wave, next to the tokens it cost. The dollar figure is the
     # money stack's to fill in from these counts and the rate card.
     report["waves"] = [{"mode": cfg.mode, "phase": phase,
-                        "cache_name": None, "prompt_id": cfg.prompt_id,
+                        # The batch transport creates one cache per language, so
+                        # the wave record names them all rather than pretending
+                        # there is one. None on the interactive path.
+                        "cache_names": sorted(batch_wave.get(
+                            "cache_prompt_shas") or {}) or None,
+                        # PER LANGUAGE, because they differ: the English
+                        # definition prompt is 1,092 tokens against 1,135.
+                        "declared_cache_tokens_by_language":
+                            batch_wave.get(
+                                "declared_cache_tokens_by_language"),
+                        "prompt_id": cfg.prompt_id,
                         "effective_prompt_id": prompts.effective_prompt_ids(
                             langs),
                         "thinking_level": cfg.thinking_level,
@@ -3016,7 +3285,27 @@ def run(cfg: Config, registry=None, lang: str | None = None,
     report["script_gate"] = gate["verdicts"]
     report["script_gate_rows"] = gate["rows"]
     report["script_gate_ok"] = gate["ok"]
+    # The four money gates on an INTERACTIVE wave. Same four gates, same rows,
+    # same per-language split as the batch transport runs -- they used to run on
+    # the batch surface only, so a confirmed standard or flex wave adjudicated
+    # nothing at all. Recorded before the report is written, raised after it.
+    if interactive_rows and usage.rows:
+        wave_gates = _interactive_wave_gates(cfg, bill, usage, interactive_rows,
+                                             stats)
+        report["wave_gates"] = wave_gates
+    else:
+        wave_gates = {"ok": True, "error": ""}
     write_json(cfg.report_dir / "translate_report.json", report)
     if not gate["ok"]:
         raise FatalError(gate["error"])
+    # Same order, same reason, for the money gates the batch transport ran on
+    # the wave it just paid for (G-BILL / G-THINK / G-PROMPT / G-CACHE). They
+    # were evaluated and recorded inside the transport with
+    # raise_on_failure=False precisely so this report reached disk first.
+    if batch_wave.get("gates") and not batch_wave.get("gates_ok"):
+        raise FatalError(batch_wave["gates_error"])
+    if not wave_gates["ok"]:
+        raise FatalError(wave_gates["error"])
+    if batch_wave.get("failure"):
+        raise FatalError(batch_wave["failure"])
     return report

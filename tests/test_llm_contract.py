@@ -637,16 +637,22 @@ def test_the_grammar_note_travels_in_the_user_message_only():
 # ---------------------------------------------------- the unwired transports
 
 def test_spending_on_a_transport_that_does_not_exist_is_refused():
-    """`--mode batch --confirm-spend` would place ordinary interactive calls and
-    label every ledger row "batch": standard rates, filed as half price. Same
-    class of error as cache_enabled with no cache -- believing a discount
-    applies costs more than knowing it does not."""
-    with pytest.raises(FatalError) as exc:
-        S42.transport_guard(Config(mode="batch"))
-    assert "batch transport" in str(exc.value)
-    with pytest.raises(FatalError) as exc:
-        S42.transport_guard(Config(cache_enabled=True))
-    assert "cache_enabled" in str(exc.value)
-    # standard and flex are real today: flex is standard plus one field
+    """Believing a discount applies costs more than knowing it does not.
+
+    UPDATED for the batch transport: the batch branch of this guard is GONE, because
+    the batch transport exists now (ankidkdeck.batch), and so is the blanket
+    cache_enabled branch, because the cache lifecycle exists
+    (ankidkdeck.batch.caches). What is left is the one combination still in the
+    state the guard describes: the cache lifecycle is DRIVEN by the batch wave,
+    so cache_enabled on the interactive surface would pay the full uncached rate
+    while the bill quoted cache_works.
+    """
+    S42.transport_guard(Config(mode="batch"))
+    S42.transport_guard(Config(mode="batch", cache_enabled=True))
     S42.transport_guard(Config(mode="standard"))
     S42.transport_guard(Config(mode="flex"))
+    for mode in ("standard", "flex"):
+        with pytest.raises(FatalError) as exc:
+            S42.transport_guard(Config(mode=mode, cache_enabled=True))
+        assert "cache_enabled" in str(exc.value)
+        assert "batch" in str(exc.value)

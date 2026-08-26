@@ -64,7 +64,18 @@ nothing from the Gemini SDK. They are not, however, read-only:
   `priority_conflicts.json` and `ranking_queue.json`.
 
 "Nothing was sent" is true. "Nothing changed" is not. Snapshot `work/` before the
-first dry run of either.
+first dry run of either. A confirmed `--mode batch` run adds `work/batch/` on top
+of that -- the job registry, the uploaded JSONL and the downloaded results -- and
+those files are the only record of what has been paid for, so they belong in the
+same snapshot.
+
+Two gates refuse before the first paid call rather than after it: `G-BUDGET`
+(month-to-date plus this run's forecast against `spend_cap_usd` -- the only place
+the languages are **summed**, since the bill's own ceiling check is per language)
+and `G-SCOPE-FROZEN`. The second one refuses today by design: until the release
+refreeze has happened and `registry/refreeze_stamp.json` signs for the scope and
+the `card_keys.json` row count, paying to translate a scope that is about to
+change is paying twice.
 
 `ankidkdeck status` prints where you are; `ankidkdeck gates` prints every quality
 gate and whether it passed; `ankidkdeck doctor` prints the configuration a paid
@@ -115,8 +126,13 @@ $ ankidkdeck translate --lang German
 effective model, the transport, the thinking level, the prompt hashes, the spend
 cap, and the state of the measured constants under `work/probes/` -- and exits
 non-zero when the run is not fit to spend on. The two numbers in the request
-range are "one request per batch" and "every retry ladder at full stretch,
-transport retries included".
+range are "one request per batch" and every retry ladder at full stretch -- and
+the second one is **per transport**, because the transports do not share a
+ceiling. On the interactive surface it is the count-lock ladder times the
+transport ladder inside `_generate` (25x, transport retries included). A batch
+wave never goes through `_generate`, so its bound is the first submit plus the
+retry waves (4x), enforced twice over: by the wave loop and by a per-cell attempt
+counter that survives the process.
 
 The bill also carries three dollar figures per language -- the cache working, the
 cache failing with the current prompt inlined on every request, and the forbidden
@@ -142,6 +158,80 @@ A clean retranslation is **resumable**, which matters because one language is
   brought every old row home, reported 0 cells, and left two translators mixed
   into one file.
 
+### The batch wave
+
+`--mode batch` is half price and asynchronous. It is a human choice: nothing
+downgrades a batch wave to the interactive surface by itself, because an
+automatic downgrade doubles the rate silently.
+
+One wave is one or two `--confirm-spend` invocations:
+
+```
+ankidkdeck translate --lang German --mode batch --phase submit --confirm-spend
+ankidkdeck translate --lang German --mode batch --phase ingest --confirm-spend
+ankidkdeck translate --lang German --mode batch --confirm-spend     # both at once
+```
+
+The submit creates the explicit cache, writes one JSONL file per job, uploads it,
+opens the job and waits for it to drain -- **one job in flight at a time** --
+downloading each result file the moment its job reaches a terminal state. It
+writes no translation row. The ingest reconciles those files **by position**,
+checks the count lock locally, writes the cells, and opens bounded retry waves
+(at most three, counted per cell) for whatever failed. Retries stay on batch. The
+drift ledger is consumed on the ingest only.
+
+`--mode batch` is also what `cache_enabled` needs: the explicit cache is the only
+discount path there is (batch has no implicit caching at all), and its lifecycle
+-- create, assert and extend the TTL before **each** submit, recreate when it has
+expired, delete once the language is drained -- is driven by the wave. On the
+interactive surface `cache_enabled` is refused rather than quietly ignored.
+
+The TTL is sized against the drain window this program actually waits for (the
+poll deadline, floored at the documented 48-hour hard expiry, plus a submit
+margin), not against a throughput extrapolation: batch resolves the cache when
+each row *executes*, so a cache that dies mid-job fails every remaining row with
+a permission error at zero prompt tokens. Holding a 1,135-token prompt for that
+whole window costs about $0.03 per language.
+
+Everything the wave knows lives under `work/batch/`:
+
+| file | what |
+|---|---|
+| `work/batch/jobs.json` | one record per job: its state, its fingerprint, its cache, and the per-request plan the ingest reconciles against |
+| `work/batch/<job>.jsonl` | exactly what was uploaded |
+| `work/batch/<job>_results.jsonl` | exactly what came back |
+
+A job is submitted once. Its fingerprint (model, prompt id, language, keys,
+cache, wave) is written **before** the API call, because `batches.create` is not
+idempotent: the same job submitted twice is accepted twice, runs twice and is
+billed twice. If a create fails with a 5xx the wave does not retry it -- it lists
+the jobs, matches the uploaded input file, and adopts the one that already
+exists.
+
+**A drain that dies is resumed, never resubmitted.** `--phase submit` can be a
+foreground call for a day or more, so run it under `tmux` or `nohup`. If it dies
+anyway -- a dropped connection, a reboot, the 50-hour wait running out -- the
+next invocation of either phase picks up where it stopped, before it plans
+anything new:
+
+| left as | what happens next run |
+|---|---|
+| `SUBMITTED` | polled to a terminal state and downloaded. The money was already committed; this is the results being collected, not a second order |
+| `PLANNED` with an uploaded file | the jobs are listed and the one matching that input file is **adopted**. If none matches, the run stops and says so: the create may have been accepted and the answer lost, and guessing there is a duplicate charge |
+| `PLANNED` with nothing uploaded | released. Nothing was sent, so nothing was billed, and the wave plans it again |
+
+Because that sweep runs first, **one job in flight at a time** holds across
+invocations too, not only inside one. The cache is kept alive while any job of
+that language is still in flight: batch resolves the cache when each row
+*executes*, so deleting it early fails every remaining row of a job that was
+otherwise recoverable.
+
+A job that ends terminal with no result file is recorded as `FAILED`, and the
+record says whether the wave may be submitted again. The service reporting
+`FAILED`, `CANCELLED` or `EXPIRED` means nothing ran and nothing was billed, so
+it may. "We could not read the results of a job that succeeded" means the money
+is spent, so it may not -- that one needs a human and the console.
+
 ### What a paid run leaves behind
 
 Every spend record is on disk before anything can fail, because a crash is the
@@ -154,6 +244,7 @@ only time it matters:
 | `review/count_lock_violations_<lang>.json` | as each violation happens |
 | `reports/translate_report.json` | always, with a `crashed` block on a fatal path |
 | `reports/bind_report_pre_translate.json` | once, before the first paid call: the pre-LLM migration audit |
+| `work/batch/jobs.json` | batch only: every job's state, written before each API call |
 
 Five paid calls followed by a crash leave five rows. `priority` writes the same
 kind of per-call ledger to `reports/priority_usage.jsonl`.
