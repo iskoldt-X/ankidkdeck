@@ -153,8 +153,8 @@ def test_every_family_id_is_a_bare_entry_id(workspace):
         assert FAMILY_ID.match(fid), fid
 
 
-def test_refused_component_splits_by_head_and_emits_no_duplicate_family(cfg,
-                                                                       registry):
+def test_refused_component_splits_by_head_and_emits_no_duplicate_family(
+        cfg, registry_empty_card_keys):
     """kan/kunne/khan, the measured duplicate-card case (R2's micro30b).
 
     Two words in one refused component used to produce TWO families with
@@ -188,7 +188,7 @@ def test_refused_component_splits_by_head_and_emits_no_duplicate_family(cfg,
     }
     write_workspace(cfg, entries, [(23, "kan"), (400, "kunne")],
                     classification=classification, v2_querywords={"kan": 23})
-    merge_run(cfg, registry)
+    merge_run(cfg, registry_empty_card_keys)
     fams = read_json(cfg.json_dir / "words.json")
 
     # one family per head lemma, and NO family holds both heads
@@ -761,7 +761,7 @@ def test_a_stale_guid_seed_is_reported_and_never_rewritten(cfg, registry):
 
 
 def test_the_freeze_report_says_what_is_uncommitted_when_added_is_zero(
-        cfg, monkeypatch):
+        cfg, monkeypatch, shipped_card_keys_empty):
     """`added: 0` is correct on a rerun and useless as evidence.
 
     Round 2 appended 4 rows, then two idempotent reruns overwrote
@@ -769,8 +769,12 @@ def test_the_freeze_report_says_what_is_uncommitted_when_added_is_zero(
     said this workspace had frozen nothing, and the append-only invariant could
     only be shown by diffing a snapshot taken outside the pipeline. The count
     that survives a rerun is the overlay's diff against the COMMITTED registry
-    (src/ankidkdeck/registry/card_keys.json, still `{}`), which is also the
-    diff a human has to review before release.
+    (src/ankidkdeck/registry/card_keys.json), which is also the diff a human has
+    to review before release.
+
+    `shipped_card_keys_empty` is what keeps the arithmetic here readable: the
+    committed registry was `{}` when this test was written and ships 2,927 rows
+    since the release refreeze -- one of them this test's own `11021722`.
     """
     from ankidkdeck.registry import Registry
     from ankidkdeck.util import write_json

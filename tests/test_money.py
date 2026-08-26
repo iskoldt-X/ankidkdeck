@@ -816,9 +816,15 @@ def test_g_budget_refuses_a_run_that_would_break_the_cap():
 
 def test_g_scope_frozen_refuses_without_a_stamp(cfg, not_refrozen):
     """Spec 2.7. No refreeze signature, no spending -- and the signature is a
-    signature: nothing in this package writes it."""
+    signature: nothing in this package writes it.
+
+    `not_refrozen` synthesises the unsigned state. It used to be the real state
+    of a checkout; since the 2026-08-27 release refreeze the package ships a
+    signed stamp, and this refusal is what the program returns to the next time
+    the scope moves.
+    """
     stamp, where = gates.read_refreeze_stamp(cfg)
-    assert stamp is None, "the refreeze has not happened; nothing may forge it"
+    assert stamp is None, "an unsigned package must read as unsigned"
     ok, detail = gates.scope_is_frozen(stamp, 2909, {"1": {}}, where)
     assert ok is False and "no refreeze stamp" in detail["why"]
 

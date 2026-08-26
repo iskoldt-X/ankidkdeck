@@ -89,6 +89,45 @@ def registry(cfg):
     return Registry(cfg)
 
 
+@pytest.fixture
+def shipped_card_keys_empty(monkeypatch):
+    """The SHIPPED card_keys.json, emptied.
+
+    Every count freeze_card_keys returns -- `added`, `total`, `unchanged`,
+    `not_in_the_committed_registry` -- is relative to what the package ships,
+    and G-SEED's duplicate-seed check runs over the merged view. The package
+    shipped `{}` until the 2026-08-27 release refreeze and now ships 2,927 real
+    rows, so a test that appends one synthetic family and asserts `total == 1`,
+    or one that replays kan/kunne/khan on two synthetic articles, was quietly
+    relying on the registry being empty: `11021722` (hus) and `11028611`
+    (kunne, seed `kan`) are both real rows now.
+
+    Emptying it keeps those tests about the append-only mechanism they were
+    written for. The shipped table itself is covered by its own tests and by
+    the stage-30 gates on the real corpus, which is where it belongs.
+
+    Patches registry._package_default -- both what Registry() reads and what
+    freeze_card_keys re-reads for the uncommitted count.
+    """
+    from ankidkdeck import registry as _registry
+    real = _registry._package_default
+    monkeypatch.setattr(
+        _registry, "_package_default",
+        lambda name: {} if name == "card_keys.json" else real(name))
+
+
+@pytest.fixture
+def registry_empty_card_keys(cfg, shipped_card_keys_empty):
+    """A Registry built while `shipped_card_keys_empty` is in force.
+
+    Depending on that fixture rather than being listed beside it is deliberate:
+    the patch has to be applied BEFORE Registry() reads the file, and fixture
+    argument order is a weak thing to hang that on.
+    """
+    from ankidkdeck.registry import Registry
+    return Registry(cfg)
+
+
 # --------------------------------------------------------------------------
 # the refreeze signature, faked for every test
 # --------------------------------------------------------------------------
@@ -108,10 +147,10 @@ def registry(cfg):
 # have run.
 CARD_KEYS_ROWS = 2922
 
-# Captured at import, BEFORE any fixture has patched them, so `not_refrozen` can
-# put the real functions back however the fixtures happen to be ordered.
+# Captured at import, BEFORE any fixture has patched it, so the two stand-in
+# _packaged_registry functions below can still reach the genuine one for every
+# file except card_keys.json.
 from ankidkdeck import gates as _gates                          # noqa: E402
-_REAL_REFREEZE_STAMP = _gates.read_refreeze_stamp
 _REAL_PACKAGED_REGISTRY = _gates._packaged_registry
 
 
@@ -138,16 +177,46 @@ def refrozen(monkeypatch):
     return _refrozen_stamp
 
 
+def _unfrozen_stamp(cfg):
+    """read_refreeze_stamp with the PACKAGED stamp absent.
+
+    The <work>/registry copy still wins when a test wrote one: that is the real
+    function's first branch, and a test that signs its own stamp is exercising
+    the reader, not the package. Only the packaged half is suppressed.
+    """
+    from ankidkdeck.util import read_json
+    local = Path(cfg.registry_local) / _gates.REFREEZE_STAMP
+    if local.exists():
+        return read_json(local, default=None), str(local)
+    return None, "%s or package registry/%s" % (local, _gates.REFREEZE_STAMP)
+
+
+def _unfrozen_packaged(name):
+    if name == "card_keys.json":
+        return {}
+    return _REAL_PACKAGED_REGISTRY(name)
+
+
 @pytest.fixture
 def not_refrozen(monkeypatch):
-    """The REAL state of the package: no stamp, `{}` card_keys.
+    """The state of the package BEFORE the release refreeze: no stamp, `{}`
+    card_keys.
 
-    Overrides `refrozen` for the tests that check the refusal, and it puts the
-    genuine functions back rather than a second imitation of them -- so the
-    refusal those tests see is the one a real checkout produces today.
+    Until 2026-08-27 this fixture put the REAL functions back, because a real
+    checkout WAS in that state and the refusal these tests pin was the one it
+    produced. The refreeze has now happened -- the package ships 2,927
+    card_keys rows and a signed refreeze_stamp.json -- so restoring them would
+    hand these tests a REFROZEN package and the refusal would either not fire
+    or fire for the wrong reason (`the stamp signed for 2927 families,
+    words.json has 1`, from a synthetic one-family workspace).
+
+    The refusal still has to be pinned: an unsigned stamp is the state this
+    program returns to the moment the scope moves again. So the state is
+    synthesised instead, returning exactly what read_refreeze_stamp and
+    _packaged_registry return when the two files are absent and empty.
     """
-    monkeypatch.setattr(_gates, "read_refreeze_stamp", _REAL_REFREEZE_STAMP)
-    monkeypatch.setattr(_gates, "_packaged_registry", _REAL_PACKAGED_REGISTRY)
+    monkeypatch.setattr(_gates, "read_refreeze_stamp", _unfrozen_stamp)
+    monkeypatch.setattr(_gates, "_packaged_registry", _unfrozen_packaged)
 
 
 # --------------------------------------------------------------------------

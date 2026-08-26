@@ -1031,12 +1031,14 @@ def test_the_bill_and_the_provenance_carry_the_pack_version(cfg, registry,
 
 def test_a_confirmed_run_refuses_until_the_scope_is_refrozen(
         cfg, registry, translator, not_refrozen):
-    """G-SCOPE-FROZEN, on the real state of the package.
+    """G-SCOPE-FROZEN, on an unsigned package (`not_refrozen`).
 
-    This refusal is CORRECT for this program right now: the packaged
-    registry/card_keys.json is `{}` and the refreeze -- 22 guid_seed reselections
-    plus three alias merges -- has not happened, so every paid cell would be paid
-    for again afterwards. What was wrong was that nothing asked. The dry path is
+    Paying to translate a scope that is about to change is paying twice, so an
+    unsigned package must refuse every confirmed run. That was the real state of
+    a checkout until the 2026-08-27 release refreeze -- packaged card_keys `{}`,
+    no stamp -- and it is the state the program returns to the next time the
+    scope moves, which is why the refusal is pinned rather than deleted. What
+    was wrong before this gate existed was that nothing asked. The dry path is
     deliberately unaffected: a human still has to be able to read the bill.
     """
     _workspace(cfg)

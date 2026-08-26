@@ -59,6 +59,13 @@ KNOWN_POS_KEYS = {
     "sb. pl.", "fork.", "symbol", "talord (mængdetal)", "talord (ordenstal)",
     "førsteled", "sidsteled", "suffiks", "præfiks", "formelt subjekt",
     "udråbsord", "lydord", "infinitivens", "num.",
+    # These three reached us through the "log and continue" path below: they
+    # were the whole of report["new_pos_keys"] on the 2026 corpus (egennavn 8
+    # entries, adj. pl. 3, infinitivpartikel 1). They are now hand-translated
+    # in all four languages, so they are known, not new. infinitivpartikel is
+    # the spelling this corpus serves for what `infinitivens` names; both stay,
+    # and pos_translations.json gives them the same term per language.
+    "adj. pl.", "egennavn", "infinitivpartikel",
 }
 
 DIGITS_TRAIL_RE = re.compile(r"\d+$")
