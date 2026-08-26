@@ -1,0 +1,89 @@
+{
+  "_note": [
+    "Hand-reviewed prompt pack for the English definition and expression prompts.",
+    "Mined from the 2025 corpus (13,518 definition cells, 5,989 expression cells)",
+    "by the same method as the Chinese pack; the measured basis for every value is",
+    "recorded in observations/v3-patch-crew-C.md.",
+    "English is the recorded special case: the frozen V4 core has no CRITICAL RULE",
+    "block for it, and the script contract is nearly vacuous (Latin only).",
+    "The one real English defect the corpus shows is not a script defect at all:",
+    "the capital-plus-full-stop register holds in only 80.2% of cells, and the",
+    "split does not follow part of speech, so it is generation noise. The pack",
+    "pins the majority form.",
+    "COVERAGE METHOD for fixed_renderings_table: each percentage is the share of",
+    "definition cells whose DANISH definition contains the left-hand formula (for",
+    "the frame rows, the `der` form: `person der`, `noget der`) and whose target",
+    "gloss contains the right-hand rendering. Stated because a reviewer read the",
+    "`der/som` label as the denominator and could not land on the value: the",
+    "`der|som` denominator gives 60.0 / 36.5 / 58.9% for noget and 76.5 / 81.1 /",
+    "73.2% for person (EN/DE/ES), i.e. the whole table would shift, not one row.",
+    "Re-derived 2026-08-26: the `der`-form numbers reproduce exactly.",
+    "Danish text in the worked examples is HAND-AUTHORED in DDO's editorial style.",
+    "No DDO source text is stored in this file."
+  ],
+  "pack_version": "en-1",
+  "allowed_scripts": "Latin letters, ASCII punctuation, and Arabic digits",
+  "orthography_rules": "Begin the `gloss` with a capital letter and end it with a single full stop (80.2% of shipped cells do exactly this; the remaining 19.2% are generation noise, not a second register, because the split does not follow part of speech). Keep the `lemma` lowercase unless it is a proper name (98.6%).",
+  "lemma_charset_rule": "Latin letters, spaces, and hyphens. No digits, no quotation marks, no phonetic transcription.",
+  "punctuation_rule": "ASCII punctuation only. Commas are normal (43.5% of glosses); a semicolon may carry a short synonym tail (14.0%). Colons, slashes and quotation marks are effectively absent (under 0.3% each); do not introduce them.",
+  "pos_vb": "Give the bare verb, never with `to` (94.0% of shipped verb lemmas are bare). The `to` lives at the start of the gloss instead (95.0% of verb glosses).",
+  "pos_sb": "Give the bare singular noun with no article (0.55% of lemmas break this). The `gloss` normally opens with `a` or `the` (79.1%).",
+  "pos_function": "Open the `gloss` with `Used` and name the function: 35.9% of function-word glosses and 87.0% of interjection glosses do this.",
+  "worked_example_output": {
+    "headword": "træk",
+    "definitions": [
+      {
+        "lemma": "pull",
+        "gloss": "The act of moving something towards oneself using force."
+      },
+      {
+        "lemma": "draught",
+        "gloss": "A current of cold air moving through a room, for example from an open door."
+      },
+      {
+        "lemma": "trait",
+        "gloss": "A characteristic quality of a person or thing, often one that is easy to identify."
+      }
+    ]
+  },
+  "fixed_renderings_table": [
+    "fx              -> for example (52.1%)",
+    "el.lign.        -> or similar (56.7%) / the like",
+    "ofte            -> often (92.7%)",
+    "især            -> especially (94.4%)",
+    "typisk          -> typically",
+    "evt.            -> possibly (79.9%)",
+    "dvs.            -> i.e.",
+    "m.m. / osv.     -> etc. (82.9% / 86.8%)",
+    "undertiden      -> sometimes",
+    "det at ...      -> the act of ... (60.3%)",
+    "person der/som  -> a person who ... (79.9%)",
+    "noget der/som   -> something that ... (78.5%)",
+    "om person       -> about a person / of a person",
+    "med hensyn til  -> with regard to (40.0%)"
+  ],
+  "anti_patterns": [
+    "bad lemma to pull -> the infinitive marker belongs at the start of the gloss, not in the lemma (1.86% of shipped lemmas carry it) -> good lemma pull",
+    "bad lemma noun suffix -> a grammatical label instead of a concept (V4 lemma rule 2) -> good: name the meaning the element contributes",
+    "bad gloss a current of cold air moving through a room -> no capital and no full stop, against a capital-to-full-stop register -> good gloss A current of cold air moving through a room.",
+    "bad gloss The act of moving something towards oneself using force, which physicists call tension. -> over-explaining past the Danish definition (V4 gloss rule 2) -> good gloss The act of moving something towards oneself using force."
+  ],
+  "length_targets": [
+    "lemma: one word is the norm (65.7% of cells), two words 26.1%, three 6.8%. Median 8 characters, 90th percentile 15.",
+    "gloss: 11 words is the median, 21 the 90th percentile, 34 the 99th; above 25 words needs a reason. Exactly one sentence, capital letter to a single full stop."
+  ],
+  "lemma_allowed_set": "Latin letters, spaces, and hyphens",
+  "gloss_allowed_set": "Latin letters, ASCII punctuation, Arabic digits, and the Danish letters æ ø å when a Danish word or letter is named",
+  "expr_worked_example_output": {
+    "fixed_expressions": [
+      {
+        "lemma": "have backbone",
+        "gloss": "To be strong-willed and willing to assert oneself."
+      },
+      {
+        "lemma": "go bananas",
+        "gloss": "To become wildly excited or to lose control completely."
+      }
+    ]
+  }
+}

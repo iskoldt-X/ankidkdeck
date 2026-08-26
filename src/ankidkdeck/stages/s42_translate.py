@@ -66,9 +66,12 @@ import re
 import time
 from pathlib import Path
 
+from .. import prompts
 from ..config import Config
 from ..extract import ARTICLE_SHA_SCHEMA
-from ..gates import G_ORPH, Gate, run_gates
+from ..gates import (G_ORPH, Gate, read_gates_policy, run_gates,
+                     script_gate_rows)
+from ..gates import failure_message as gate_failure_message
 from ..util import NFC, FatalError, read_json, sha256_str, write_json
 
 MAX_DEFS_PER_BATCH = 20        # 05: one call per entry, capped
@@ -269,8 +272,8 @@ def compute_todo(cfg: Config, entries: dict, translations: dict, lang: str,
                  done_provenance: str = "", resume: dict | None = None) -> list:
     """Cells that are missing, or whose Danish source text has changed.
 
-    One row per cell: {key, kind, entry_id, lemma, pos_text, dannetid, text,
-    grammar, hint, src_sha, reason}. Empty definition texts are not cells --
+    One row per cell: {key, kind, entry_id, lemma, pos_text, pos_key, dannetid,
+    text, grammar, hint, src_sha, reason}. Empty definition texts are not cells --
     there is nothing to translate and the exporter does not render them.
 
     A key that is missing from the live table but present in archive.json with
@@ -349,6 +352,9 @@ def compute_todo(cfg: Config, entries: dict, translations: dict, lang: str,
                 todo.append({"key": key, "kind": "definition", "entry_id": eid,
                              "lemma": e.get("display_headword") or e.get("lemma"),
                              "pos_text": e.get("pos_text") or "",
+                             # The rich prompt's POS block is written against
+                             # pos_key, not the pos_text display form.
+                             "pos_key": e.get("pos_key") or "",
                              "dannetid": s.get("dannetid"), "text": text,
                              "grammar": (s.get("grammar") or "").strip(),
                              "hint": "", "src_sha": s.get("src_sha"),
@@ -378,6 +384,7 @@ def compute_todo(cfg: Config, entries: dict, translations: dict, lang: str,
                 todo.append({"key": key, "kind": "expression", "entry_id": eid,
                              "lemma": e.get("display_headword") or e.get("lemma"),
                              "pos_text": e.get("pos_text") or "",
+                             "pos_key": e.get("pos_key") or "",
                              "dannetid": key, "text": text, "grammar": "",
                              "hint": expression_hint(x), "src_sha": sha,
                              "reason": reason})
@@ -948,6 +955,86 @@ def orphans_gate(per_lang: dict):
 # prompts, ported verbatim from the v2.1 scripts
 # --------------------------------------------------------------------------
 
+def script_gates(cfg: Config, langs, registry=None, raise_on_failure=True):
+    """Run G-SCRIPT over the translation cells on disk. Offline, zero cost.
+
+    The gate reads translations/<lang>/{definitions,expressions}.json and the
+    language's prompt pack, and nothing else -- in particular not entries.json,
+    so no DDO source text can reach its report row.
+
+    Called on BOTH paths: on the dry path it adjudicates what is already on
+    disk (which is how the 325 contaminated Chinese cells become visible before
+    anyone spends), and at the end of a confirmed run it adjudicates what the
+    wave just wrote, where every finding is BLOCK tier because those rows carry
+    this run's provenance rather than 2025's.
+
+    `raise_on_failure=False` evaluates and REPORTS without raising, so a caller
+    can put the verdict into its own report, write that report, and only then
+    let the failure out. That order matters twice:
+
+      * on the confirmed path, this ran between the drift ledger's irreversible
+        consumption and the single write of translate_report.json, so a gate
+        failure left the report of a wave that had already been paid for
+        unwritten -- with the PREVIOUS run's file still on disk, describing a
+        different run.
+      * on the dry path the whole point is to see the bill before spending, and
+        a single drifted cell (the corpus has already drifted +72) made the
+        gate raise before the report existed. Refusing to spend is right;
+        refusing to show the bill is not.
+
+    Returns {"rows": [...], "verdicts": [...], "ok": bool}.
+    """
+    policy = read_gates_policy(cfg)
+    rows = []
+    for lang in langs:
+        tdir = cfg.json_dir / "translations" / lang
+        cells = {"definitions": read_json(tdir / "definitions.json", default={}),
+                 "expressions": read_json(tdir / "expressions.json", default={})}
+        cells = {k: v for k, v in cells.items() if v}
+        if not cells:
+            # Nothing written for this language yet. A gate with no cells has
+            # nothing to say, and a vacuous PASS row would be worse than no row.
+            # Filtered per KIND, not per language: one empty kind used to leave
+            # the other kind's row plus a hollow PASS over zero cells.
+            continue
+        rows.extend(script_gate_rows(
+            cfg, cells, lang=lang,
+            pack=prompts.packs.load(lang, cfg), policy=policy))
+    if not rows:
+        return {"rows": [], "verdicts": [], "ok": True}
+    results = run_gates(rows, cfg, stage="42",
+                        raise_on_failure=raise_on_failure)
+    # run_gates has already written gates_report.json, so the per-row detail is
+    # on disk either way. What the caller still needs on a failure is the
+    # verdict and the message, in ITS report, before the failure continues.
+    message = gate_failure_message(results)
+    return {"rows": [g.extra for g in rows],
+            "verdicts": _script_verdicts(results),
+            "ok": not message, "error": message}
+
+
+def _script_verdicts(results: list) -> list:
+    """The one-line-per-row summary that belongs in translate_report.json.
+
+    The field used to carry only [{"lang":..., "kind":...}] -- no verdict and no
+    counts, so a reader of translate_report.json learned nothing from it at all.
+    """
+    out = []
+    for row in results:
+        detail = row.get("detail") or {}
+        out.append({"lang": (row.get("extra") or {}).get("lang"),
+                    "kind": (row.get("extra") or {}).get("kind"),
+                    "ok": bool(row.get("ok")),
+                    "cells_examined": detail.get("cells_examined"),
+                    "block_tier_findings": detail.get("block_tier_findings"),
+                    "block_tier_by_class": detail.get("block_tier_by_class"),
+                    "baseline_tier_counts": detail.get("baseline_tier_counts"),
+                    "baseline_over": detail.get("baseline_over"),
+                    "baseline_unpinned": detail.get("baseline_unpinned"),
+                    "review_tier_counts": detail.get("review_tier_counts")})
+    return out
+
+
 def definition_schema(n_defs: int) -> dict:
     """05: the count lock. minItems == maxItems == n is what made a silent
     truncation impossible, and it stays exactly as it is.
@@ -981,87 +1068,29 @@ def definition_schema(n_defs: int) -> dict:
 
 
 def definition_prompt(lang: str) -> str:
-    """PROMPT V4, ported from 05_translate_definitions.py. The 22,734 existing
-    cells per language were produced by this text; changing a word makes the new
-    cells stylistically foreign to the old ones.
+    """The definition system prompt for `lang`. Depends on the LANGUAGE ONLY.
 
-    ONE EDIT, and it is the whole point of this function's signature (2026-08-26;
-    German went from a measured 5,124 characters to 5,134, i.e. +10 characters /
-    0.2% -- the "+50 characters, 1.0%" figure this comment and the artifact both
-    carried was never measured, and it was the number consumption rule 6's size
-    band was justified with): the last line used to interpolate n_defs, so the
-    "constant"
-    system prompt was a different string for every batch size -- 30 measured
-    payloads produced 7 distinct sha256 values, one per value of n, differing by
-    one or two characters. An explicit cache is keyed on exact content, so that
-    made one-cache-per-language impossible while looking like a formatting
-    detail. The count is stated in the user message and enforced by the schema's
-    minItems == maxItems, which is where it was always actually enforced.
+    The text now lives in the `prompts` package: `prompts.core.definition_core`
+    holds the byte-frozen PROMPT V4 that produced the 22,734 shipped cells per
+    language, and `prompts.blocks` holds the append-only enrichment blocks. The
+    active variant comes from `cfg.prompt_id` through `prompts.activate(cfg)`,
+    and its default is the frozen prompt, so a caller that never activates
+    anything gets exactly the bytes that were measured.
 
-    Any prompt function reachable from a cached request must therefore depend on
-    the LANGUAGE ONLY. test_prompt_is_constant is the thing that keeps it true.
+    It moved for one reason: a prompt pack has to be swappable in ONE place. As
+    long as this function and the bill and doctor and the cache key all reach
+    the same builder, G-PROMPT compares a live sha to a live sha. Two copies of
+    the text would have let it compare a stale sha to itself and report
+    agreement -- a gate certifying the thing it is not looking at.
+
+    Any prompt function reachable from a cached request must depend on the
+    language only: no count, no batch size, no correction instruction. An
+    explicit cache is keyed on exact content, and interpolating the object count
+    here made the "constant" prompt one string per batch size (30 measured
+    payloads, 7 distinct sha256 values). test_prompt_is_constant is the thing
+    that keeps it true.
     """
-    critical_rule = ""
-    if lang.lower() != "english":
-        critical_rule = f"""
-    **CRITICAL RULE: Both "lemma" and "gloss" MUST be in {lang}. Do NOT use English in your output, unless there is absolutely no way to express a concept in {lang}.**
-    """
-
-    system_prompt_base = f"""
-    You are a senior lexicographer creating a new Danish-{lang} dictionary specifically for **language learners**. Your translations must be clear, practical, and intuitive.
-
-    ### CORE TASK
-    For each Danish definition provided, you must generate a corresponding `lemma` and `gloss` in **{lang}**.
-
-    ### RULES FOR "lemma" (The {lang} headword):
-    1.  **Be a real word/phrase:** It must be a concise, common {lang} word or a widely used, natural-sounding fixed phrase.
-    2.  **Be practical, not overly technical:** AVOID purely grammatical descriptions. A conceptual hint is better than a niche technical term. If a grammatical term is widely understood by learners in the context of {lang} (e.g., a {lang} term for "noun suffix" when dealing with a suffix that forms nouns), it can be acceptable if truly the best and most concise fit.
-    3.  **Balance specificity, naturalness, and informativeness. Focus on DEFINITION'S CORE SEMANTICS:**
-        a.  **Capture Key Nuances:** The `lemma` should accurately reflect the specific and defining characteristics of THAT particular Danish definition.
-        b.  **Prioritize Natural & Common Usage:** Choose {lang} words/phrases that are natural and commonly used by native speakers.
-        c.  **Handling Multiple Meanings of Same Headword:** If multiple Danish definitions of the *same Danish headword* naturally map to the *same core {lang} lemma* (because it genuinely covers those nuances), you MAY reuse that lemma. Rely on distinct `glosses` for precise differentiation.
-        d.  **When to Be More Specific (Informativeness):** However, if a Danish definition highlights a *distinct, crucial aspect* (e.g., a specific skill, a combined action, or a specialized context) that a very general {lang} lemma would obscure, prefer a *slightly more specific (yet still natural and common)* {lang} lemma that better conveys this key information. For example, if a definition describes "kicking a ball with light force AND high control", a lemma reflecting both aspects is better than one reflecting only "light kicking" if a natural {lang} term for the combined concept exists.
-        e.  **Avoid Over-Simplification & Literal Traps:** Do NOT over-simplify the lemma to the point of losing essential semantic information from the Danish definition. Also, be cautious of being overly influenced by the literal translation of the *Danish headword itself* if the *definition* points to a more nuanced or specific meaning in {lang}. The definition is paramount.
-        f.   **Clarity for Learners:** Ultimately, the lemma (in conjunction with the gloss) should provide maximum clarity for a language learner.
-    4.  **Conciseness preferred:** Aim for brevity. Single words or short, common phrases in {lang} are ideal, but not at the cost of Rule 3's requirements.
-
-    ### RULES FOR "gloss" (The explanatory translation):
-    1.  **Be a clear, complete thought:** It must be a grammatically correct and natural-sounding sentence or a very clear, self-contained explanatory phrase in {lang}. Full sentences are preferred, but clarity and conciseness for the learner are paramount.
-    2.  **Be explanatory, focused, AND faithful:** It should clearly explain the meaning and usage context relevant to THAT specific definition, being faithful to the scope and nuances of the Danish original. AVOID over-explaining with information not directly implied by the Danish definition, but ensure all key semantic components of the Danish definition are represented in the {lang} gloss. Focus on direct translation and essential clarification in {lang}.
-    3.  **Match formality:** The tone of the gloss in {lang} should generally match the formality of the Danish definition.
-
-    ### OUTPUT FORMAT
-    Return pure JSON that **exactly matches the response schema**. The `definitions` array MUST have exactly as many objects as the user message states.
-    """
-
-    unified_example = f"""
-    ### EXAMPLE OF STRUCTURE (target language is {lang}):
-    Input Headword: "spille" (example headword, not necessarily from your data)
-    Input Definitions: {{
-        "0": "udføre musik på et instrument",
-        "1": "deltage i et spil for fornøjelses skyld",
-        "2": "i fodbold, aflevere bolden til en medspiller med præcis kontrol og ofte for at skabe en scoringsmulighed"
-    }}
-
-    Expected JSON Output Structure:
-    {{
-    "headword":"spille",
-    "definitions":[
-    {{
-        "lemma":"[A {lang} lemma for 'to play music']",
-        "gloss":"[A {lang} gloss explaining playing music on an instrument]."
-    }},
-    {{
-        "lemma":"[A {lang} lemma for 'to play a game']",
-        "gloss":"[A {lang} gloss explaining participating in a game for fun]."
-    }},
-    {{
-        "lemma":"[A {lang} lemma for 'to pass with control (football)', informative and natural phrase]",
-        "gloss":"[A {lang} gloss explaining the football-specific action of passing with control to create an opportunity, ensuring all key elements are covered]."
-    }}
-    ]}}
-    """
-    return f"{critical_rule}\n{system_prompt_base.strip()}\n\n{unified_example.strip()}"
+    return prompts.build_definition_prompt(lang)
 
 
 def expression_schema(n_items: int) -> dict:
@@ -1105,45 +1134,18 @@ def review_schema() -> dict:
 
 
 def expression_prompt(lang: str) -> str:
-    """06's generator prompt. The Russian clause exists because of a real
-    contamination incident; do not remove it.
+    """The expression system prompt for `lang`. Depends on the LANGUAGE ONLY.
 
-    Two edits (2026-08-26), for the same reason as definition_prompt:
+    Text in `prompts.core.expression_core` (frozen; the Russian clause exists
+    because of a real contamination incident) plus the two append-only blocks in
+    `prompts.blocks`, selected by the active prompt_id.
 
-      * `n_items` is gone from the last line -- the count is in the user message
-        and in the schema, and interpolating it here made the "constant" prompt
-        one string per batch size.
-      * the correction instruction is gone from the signature. It used to be
-        PREPENDED to the system prompt, which changes the cached prefix and so
-        forfeits the cache for exactly the requests that are being redone. It is
-        appended to the USER message now (see expression_user_payload), and the
-        automatic review-and-correct loop that generated it no longer exists:
-        review is a hand-run subcommand (owner decision D-08).
+    Deliberately NOT given an explicit cache in either variant: the enriched
+    expression prompt is around 640 tokens against a 1,024-token cache floor, so
+    qualifying would mean padding it to twice its size to buy a discount on
+    tokens that only exist because of the padding.
     """
-    system_prompt_base = f"""
-You are a senior lexicographer translating Danish fixed expressions and idioms into {lang} for a dictionary aimed at **language learners**.
-### CORE TASK
-For each Danish expression in the input, provide a `lemma` and a `gloss` in {lang}.
-### CONTEXT PROVIDED
-- `expr`: The Danish expression to translate.
-- `hint`: An optional Danish definition to clarify the expression's meaning. Use this hint to find the best translation, but do not translate the hint itself.
-### RULES FOR "lemma":
-- It must be the most natural and common equivalent idiom or phrase in {lang}.
-- If a direct idiom exists, prefer it. If not, use a concise, descriptive phrase.
-### RULES FOR "gloss":
-- It must be a full, explanatory sentence in {lang} that clarifies the meaning and usage of the Danish expression for a learner.
-### OUTPUT FORMAT
-Return pure JSON matching the schema. The `fixed_expressions` array MUST have exactly as many objects as the user message states.
-"""
-    critical_rules = ""
-    if lang.lower() != "english":
-        critical_rules = f"""
-**CRITICAL RULES: These are non-negotiable.**
-1.  The primary language for both "lemma" and "gloss" MUST be **{lang}**.
-2.  You must avoid all other languages. **DO NOT USE RUSSIAN under any circumstances.**
-3.  **AS A LAST RESORT, ONLY IF** a concept is truly untranslatable into {lang}, you are permitted to use a concise English word or phrase in the `gloss`. This should be extremely rare. Never use English in the `lemma`.
-"""
-    return f"{critical_rules.strip()}\n\n{system_prompt_base.strip()}"
+    return prompts.build_expression_prompt(lang)
 
 
 # --------------------------------------------------------------------------
@@ -1154,19 +1156,30 @@ def definition_user_payload(entry_label: str, rows: list,
                             correction: str = "") -> str:
     """The Danish side of one definition request.
 
-    Three things travel here and nowhere else: the headword label, the count
-    (the schema enforces it, the prompt refers to it), and DDO's per-sense
-    `grammar` note. The grammar block is emitted only when at least one row has
-    one, so an entry without grammar produces byte-identical bytes to before.
+    Four things travel here and nowhere else: the headword label, the source
+    dictionary's `pos_key`, the count (the schema enforces it, the prompt refers
+    to it), and DDO's per-sense `grammar` note. Both optional blocks are emitted
+    only when a row carries one, so a row without them produces byte-identical
+    bytes to before.
+
+    The pos_key line is what makes the rich prompt's part-of-speech block
+    executable. `entry_label` carries `pos_text` -- 38 long Danish display
+    forms, "substantiv pluralis" among them -- while the block's rules are
+    written against the 20 `pos_key` values, and its plural rule tests the
+    literal string `sb. pl.`, which no payload had ever contained. Four extra
+    tokens per request buys a block that was already being paid for on all
+    3,623 definition requests per language.
     """
     payload = {str(i): r["text"] for i, r in enumerate(rows)}
     grammar = {str(i): (r.get("grammar") or "").strip()
                for i, r in enumerate(rows) if (r.get("grammar") or "").strip()}
-    out = ('Headword: "%s"\n'
-           "Expecting exactly %d definition objects.\n"
-           "Input Definitions JSON:\n%s"
-           % (entry_label, len(payload),
-              json.dumps(payload, ensure_ascii=False, indent=2)))
+    pos_key = str((rows[0].get("pos_key") if rows else "") or "").strip()
+    out = ('Headword: "%s"\n' % entry_label
+           + ("Part of speech: %s\n" % pos_key if pos_key else "")
+           + ("Expecting exactly %d definition objects.\n"
+              "Input Definitions JSON:\n%s"
+              % (len(payload),
+                 json.dumps(payload, ensure_ascii=False, indent=2))))
     if grammar:
         out += ("\nGrammar notes from the source dictionary, keyed by the same "
                 "index (valency frames and number/register labels; translate "
@@ -1242,27 +1255,24 @@ def prompt_shas(lang: str) -> dict:
 
 
 def review_prompt(lang: str, json_string: str) -> str:
-    """06's reviewer. English gets its own wording, as in the original.
+    """06's inspector, rewritten to read the pack (patch plan N-02d).
 
-    NOTHING CALLS THIS ANY MORE -- see review_schema. The hand-run correction
-    pass uses the ordinary generator prompt plus a correction in the user
-    message, because a redo has to produce a translation, not a verdict.
+    The 2025 generator said "Never use English in the `lemma`" while this
+    inspector was told the allowed set was "the {lang} or English languages" and
+    asked to check "the lemma part". So an English lemma on a Chinese card was
+    reported CLEAN by the reviewer that existed to catch it, and 20 pinyin
+    lemmas shipped. The contradiction was two prose paragraphs disagreeing.
+
+    Both prompts now interpolate the SAME two pack fields --
+    `lemma_allowed_set` (no English) and `gloss_allowed_set` (a concise English
+    word as a last resort) -- and the G-SCRIPT gate reads those same fields. The
+    disagreement is now impossible to express, rather than merely discouraged.
+
+    NOTHING CALLS THIS ON THE DEFAULT PATH -- see review_schema. The hand-run
+    correction pass sends the ordinary generator prompt plus a correction in the
+    user message, because a redo has to produce a translation, not a verdict.
     """
-    if lang.lower() == "english":
-        allowed = "the English language"
-    else:
-        allowed = f"the {lang} or English languages"
-    return f"""
-You are a meticulous language quality inspector. Your only task is to detect if the lemma part of the following text contains any **CHARACTERS** that are NOT part of {allowed}.
-
-- You MUST ignore JSON structure characters like {{, }}, " and keys like "lemma", "gloss".
-- If no other languages are found, "contains_other_languages" must be false and "detected_words" must be an empty list.
-
-Text to inspect:
----
-{json_string}
----
-"""
+    return prompts.build_review_prompt(lang, json_string)
 
 
 def pos_schema(tags: list, lang: str) -> dict:
@@ -2434,6 +2444,7 @@ def review(cfg: Config, registry=None, lang: str | None = None,
         is still wrong, a human decides to run it again.
     """
     cfg.validate()
+    prompts.activate(cfg)
     if not lang:
         raise FatalError("review needs --lang: the flag files are per language")
     entries = read_json(cfg.json_dir / "entries.json")
@@ -2473,6 +2484,7 @@ def review(cfg: Config, registry=None, lang: str | None = None,
     transport_guard(cfg)
     stats = probe_stats(cfg)
     cfg.validate(spending=True, stats=stats)
+    report["consumption_rules"] = spend_gate(cfg, stats, [lang])
     fit = output_fit(stats=stats)
     pool = _pool_from_env(cfg)
     usage = UsageLog(sink=usage_sink,
@@ -2481,9 +2493,9 @@ def review(cfg: Config, registry=None, lang: str | None = None,
                       prompt_id=cfg.prompt_id, mode=cfg.mode,
                       violations_path=cfg.review_dir
                       / ("count_lock_violations_%s.json" % lang))
-    prov = _provenance(cfg.gemini_model, cfg.prompt_id, cfg.thinking_level)
-    prov_expr = _provenance(cfg.expressions_model, cfg.prompt_id,
-                            cfg.thinking_level)
+    eff = prompts.effective_prompt_id(lang)
+    prov = _provenance(cfg.gemini_model, eff, cfg.thinking_level)
+    prov_expr = _provenance(cfg.expressions_model, eff, cfg.thinking_level)
     redone = {"definitions": 0, "expressions": 0}
     usage_file = "review_usage_%s.json" % lang
     report_file = "review_report_%s.json" % lang
@@ -2524,6 +2536,31 @@ def review(cfg: Config, registry=None, lang: str | None = None,
                            usage_file=usage_file, report_file=report_file)
     write_json(cfg.report_dir / report_file, report)
     return report
+
+
+def spend_gate(cfg: Config, stats: dict, langs) -> list:
+    """Refuse the spend unless every blocking N-09 consumption rule passes.
+
+    CROSS-OWNER EDIT (crew B owns billing.py): `assert_ready_to_spend` and
+    `consumption_rules` had NO production caller at all. The only importer was
+    tests/test_money.py, this module did not import billing, and the paid path's
+    pre-flight was transport_guard + probe_stats + cfg.validate(spending=True)
+    -- none of which evaluates rule 6. So "the artifact was measured on
+    v4-frozen and the config says rich-core-1" was a rule that computed
+    correctly, reported blocking=True, and was never asked at the moment it
+    exists for. It is asked here, next to probe_stats, on both paid paths.
+
+    The prompt handed to rule 6 is the LONGEST definition prompt across the
+    run's languages -- the worst case for the size band, and the only prompt
+    family any probe ever measured. Sending the first language's would make the
+    check depend on config order.
+    """
+    from .. import billing                        # noqa: PLC0415 - import cycle
+    langs = list(langs) or [getattr(cfg, "langs", ["German"])[0]]
+    worst = max(langs, key=lambda lg: len(system_prompt("definition", lg)))
+    texts = {kind: system_prompt(kind, worst)
+             for kind in ("definition", "expression")}
+    return billing.assert_ready_to_spend(cfg, stats, prompts=texts)
 
 
 def transport_guard(cfg: Config) -> None:
@@ -2596,7 +2633,7 @@ DRY_PATH_WRITES = ("translations/<lang>/definitions.json (restored rows only)",
                    "translations/<lang>/archive.json (gc)",
                    "reports/translate_bill_<lang>.json",
                    "reports/translate_report.json",
-                   "reports/gates_report.json (G-ORPH)")
+                   "reports/gates_report.json (G-ORPH and G-SCRIPT)")
 
 
 def run(cfg: Config, registry=None, lang: str | None = None,
@@ -2606,9 +2643,11 @@ def run(cfg: Config, registry=None, lang: str | None = None,
     """Bill, then (with confirm) spend.
 
     `run(confirm=False)` IS NOT READ-ONLY, and the help text now says so: it
-    runs gc(), writes the files listed in DRY_PATH_WRITES and runs G-ORPH, which
-    can FatalError before a human ever sees the bill. "Nothing was sent" is
-    true; "nothing changed" is not. Snapshot work/ before the first dry run.
+    runs gc(), writes the files listed in DRY_PATH_WRITES and runs G-ORPH and
+    G-SCRIPT, either of which can FatalError. "Nothing was sent" is true;
+    "nothing changed" is not. Snapshot work/ before the first dry run. G-SCRIPT
+    raises only AFTER translate_report.json is written, so the bill stays
+    readable; G-ORPH still raises before it.
 
     `phase` exists for the batch transport, where one wave is two invocations
     (submit, then ingest hours later) and both of them are --confirm-spend runs.
@@ -2623,6 +2662,12 @@ def run(cfg: Config, registry=None, lang: str | None = None,
     again" after a crash silently rolled the whole redo back to the old model.
     """
     cfg.validate()
+    # The prompt variant for this run. Everything downstream -- the wire, the
+    # bill's prompt_sha256 block, the cache key, the ledger row -- reads the
+    # builder this points at, so there is exactly one prompt per (kind, lang)
+    # in the process. An unknown prompt_id raises here, BEFORE the bill: a run
+    # that cannot say which prompt it is sending must not price itself.
+    prompts.activate(cfg)
     retranslate_all = bool(retranslate_all or cfg.retranslate_all)
     if phase not in ("all", "submit", "ingest"):
         raise FatalError("phase = %r is not one of all, submit, ingest" % phase)
@@ -2672,8 +2717,15 @@ def run(cfg: Config, registry=None, lang: str | None = None,
     # The identity a resumed redo compares live rows against: same model, same
     # prompt pack, same thinking level, ANY date. Only meaningful on the redo
     # path -- on the incremental path src_sha already decides.
-    done_prefix = provenance_prefix(cfg.gemini_model, cfg.prompt_id,
-                                   cfg.thinking_level) if retranslate_all else ""
+    #
+    # PER LANGUAGE, because the effective prompt_id now carries the pack version
+    # and packs are per language. A single shared prefix would have made a
+    # resumed redo compare Chinese rows against a prefix built from another
+    # language's pack version and re-buy every one of them.
+    done_prefixes = {lg: (provenance_prefix(cfg.gemini_model,
+                                            prompts.effective_prompt_id(lg),
+                                            cfg.thinking_level)
+                          if retranslate_all else "") for lg in langs}
     # The measured constants, for the bill. Read on the DRY path too, because
     # spec 4.2(1) is a dry-run requirement: three dollar figures, offline. Missing
     # or unusable is not fatal HERE (the spend gate below is where it refuses)
@@ -2687,6 +2739,7 @@ def run(cfg: Config, registry=None, lang: str | None = None,
     rates, rates_note = rate_card_for(cfg)
 
     for lg in langs:
+        done_prefix = done_prefixes[lg]
         tdir = cfg.json_dir / "translations" / lg
         if do_gc:
             g = gc(cfg, lg, entries, scope)
@@ -2732,6 +2785,13 @@ def run(cfg: Config, registry=None, lang: str | None = None,
                     "model_expressions": cfg.expressions_model,
                     "mode": cfg.mode, "thinking_level": cfg.thinking_level,
                     "prompt_id": cfg.prompt_id,
+                    # The prompt_id names the block FAMILY; the pack is the rest
+                    # of the prompt. Both travel, because a pack edit changes
+                    # what the model is told and used to change nothing any
+                    # artifact, gate or ledger row could see.
+                    "pack_version": prompts.pack_version(lg),
+                    "pack_sha256": prompts.pack_sha256(lg),
+                    "effective_prompt_id": prompts.effective_prompt_id(lg),
                     # From system_prompt(), the same function CallContext builds
                     # the request with -- not a second reading of the prompt.
                     "prompt_sha256": prompt_shas(lg),
@@ -2766,7 +2826,8 @@ def run(cfg: Config, registry=None, lang: str | None = None,
               "--confirm-spend the existing rows are moved into archive.json "
               "with reason=%r and the archive is NOT read back. Rows that "
               "already carry this run's provenance (%s) are kept and NOT "
-              "re-billed." % (cfg.retranslate_reason, done_prefix))
+              "re-billed." % (cfg.retranslate_reason,
+                              ", ".join(sorted(set(done_prefixes.values())))))
     if not cfg.model_is_verified():
         print("  WARNING: model %s is not on the verified list; no measured "
               "constant and no price applies to it." % cfg.gemini_model)
@@ -2782,7 +2843,16 @@ def run(cfg: Config, registry=None, lang: str | None = None,
         report["note"] = ("bill only: no LLM module was imported and no request was "
                           "made. Re-run with --confirm-spend to place the calls.")
         report["dry_path_wrote"] = list(DRY_PATH_WRITES)
+        # Evaluate, record, WRITE, and only then raise. The dry path exists so a
+        # human can read the bill before spending; a gate that raised ahead of
+        # the report made the bill unreadable until somebody bumped a baseline.
+        gate = script_gates(cfg, langs, registry, raise_on_failure=False)
+        report["script_gate"] = gate["verdicts"]
+        report["script_gate_rows"] = gate["rows"]
+        report["script_gate_ok"] = gate["ok"]
         write_json(cfg.report_dir / "translate_report.json", report)
+        if not gate["ok"]:
+            raise FatalError(gate["error"])
         return report
 
     # ---------------- past this line, money is spent ----------------
@@ -2795,14 +2865,22 @@ def run(cfg: Config, registry=None, lang: str | None = None,
     # quote any level, but placing paid calls at a level whose thinking cost
     # nobody measured means the cap formula (no thinking term) does not apply.
     cfg.validate(spending=True, stats=stats)
+    # And the N-09 consumption rules, which nothing on this path used to ask.
+    report["consumption_rules"] = spend_gate(cfg, stats, langs)
     fit = output_fit(stats=stats)
     pool = _pool_from_env(cfg)
     model = cfg.gemini_model
     # Expressions, the POS table (and stage 50's ranking) may run on their own
     # model: short outputs whose failure mode is contamination, not truncation.
     expr_model = cfg.expressions_model
-    prov = _provenance(model, cfg.prompt_id, cfg.thinking_level)
-    prov_expr = _provenance(expr_model, cfg.prompt_id, cfg.thinking_level)
+    # PER LANGUAGE, because the pack is per language and the pack is part of the
+    # prompt: `gemini:<model>+rich-core-1.zh-1+LOW@<date>`. Under the frozen
+    # prompt the effective id is just `v4-frozen` -- LEAN reads no pack, so
+    # folding a version in would relabel cells whose text did not change.
+    provs = {lg: _provenance(model, prompts.effective_prompt_id(lg),
+                             cfg.thinking_level) for lg in langs}
+    provs_expr = {lg: _provenance(expr_model, prompts.effective_prompt_id(lg),
+                                  cfg.thinking_level) for lg in langs}
     # Per-call, fsync'd, append-only. This is the file that answers "what had
     # already been paid for?" after a crash; everything else is a roll-up of it.
     usage = UsageLog(sink=usage_sink,
@@ -2823,7 +2901,7 @@ def run(cfg: Config, registry=None, lang: str | None = None,
                 # produced stay live instead of being retired and bought again.
                 moved = archive_everything(defs, exprs, st["archive"],
                                            cfg.retranslate_reason,
-                                           keep_prefix=done_prefix)
+                                           keep_prefix=done_prefixes[lg])
                 write_json(tdir / "definitions.json", defs)
                 write_json(tdir / "expressions.json", exprs)
                 write_json(tdir / "archive.json", st["archive"])
@@ -2834,6 +2912,7 @@ def run(cfg: Config, registry=None, lang: str | None = None,
                                 cfg.retranslate_reason,
                                 moved["kept"]["definitions"],
                                 moved["kept"]["expressions"]))
+            prov, prov_expr = provs[lg], provs_expr[lg]
             ctx = CallContext(cfg=cfg, pool=pool, fit=fit, lang=lg, usage=usage,
                               prompt_id=cfg.prompt_id, mode=cfg.mode,
                               violations_path=cfg.review_dir
@@ -2899,6 +2978,8 @@ def run(cfg: Config, registry=None, lang: str | None = None,
     # money stack's to fill in from these counts and the rate card.
     report["waves"] = [{"mode": cfg.mode, "phase": phase,
                         "cache_name": None, "prompt_id": cfg.prompt_id,
+                        "effective_prompt_id": prompts.effective_prompt_ids(
+                            langs),
                         "thinking_level": cfg.thinking_level,
                         "languages": list(langs), **usage.totals(),
                         "cached_share": (usage.totals()["cached_tokens"]
@@ -2920,5 +3001,22 @@ def run(cfg: Config, registry=None, lang: str | None = None,
         report["drift"]["ledger_written_at_phase"] = phase
     else:
         report["drift"]["ledger_written_at_phase"] = None
+    # After the wave, on what the wave wrote. Every finding here is BLOCK tier:
+    # these rows carry this run's provenance, so the 2025 baselines do not cover
+    # them and must not.
+    #
+    # The ORDER is the fix: the money is spent, the drift ledger is already
+    # consumed, and this gate can fail. So the verdict goes into the report, the
+    # report goes to disk, and only then does the failure continue -- otherwise
+    # a failing wave left translate_report.json unwritten and the PREVIOUS run's
+    # file on disk describing a different run. gates_report.json already
+    # survived (run_gates writes before it raises); this run's waves, usage, api
+    # and drift blocks did not.
+    gate = script_gates(cfg, langs, registry, raise_on_failure=False)
+    report["script_gate"] = gate["verdicts"]
+    report["script_gate_rows"] = gate["rows"]
+    report["script_gate_ok"] = gate["ok"]
     write_json(cfg.report_dir / "translate_report.json", report)
+    if not gate["ok"]:
+        raise FatalError(gate["error"])
     return report

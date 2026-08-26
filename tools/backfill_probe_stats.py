@@ -456,6 +456,24 @@ def reconcile(stats: dict, raw: dict) -> list:
     return rows
 
 
+def live_pack_versions() -> dict:
+    """{language: {version, sha256}} for the packs installed right now.
+
+    Declared next to the prompt_id because the pack IS the prompt: `prompt_id`
+    names which blocks are assembled, the pack supplies most of their text, and
+    editing `fixed_renderings_table` changes what the model is told. Recording
+    only the family let a 60-character pack edit change the shipped prompt with
+    both halves of consumption rule 6 passing. Rule R6-pack-version compares
+    this declaration against the live packs, so a pack bump now needs the same
+    explicit --declare-prompt-id --rebase-measurement a family change needs.
+    """
+    try:
+        from ankidkdeck import prompts                # noqa: PLC0415
+        return prompts.pack_identity(prompts.available())
+    except Exception as exc:                          # noqa: BLE001
+        return {"_unavailable": str(exc)}
+
+
 def prompt_lineage(stats: dict, raw: dict, prompt_id: str,
                    rebased_from=None) -> dict:
     """The declaration consumption rule 6 needs, with its own counter-evidence.
@@ -486,6 +504,8 @@ def prompt_lineage(stats: dict, raw: dict, prompt_id: str,
         "measured_prompt_sha256": shas,
         "measured_prompt_chars": raw.get("prompt_chars_seen"),
         "measured_system_tokens": system,
+        # WHICH PACKS. Read by consumption rule R6-pack-version.
+        "pack_versions": live_pack_versions(),
         "size_band_basis": {
             "prompt_id": prompt_id,
             "by_family": families,
@@ -515,9 +535,10 @@ def prompt_lineage(stats: dict, raw: dict, prompt_id: str,
             "5,124: +10 characters, 0.2%%) and refuses an enrichment (5,124 -> "
             "~11,970 characters, +134%%)."
             % (len(shas), len(raw.get("prompt_sha256_per_n") or {}))),
-        "invalidated_by": ("any prompt_id change. The thinking constant, the "
-                           "prompt-token fit and the system prompt size are "
-                           "properties of one pack."),
+        "invalidated_by": ("any prompt_id change AND any pack_version change. "
+                           "The thinking constant, the prompt-token fit and the "
+                           "system prompt size are properties of one prompt "
+                           "TEXT, and the pack is most of that text."),
     }
     if rebased_from:
         out["rebased_from"] = rebased_from

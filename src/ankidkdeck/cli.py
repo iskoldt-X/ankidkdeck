@@ -425,7 +425,16 @@ def doctor(cfg) -> int:
              "kinds nobody measured" % (cfg.max_output_floor,
                                        cfg.max_output_unmeasured)
              if not cfg.max_output_tokens else cfg.max_output_tokens))
-    print("  prompt_id           %s" % cfg.prompt_id)
+    # Print the shas of the prompts THIS config would send, not the shas of
+    # the default prompt: cfg.prompt_id selects the variant, and a doctor that
+    # printed the frozen shas under a rich prompt_id would certify the wrong
+    # text right above the line that names the id.
+    from . import prompts as _prompts
+    _prompts.activate(cfg)
+    print("  prompt_id           %s   (variant %s, packs %s)"
+          % (cfg.prompt_id, _prompts.variant_for(cfg.prompt_id),
+             ", ".join("%s=%s" % (lang, _prompts.pack_version(lang))
+                       for lang in cfg.langs) or "-"))
     for lang in cfg.langs:
         shas = prompt_shas(lang)
         print("    %-9s def %s  expr %s"

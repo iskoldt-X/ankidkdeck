@@ -132,6 +132,19 @@ MEASURED_CONSTANTS = {
     "TEMPERATURE": None,
     "SCHEMA_SURFACE_VERIFIED": "responseSchema",
     "RANK_ENUM_HONOURED": True,
+    # WHICH PROMPT the constants above were measured on. These two were missing
+    # from this fixture while the real work/probes/stats.json has carried them
+    # since the N-09 backfill, and the difference stopped mattering the moment
+    # the paid paths started asking billing.assert_ready_to_spend: without them
+    # every confirmed run refuses itself on R6-prompt-id, which is the correct
+    # verdict for an artifact that does not say what it measured.
+    "prompt_id": "v4-frozen",
+    "prompt_lineage": {
+        "prompt_id": "v4-frozen",
+        "measured_prompt_chars": [5123, 5124],
+        "size_band_basis": {"prompt_id": "v4-frozen",
+                            "by_family": {"definition": [5123, 5124]}},
+    },
 }
 
 

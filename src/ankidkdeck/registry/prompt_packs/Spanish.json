@@ -1,0 +1,90 @@
+{
+  "_note": [
+    "Hand-reviewed prompt pack for the Spanish definition and expression prompts.",
+    "Mined from the 2025 corpus (13,518 definition cells, 8,590 expression cells)",
+    "by the same method as the Chinese pack; the measured basis for every value is",
+    "recorded in observations/v3-patch-crew-C.md.",
+    "Spanish is the most regular of the four target languages: capital-to-full-stop",
+    "holds in 99.9% of the shipped definition glosses (13,505 of 13,518; the 13",
+    "exceptions are all migrated:2025 cells, one of them a correctly punctuated",
+    "interrogative adverb). The gloss also opens with a",
+    "content word rather than an article (determiner-initial is 4.0%, against 35.8%",
+    "in English and 36.9% in German). Both are deliberate register, so the pack",
+    "pins them.",
+    "COVERAGE METHOD for fixed_renderings_table: each percentage is the share of",
+    "definition cells whose DANISH definition contains the left-hand formula (for",
+    "the frame rows, the `der` form: `person der`, `noget der`) and whose target",
+    "gloss contains the right-hand rendering. Stated because a reviewer read the",
+    "`der/som` label as the denominator and could not land on the value: the",
+    "`der|som` denominator gives 60.0 / 36.5 / 58.9% for noget and 76.5 / 81.1 /",
+    "73.2% for person (EN/DE/ES), i.e. the whole table would shift, not one row.",
+    "Re-derived 2026-08-26: the `der`-form numbers reproduce exactly.",
+    "Danish text in the worked examples is HAND-AUTHORED in DDO's editorial style.",
+    "No DDO source text is stored in this file."
+  ],
+  "pack_version": "es-1",
+  "allowed_scripts": "Latin letters including accented vowels and ñ, Spanish punctuation including the inverted marks, and Arabic digits",
+  "orthography_rules": "Write Spanish with its accents and with ñ: 18.4% of shipped lemmas carry an accented character, and an unaccented form is a spelling error, not a variant. Begin every `gloss` with a capital letter and end it with a single full stop -- 99.9% of shipped glosses do. Open the `gloss` with a content word, not with an article (determiner-initial is 4.0%).",
+  "lemma_charset_rule": "Spanish letters including accented vowels and ñ, plus spaces. No article, no digits, no quotation marks; hyphens are effectively absent (0.04%).",
+  "punctuation_rule": "ASCII punctuation plus the inverted marks the language requires. Commas 42.8% of glosses, semicolon 13.7% for a short synonym tail. Colons and slashes are effectively absent (under 0.4%); do not introduce them.",
+  "pos_vb": "Give the full infinitive in -ar, -er or -ir, adding -se only when the sense is genuinely reflexive (6.6% of verb lemmas). 66.5% of shipped verb lemmas end that way.",
+  "pos_sb": "Give the bare singular noun with no article (article-initial lemmas are 0.49%). A multiword noun lemma is normally built with `de` (13.7% of multiword lemmas).",
+  "pos_function": "Open the `gloss` with `Se usa`, `Se emplea` or `Indica` and name the function (`se`-initial covers 31.5% of function-word glosses, 86.3% for interjections).",
+  "worked_example_output": {
+    "headword": "træk",
+    "definitions": [
+      {
+        "lemma": "tirón",
+        "gloss": "Acción de mover algo hacia uno mismo usando fuerza."
+      },
+      {
+        "lemma": "corriente de aire",
+        "gloss": "Corriente de aire frío que se mueve por una habitación, por ejemplo desde una puerta abierta."
+      },
+      {
+        "lemma": "rasgo",
+        "gloss": "Cualidad característica de una persona o cosa, a menudo fácil de reconocer."
+      }
+    ]
+  },
+  "fixed_renderings_table": [
+    "fx              -> por ejemplo (51.9%, and it beats `p. ej.` 79:1)",
+    "el.lign.        -> o similar (24.9%) / similar (36.5%)",
+    "ofte            -> a menudo (72.8%)",
+    "især            -> especialmente (91.4%)",
+    "typisk          -> típicamente (34.3%)",
+    "evt.            -> posiblemente (54.6%)",
+    "dvs.            -> es decir (41.9%)",
+    "m.m. / osv.     -> etc. (72.4% / 71.7%)",
+    "undertiden      -> a veces",
+    "det at ...      -> el acto de ... (28.4%) / la acción de ...",
+    "person der/som  -> persona que ... (79.0%)",
+    "noget der/som   -> algo que ... (71.5%)",
+    "om person       -> refiriéndose a una persona (31.2%)",
+    "med hensyn til  -> en términos de / respecto a"
+  ],
+  "anti_patterns": [
+    "bad lemma el coche -> an article in the lemma; article-initial lemmas are 0.49% of the corpus -> good lemma coche",
+    "bad gloss una corriente de aire frio que se mueve por una habitacion -> a determiner opening, two missing accents, no capital and no full stop -> good gloss Corriente de aire frío que se mueve por una habitación.",
+    "bad lemma sufijo nominal -> a grammatical label instead of a concept (V4 lemma rule 2) -> good: name the meaning the element contributes",
+    "bad gloss Acción de mover algo hacia uno mismo usando fuerza, que en física se llama tensión. -> over-explaining past the Danish definition (V4 gloss rule 2) -> good gloss Acción de mover algo hacia uno mismo usando fuerza."
+  ],
+  "length_targets": [
+    "lemma: one word 66.2% of cells, two 20.0%, three 11.3%. Median 9 characters, 90th percentile 17.",
+    "gloss: 11 words is the median, 21 the 90th percentile, 33 the 99th; above 25 words needs a reason. Exactly one sentence, capital letter to a single full stop."
+  ],
+  "lemma_allowed_set": "Spanish letters including accented vowels and ñ, and spaces",
+  "gloss_allowed_set": "Spanish letters including accented vowels and ñ, Spanish punctuation including the inverted marks, Arabic digits, the Danish letters æ ø å when a Danish word is named, and rarely a concise English word",
+  "expr_worked_example_output": {
+    "fixed_expressions": [
+      {
+        "lemma": "tener agallas",
+        "gloss": "Significa ser una persona de carácter fuerte capaz de imponerse."
+      },
+      {
+        "lemma": "volverse loco",
+        "gloss": "Significa emocionarse muchísimo o perder por completo el control."
+      }
+    ]
+  }
+}

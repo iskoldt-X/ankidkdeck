@@ -367,7 +367,7 @@ def run(cfg: Config, registry=None, confirm: bool = False) -> dict:
     # ---------------- past this line, money is spent ----------------
     from .s42_translate import (CallContext, UsageLog, _pool_from_env,
                                 _provenance, output_fit, probe_stats,
-                                transport_guard)
+                                spend_gate, transport_guard)
 
     cfg.validate()
     # The same gate stage 42 has. This stage never runs in batch mode
@@ -378,6 +378,11 @@ def run(cfg: Config, registry=None, confirm: bool = False) -> dict:
     transport_guard(cfg)
     stats = probe_stats(cfg)
     cfg.validate(spending=True, stats=stats)
+    # CROSS-OWNER EDIT (crew B owns billing.py): the N-09 consumption rules had
+    # no production caller. Same call as stage 42's paid path, for the same
+    # reason -- doctor and the spend gate must not disagree about whether a
+    # configuration may place calls.
+    report["consumption_rules"] = spend_gate(cfg, stats, list(cfg.langs))
     # The ranking is a short permutation, not prose: it shares the expressions
     # model rather than the definition model (config.expressions_model), and it
     # always runs on the standard surface (see the module docstring).

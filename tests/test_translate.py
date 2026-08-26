@@ -862,3 +862,156 @@ def test_the_dry_path_imports_no_llm_module(cfg, registry):
     S42.run(cfg, registry, lang="German", confirm=False)
     S42.review(cfg, registry, lang="German", confirm=False)
     assert [m for m in sys.modules if m.startswith("google")] == []
+
+
+# ------------------------------------- crew C fix round: F2 and F7 (cross-crew)
+
+def test_a_failing_script_gate_still_leaves_the_paid_run_on_disk(cfg, registry,
+                                                                translator):
+    """F2. G-SCRIPT used to be evaluated between the drift ledger's irreversible
+    consumption and the single write of translate_report.json, and run_gates
+    raises. So a wave that had already been paid for lost its report entirely --
+    and left the PREVIOUS run's file on disk, describing a different run.
+
+    Order now: evaluate, record the verdict in the report, write the report,
+    then raise. The drift ledger's success-only consumption (crew A's 1.11) is
+    unchanged: it is still written before this, only on a run that got that far.
+    """
+    _workspace(cfg)
+    # every cell this run writes carries gemini:* provenance, so a forbidden
+    # class on one of them is BLOCK tier with no baseline -- reviewer A's
+    # end-to-end repro, reproduced from the gate's own findings.
+    from ankidkdeck import gates
+    real = gates.script_findings
+
+    def poisoned(cells, **kw):
+        found = real(cells, **kw)
+        if cells and kw.get("kind") == "definitions":
+            key = sorted(cells)[0]
+            found = found + [{"key": key, "lang": kw.get("lang"),
+                              "kind": "definitions",
+                              "class": "traditional_han", "tier": gates.BLOCK,
+                              "legacy": False, "fields": ["gloss"], "chars": ""}]
+        return found
+
+    gates.script_findings = poisoned
+    try:
+        with pytest.raises(FatalError) as err:
+            S42.run(cfg, registry, lang="German", confirm=True)
+    finally:
+        gates.script_findings = real
+    assert "G-SCRIPT" in str(err.value)
+
+    report = read_json(cfg.report_dir / "translate_report.json")
+    assert report["script_gate_ok"] is False
+    assert report["usage"]["requests"] == 2
+    assert report["waves"][0]["prompt_id"] == cfg.prompt_id
+    assert report["drift"]["ledger_written"] is True
+    # the per-call money records, and the gate's own detail, are on disk too
+    assert (cfg.report_dir / "translate_usage.jsonl").exists()
+    assert read_json(cfg.report_dir / "translate_usage.json")
+    verdicts = {(v["lang"], v["kind"]): v for v in report["script_gate"]}
+    assert verdicts[("German", "definitions")]["ok"] is False
+    assert verdicts[("German", "definitions")]["block_tier_findings"] == 1
+    gates_report = read_json(cfg.report_dir / "gates_report.json")
+    assert any(r["id"] == "G-SCRIPT" and not r["ok"]
+               for r in gates_report["results"])
+
+
+def test_a_failing_script_gate_on_the_dry_path_still_writes_the_bill(cfg,
+                                                                    registry):
+    """F2, the other half. The dry path exists so a human can read the bill
+    before spending. One drifted cell made the gate raise ahead of the report,
+    so the bill was unreadable until somebody bumped a baseline in
+    registry/gates.json -- refusing to spend is right, refusing to show the
+    bill is not."""
+    _workspace(cfg)
+    S42.run(cfg, registry, lang="German", confirm=False)
+    tdir = cfg.json_dir / "translations" / "German"
+    write_json(tdir / "definitions.json", {
+        # a Traditional character (U+52D5) in a cell this pipeline wrote
+        "11021722:21000001": {"lemma": "Haus", "gloss": "Ein \u52d5.",
+                              "src_sha": "a" * 64,
+                              "provenance": "gemini:x+v4-frozen+LOW@2026-08-27"}})
+    with pytest.raises(FatalError):
+        S42.run(cfg, registry, lang="German", confirm=False, do_gc=False)
+    report = read_json(cfg.report_dir / "translate_report.json")
+    assert report["script_gate_ok"] is False
+    assert report["bill"]["German"]["cells_total"] >= 1
+    assert (cfg.report_dir / "translate_bill_German.json").exists()
+
+
+def test_the_consumption_rules_actually_refuse_a_confirmed_run(cfg, registry,
+                                                              translator):
+    """F7 (cross-owner: crew B owns billing.py). billing.assert_ready_to_spend
+    and billing.consumption_rules had NO production caller -- the only importer
+    was tests/test_money.py, s42 did not import billing at all, and the paid
+    path's pre-flight was transport_guard + probe_stats + cfg.validate, none of
+    which evaluates rule 6. So "the artifact was measured on v4-frozen and the
+    config says rich-core-1" was a rule that computed correctly, reported
+    blocking=True, and was never asked at the moment it exists for.
+
+    The refusals come first, because a run that succeeds leaves nothing to
+    translate and the later cases would pass on an empty todo.
+    """
+    _workspace(cfg)
+    stats = read_json(cfg.probe_stats_path)
+
+    # 1. a rich prompt_id against an artifact measured on the frozen prompt.
+    #    This is the rule the whole prompt-pack exercise depends on.
+    cfg.prompt_id = "rich-core-1"
+    with pytest.raises(FatalError) as err:
+        S42.run(cfg, registry, lang="German", confirm=True)
+    assert "R6-prompt-id" in str(err.value)
+    cfg.prompt_id = "v4-frozen"
+
+    # 2. constants measured before the model was published. probe_stats does not
+    #    look at the date at all, so this refusal is new.
+    write_json(cfg.probe_stats_path,
+               dict(stats, measured_at="2026-08-12T23:59+02:00"))
+    with pytest.raises(FatalError) as err:
+        S42.run(cfg, registry, lang="German", confirm=True)
+    assert "R2-measured-at" in str(err.value)
+
+    # 3. the guard tools/backfill_probe_stats.py sets when the artifact is not
+    #    fit to authorise a spend. doctor read it; the spend path did not.
+    write_json(cfg.probe_stats_path,
+               dict(stats, CONSUMPTION_GUARD="basis relabelled by hand"))
+    with pytest.raises(FatalError) as err:
+        S42.run(cfg, registry, lang="German", confirm=True)
+    assert "R1-guard" in str(err.value)
+
+    # 4. a missing measured constant is refused too -- by probe_stats, which
+    #    R1-constants duplicates on purpose (see assert_ready_to_spend).
+    write_json(cfg.probe_stats_path,
+               {k: v for k, v in stats.items() if k != "EXPECTED_OUTPUT"})
+    with pytest.raises(FatalError) as err:
+        S42.run(cfg, registry, lang="German", confirm=True)
+    assert "EXPECTED_OUTPUT" in str(err.value)
+
+    # 5. and on the default path every blocking rule passes, with the rows in
+    #    the report so a reader can see what authorised the spend.
+    write_json(cfg.probe_stats_path, stats)
+    report = S42.run(cfg, registry, lang="German", confirm=True)
+    rules = {r["rule"]: r for r in report["consumption_rules"]}
+    assert rules["R6-prompt-id"]["ok"] is True
+    assert all(r["ok"] for r in rules.values() if r["blocking"]), rules
+    # LEAN reads no pack, so the pack rule cannot block there
+    assert rules["R6-pack-version"]["blocking"] is False
+    assert report["usage"]["requests"] == 2
+
+
+def test_the_bill_and_the_provenance_carry_the_pack_version(cfg, registry,
+                                                           translator):
+    """F6. `prompt_id` names the block family; the pack is the rest of the
+    prompt text. Under the frozen prompt the effective id is the bare
+    prompt_id -- LEAN reads no pack, so folding a version in would relabel cells
+    whose text did not change."""
+    _workspace(cfg)
+    report = S42.run(cfg, registry, lang="German", confirm=True)
+    bill = read_json(cfg.report_dir / "translate_bill_German.json")
+    assert bill["pack_version"] == "de-1"
+    assert bill["effective_prompt_id"] == "v4-frozen"
+    assert report["waves"][0]["effective_prompt_id"] == {"German": "v4-frozen"}
+    prov = report["languages"]["German"]["provenance"]
+    assert prov.startswith("gemini:gemini-3.7-flash+v4-frozen+LOW@")

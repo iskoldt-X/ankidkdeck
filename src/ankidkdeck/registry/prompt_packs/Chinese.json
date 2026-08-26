@@ -1,0 +1,90 @@
+{
+  "_note": [
+    "Hand-reviewed prompt pack for the Chinese definition and expression prompts.",
+    "Every value was mined from the 2025 corpus (13,518 definition cells, 8,590",
+    "expression cells) and then human-reviewed. The measured basis for each field",
+    "is recorded in observations/v3-patch-crew-C.md (mining table) and in",
+    "specs/v3-prompt-comparison.md section 4.1.",
+    "A pack only ENRICHES the prompt. A language with no pack file still runs:",
+    "the builder degrades to the frozen V4 skeleton (patch plan D-10 / N-03).",
+    "COVERAGE METHOD for fixed_renderings_table: each percentage is the share of",
+    "definition cells whose DANISH definition contains the left-hand formula (for",
+    "the frame rows, the `der` form: `person der`, `noget der`) and whose target",
+    "gloss contains the right-hand rendering. Stated because a reviewer read the",
+    "`der/som` label as the denominator and could not land on the value: the",
+    "`der|som` denominator gives 60.0 / 36.5 / 58.9% for noget and 76.5 / 81.1 /",
+    "73.2% for person (EN/DE/ES), i.e. the whole table would shift, not one row.",
+    "Re-derived 2026-08-26: the `der`-form numbers reproduce exactly.",
+    "Danish text in the worked examples is HAND-AUTHORED in DDO's editorial",
+    "style. No DDO source text is stored in this file (v3_final_plan.md sec 2).",
+    "allowed_scripts / lemma_charset_rule / lemma_allowed_set / gloss_allowed_set",
+    "are read by BOTH the prompt builder and the G-SCRIPT gate: the prompt and",
+    "the gate must never be able to disagree about what a legal character is."
+  ],
+  "pack_version": "zh-1",
+  "allowed_scripts": "Han characters, Chinese full-width punctuation, and Arabic digits",
+  "orthography_rules": "Use SIMPLIFIED Chinese only. Never emit Traditional forms (write 个 动 为 点 来 对 间 时 体 发, never 個 動 為 點 來 對 間 時 體 發). Never emit pinyin, tone marks, or any other phonetic transcription, in either field.",
+  "lemma_charset_rule": "Han characters only. No Latin letters, no digits, no parentheses, no punctuation of any kind.",
+  "punctuation_rule": "Full-width throughout the gloss: use ，and 。and 、and ；and （）, never their ASCII counterparts. Every gloss ends with a single 。",
+  "pos_vb": "Give the bare verb. Chinese has no infinitive particle, so nothing is stripped; do not add 去 or 来 as a particle.",
+  "pos_sb": "Give the bare noun with no measure word and no 的.",
+  "pos_function": "Chinese has no single-word equivalent for most Danish function words. Open the gloss with 用于 or 表示 and describe the function (measured: 表示 22.7% and 用于 19.3% of function-word glosses; 用于 37.3% for interjections).",
+  "worked_example_output": {
+    "headword": "træk",
+    "definitions": [
+      {
+        "lemma": "拉动",
+        "gloss": "指用力把某物朝自己的方向移动。"
+      },
+      {
+        "lemma": "穿堂风",
+        "gloss": "在房间内流动的冷空气，例如来自敞开的门。"
+      },
+      {
+        "lemma": "特征",
+        "gloss": "指人或事物的显著特点，通常容易辨认。"
+      }
+    ]
+  },
+  "fixed_renderings_table": [
+    "fx              -> 例如",
+    "el.lign.        -> ...等",
+    "ofte            -> 通常",
+    "især            -> 尤其是 / 特别是",
+    "typisk          -> 通常",
+    "evt.            -> 可能 (or 有时 when the sense is temporal)",
+    "dvs.            -> 即",
+    "m.m. / osv.     -> ...等",
+    "undertiden      -> 有时",
+    "det at ...      -> ...的行为",
+    "person der/som  -> ...的人",
+    "noget der/som   -> ...的事物 / ...的东西",
+    "om person       -> 指人 / 形容人",
+    "med hensyn til  -> 在...方面"
+  ],
+  "anti_patterns": [
+    "bad lemma 拉 for sense 2 of træk -> the literal meaning of the Danish headword, which that definition does not carry -> good lemma 特征",
+    "bad lemma 名词后缀 -> a grammatical label instead of a concept (V4 lemma rule 2) -> good: name what the element means",
+    "bad lemma 究竟 (jiū jìng) -> pinyin in the lemma; 20 such cells shipped in the 2025 expression corpus -> good lemma 究竟",
+    "bad gloss 指用力把某物朝自己的方向移動。 -> Traditional 動 in a Simplified gloss; 325 definition cells shipped this way in 2025 -> good gloss 指用力把某物朝自己的方向移动。",
+    "bad gloss 指用力把某物朝自己的方向移动，这在物理学中称为拉力，常见于机械装置。 -> over-explaining past the Danish definition (V4 gloss rule 2) -> good gloss 指用力把某物朝自己的方向移动。"
+  ],
+  "length_targets": [
+    "lemma: 2 Han characters is the norm (56.3% of cells), 3 or 4 when the sense needs it (36.6%). 5 characters or more is 4.7% and needs a reason.",
+    "gloss: 18 characters is the median, 33 the 90th percentile; above 45 needs a reason. Exactly one sentence, ending in a single 。 (99.9% of cells)."
+  ],
+  "lemma_allowed_set": "Han characters only",
+  "gloss_allowed_set": "Han characters, Chinese full-width punctuation, Arabic digits, the Danish letters æ ø å when a Danish word is named, and rarely a concise English word",
+  "expr_worked_example_output": {
+    "fixed_expressions": [
+      {
+        "lemma": "有骨气",
+        "gloss": "形容人意志坚强、敢于坚持自己的主张。"
+      },
+      {
+        "lemma": "彻底失控",
+        "gloss": "指变得极度兴奋或完全失去控制。"
+      }
+    ]
+  }
+}

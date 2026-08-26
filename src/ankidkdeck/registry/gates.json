@@ -27,5 +27,23 @@
   "tie_break_byte_order_max": 3,
   "_note_money_gates": "The two policy numbers of the money gates (patch plan 2.6), READ by gates.post_wave_gates through gates.read_gates_policy: change a value here and the verdict changes, which test_the_registry_policy_numbers_are_not_dead_data asserts. They were DEAD DATA for one review round -- no caller passed a policy dict, the module constants decided both gates, and editing a file a human had signed changed nothing. G-BILL passes when a wave cost no more than the quote x bill_tolerance_factor. G-CACHE passes when cached == declared on every request that should have been cached, OR sum(cached) / (declared x THE REQUESTS OF THE WAVE THAT SHOULD HAVE BEEN CACHED) >= cache_hit_min_share. The denominator is the wave, not the rows that happen to carry a cache name: dividing by the hits made 1 hit + 99 full-price fallbacks score 1.00 and pass. The audit's cached/prompt >= 0.90 criterion is measured WRONG (0.632 at n=20 on a wave whose cache hit 1.00) and must never come back. Both values are the patch plan's; like every other baseline in this file they need a human signature.",
   "bill_tolerance_factor": 1.1,
-  "cache_hit_min_share": 0.95
+  "cache_hit_min_share": 0.95,
+  "_note_script_gate": "G-SCRIPT baselines (patch plan 1.9 / N-05), READ by gates.script_gate_rows through gates.read_gates_policy. Three tiers: BLOCK is any forbidden class on a cell THIS pipeline wrote and has no tolerance; BASELINE is the same class on a 2025 cell (provenance migrated:*) and the pinned count below is its maximum; REVIEW is reported and never fails. Calibrated by running the shipped gate code over all 85,259 cells on disk on 2026-08-26 -- not an ad-hoc script, not by hand. Growing a number here means editing this file in the same commit as whatever grew it, exactly as for G-SUPPRESS and G-ADMIT. SHRINKING is reported and never fails, because the clean retranslation is supposed to take every one of these to zero: it rewrites each cell with gemini:* provenance, which moves the class from BASELINE to BLOCK by itself, with no second edit and nobody having to remember to tighten anything. The 325 Chinese definition cells are Traditional characters mixed into Simplified text (2.41%, 63 entries, 28 of them contaminated in every translated sense); the 20 expression cells are pinyin in the lemma; the 3 Chinese and 1 German cells are the four real defects three audits found by hand (Cyrillic lemma, Arabic gloss, Cyrillic gloss, and a Greek beta written where a German sharp s was meant). greek_in_lemma is NOT pinned here and its count is 0: the two Chinese cells that used to sit in it are the DDO entries `my` and `ny`, whose Chinese lemmas are phrases meaning 'Greek letter M' / 'Greek letter N' and whose glosses explain that same letter. Both the prompt's script contract and the gate now permit a Greek character in a lemma that NAMES the letter when the cell's own gloss mentions it -- entry-subject based, no per-entry whitelist -- and they report it as greek_subject_lemma at REVIEW. Without that, the clean redo had no way to translate those two entries at all: it rewrites them with gemini:* provenance, which moves the class to BLOCK, and the wave would FatalError at ingest with the money already spent. Script leakage is still BLOCK: a lemma that IS the bare Greek letter, or one where the letter is hugged by Latin letters, or one whose gloss never mentions it. Left OUT of this table on purpose: 11 greek_mention cells (three entries whose subject IS a Greek letter), 2 greek_subject_lemma cells and 64 latin_in_han_lemma cells (Chinese cross-references of the form 'see <Danish word>'), all REVIEW. A naive 'any character outside the target script' rule produces 17 FINDINGS on 15 cells here (two Greek-letter cells hit twice, once in the lemma and once in the gloss) and 13 of the 17 are those REVIEW classes -- a 76.5% false-positive rate per finding, 73.3% per cell, and the reason the tiers exist. Like every other baseline in this file these need a human signature.",
+  "script_baseline": {
+    "Chinese": {
+      "definitions": {
+        "forbidden_script": 3,
+        "traditional_han": 325
+      },
+      "expressions": {
+        "pinyin_in_lemma": 20,
+        "traditional_han": 22
+      }
+    },
+    "German": {
+      "definitions": {
+        "greek_latin_internal": 1
+      }
+    }
+  }
 }

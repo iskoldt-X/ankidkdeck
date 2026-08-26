@@ -22,6 +22,7 @@ detail alongside the verdict, so a passing gate still leaves evidence.
 
 import json
 import re
+import unicodedata
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from importlib import resources
@@ -84,6 +85,28 @@ G_SUPPRESS = "G-SUPPRESS"
 # demoted and land in G-ANCHOR's all_demoted_families, but `hr.` is `sb.` and is
 # invisible there.
 G_ADMIT = "G-ADMIT"
+# The offline CONTENT gate over the translation cells (patch plan 1.9 / N-05).
+# The one gate here that adjudicates what the model WROTE rather than what the
+# pipeline counted, and the only reason it can be trusted is that it was
+# calibrated against 85,259 shipped cells before it was allowed to have an
+# opinion:
+#
+#   naive rule ("any character outside the target script")  17 FINDINGS on 15
+#     cells, 4 real defects, 13 false positives (76.5% per finding, 73.3% per
+#     cell -- two Greek-letter cells hit twice, once in the lemma and once in
+#     the gloss) -- and the 13 are all cells of the three entries whose SUBJECT
+#     is a Greek letter, which have to carry one.
+#   this gate                                               0 false positives,
+#     because the discriminator is mechanical: a Greek letter INSIDE a run of
+#     Latin letters is contamination (one cell, a Greek beta written for a
+#     German sharp s), a standalone one is a mention.
+#
+# The class it exists for was invisible to every audit: 325 Chinese definition
+# cells (2.41%) and 22 expression cells carry Traditional characters mixed into
+# Simplified text, 28 entries have every translated sense contaminated, and the
+# failure is PER REQUEST -- one batch whose system prompt never said
+# "Simplified" and the whole batch drifts. The 2025 prompts never said it.
+G_SCRIPT = "G-SCRIPT"
 # The MONEY gates. Before these, ALL_GATE_IDS had 26 ids and not one of them was
 # about money, tokens, the cache, thinking or the prompt version -- i.e. the
 # whole gate framework adjudicated the deck and nothing adjudicated the only
@@ -124,7 +147,8 @@ ALL_GATE_IDS = (
     G_ADMIT, G_AFFIX, G_ANCHOR, G_ASSIGN, G_BILL, G_BIND, G_BUDGET, G_CACHE,
     G_CASE, G_COV, G_DET, G_EMPTY_C, G_GUID, G_LABEL, G_MEDIA, G_NOTE, G_ORDER,
     G_ORPH, G_OVERRIDE, G_PROMPT, G_RANK, G_RATE, G_REGKEY, G_REL, G_SCOPE_FROZEN,
-    G_SEED, G_SEP, G_SITEMAP, G_SITEMAP_INV, G_SUPPRESS, G_THINK, G_TIE,
+    G_SCRIPT, G_SEED, G_SEP, G_SITEMAP, G_SITEMAP_INV, G_SUPPRESS, G_THINK,
+    G_TIE,
 )
 
 # The money gates, as a set, so a caller can ask "has anything adjudicated this
@@ -211,8 +235,33 @@ def row_label(row: dict) -> str:
     return "%s[%s]" % (row.get("id"), inner)
 
 
-def run_gates(gates: Iterable[Gate], cfg, stage: str = "") -> list[dict]:
-    """Run every gate, write the merged report, then raise on any failure."""
+def failure_message(results: list[dict]) -> str:
+    """The FatalError text for a set of gate results, or "" when they all pass.
+
+    Factored out of run_gates so a caller that has to record the verdict before
+    the failure continues -- write the run's report first, then raise -- says
+    the same thing run_gates would have said.
+    """
+    failed = [r for r in results if not r["ok"]]
+    if not failed:
+        return ""
+    lines = ["  %s: %s -> %s" % (row_label(r), r["description"], r["detail"])
+             for r in failed]
+    return ("%d gate(s) failed; no output is valid until they pass:\n%s"
+            % (len(failed), "\n".join(lines)))
+
+
+def run_gates(gates: Iterable[Gate], cfg, stage: str = "",
+              raise_on_failure: bool = True) -> list[dict]:
+    """Run every gate, write the merged report, then raise on any failure.
+
+    `raise_on_failure=False` still evaluates and still writes the report; it
+    returns the results and leaves the raising to the caller. That exists for
+    one shape: a caller whose OWN report has to reach disk before the failure
+    propagates, because the alternative is a paid wave whose report was never
+    written while the previous run's file stays on disk describing a different
+    run.
+    """
     results = []
     for g in gates:
         ok, detail = g.fn()
@@ -220,14 +269,9 @@ def run_gates(gates: Iterable[Gate], cfg, stage: str = "") -> list[dict]:
                         "stage": g.stage or stage, "extra": dict(g.extra),
                         "ok": bool(ok), "detail": detail})
     _write_report(cfg, results)
-    failed = [r for r in results if not r["ok"]]
-    if failed:
-        lines = ["  %s: %s -> %s" % (row_label(r), r["description"], r["detail"])
-                 for r in failed]
-        raise FatalError(
-            "%d gate(s) failed; no output is valid until they pass:\n%s"
-            % (len(failed), "\n".join(lines))
-        )
+    message = failure_message(results)
+    if message and raise_on_failure:
+        raise FatalError(message)
     return results
 
 
@@ -663,6 +707,373 @@ def case_only_members(rows: list, max_n: int | None = None):
 
 
 _RESULTS_RE = re.compile(r"^(\d+) resultater$")
+
+
+# --------------------------------------------------------------------------
+# G-SCRIPT: the offline content gate over translations/<lang>/{definitions,
+# expressions}.json. Patch plan 1.9 + N-05.
+# --------------------------------------------------------------------------
+
+# The script blocks a target language MAY forbid. Which of them it DOES forbid
+# is derived per language in script_profile(), because this table is not a
+# universal truth: it names Hiragana, Katakana and Hangul, so hard-coding it
+# made Japanese or Korean a target language in which EVERY cell is a BLOCK-tier
+# finding and run_gates raises -- against D-10's promise that one language word
+# in the config runs the whole pipeline with no hand-prepared files.
+#
+# Greek is NOT here: three DDO entries ARE Greek letters, so their cells have to
+# carry one, and Greek gets its own two-way test below.
+_SCRIPT_BLOCKS = (
+    ("cyrillic", 0x0400, 0x052F),
+    ("hebrew", 0x0590, 0x05FF),
+    ("arabic", 0x0600, 0x06FF),
+    ("arabic", 0x0750, 0x077F),
+    ("devanagari", 0x0900, 0x097F),
+    ("thai", 0x0E00, 0x0E7F),
+    ("hangul", 0x1100, 0x11FF),
+    ("hangul", 0x3130, 0x318F),
+    ("hangul", 0xAC00, 0xD7AF),
+    ("hiragana", 0x3040, 0x309F),
+    ("katakana", 0x30A0, 0x30FF),
+)
+
+# How a pack's own prose names each block. `allowed_scripts`,
+# `lemma_allowed_set` and `gloss_allowed_set` are a lexicographer's words, not a
+# controlled vocabulary, so the match is on the names one would actually write.
+_SCRIPT_NAMED_BY = {
+    "cyrillic": ("cyrillic",),
+    "hebrew": ("hebrew",),
+    "arabic": ("arabic",),
+    "devanagari": ("devanagari",),
+    "thai": ("thai",),
+    "hangul": ("hangul", "korean"),
+    "hiragana": ("hiragana", "kana", "japanese"),
+    "katakana": ("katakana", "kana", "japanese"),
+}
+# "Arabic DIGITS" appears in all four shipped packs and is not the Arabic
+# script. One of the four defects three audits found by hand is an Arabic gloss
+# in a Chinese cell, so reading that phrase as permission would switch off the
+# check that catches it.
+_NOT_A_SCRIPT_PHRASE = ("arabic digit",)
+
+_GREEK = ((0x0370, 0x03FF), (0x1F00, 0x1FFF))
+_HAN = ((0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xF900, 0xFAFF))
+
+# Pinyin tone marks. A Han lemma carrying one of these, or a parenthesised
+# Latin run, is a romanisation -- 20 such cells shipped in the 2025 Chinese
+# expression corpus while pos_prompt had said "DO NOT include any pinyin" since
+# 2025 and the definition and expression prompts had never mentioned it.
+_TONE_MARKS = frozenset(
+    "\u0101\u00e1\u01ce\u00e0\u0113\u00e9\u011b\u00e8\u012b\u00ed"
+    "\u01d0\u00ec\u014d\u00f3\u01d2\u00f2\u016b\u00fa\u01d4\u00f9"
+    "\u01d6\u01d8\u01da\u01dc\u00fc")
+
+# BLOCK: zero tolerance on a cell this pipeline wrote. BASELINE: the same class
+# on a cell inherited from 2025, where the count is pinned in
+# registry/gates.json and growing it means editing that file in the same commit
+# (the G-SUPPRESS / G-ADMIT discipline). REVIEW: reported, never failed.
+_BLOCK_CLASSES = ("empty_field", "forbidden_script", "greek_in_lemma",
+                  "greek_latin_internal", "han_outside_the_target",
+                  "traditional_han", "pinyin_in_lemma")
+_REVIEW_CLASSES = ("greek_mention", "greek_subject_lemma",
+                   "latin_in_han_lemma")
+SCRIPT_CLASSES = _BLOCK_CLASSES + _REVIEW_CLASSES
+
+BLOCK, BASELINE, REVIEW = "BLOCK", "BASELINE", "REVIEW"
+
+# What marks a cell as inherited rather than written by this pipeline. A cell
+# whose provenance starts with any of these is 2025 material the baseline
+# absorbs; everything else -- every `gemini:` row a clean redo writes -- is held
+# to BLOCK. That is the whole mechanism: after the clean redo the baselines fall
+# to zero on their own and every class becomes zero-tolerance, with no second
+# edit and no human remembering to tighten anything.
+LEGACY_PROVENANCE_PREFIXES = ("migrated:",)
+
+
+def _in(ch: str, ranges) -> bool:
+    o = ord(ch)
+    return any(a <= o <= b for a, b in ranges)
+
+
+def _script_of(ch: str, blocks=_SCRIPT_BLOCKS):
+    o = ord(ch)
+    for name, a, b in blocks:
+        if a <= o <= b:
+            return name
+    return None
+
+
+def _is_latin_letter(ch: str) -> bool:
+    if not ch.isalpha():
+        return False
+    return "LATIN" in unicodedata.name(ch, "")
+
+
+def _greek_mentions(text: str) -> set:
+    """The Greek characters `text` MENTIONS: present, and not hugged by Latin
+    letters. The same discriminator the gloss check uses, factored out because
+    the lemma's verdict now reads it."""
+    out = set()
+    for i, ch in enumerate(text):
+        if not _in(ch, _GREEK):
+            continue
+        if ((i and _is_latin_letter(text[i - 1]))
+                or (i + 1 < len(text) and _is_latin_letter(text[i + 1]))):
+            continue
+        out.add(ch)
+    return out
+
+
+def _names_a_letter(lemma: str, ch: str) -> bool:
+    """Is `ch` part of a lemma that NAMES the letter, rather than the whole of
+    it? A lemma that is only the Greek character is script leakage, not a
+    lexicographic phrase, and stays a defect."""
+    rest = [c for c in lemma.strip() if not _in(c, _GREEK) and not c.isspace()]
+    return bool(rest)
+
+
+def _is_traditional(ch: str) -> bool:
+    """A Han character GB2312 cannot encode.
+
+    GB2312 covers Simplified only, so this is the cheapest available Simplified
+    test and it needs no character table in the repo. It over-reports: a few
+    rare Simplified characters are also outside GB2312, so the count is an UPPER
+    BOUND -- which is the right direction for a gate. Every one of the ten most
+    frequent hits in the shipped corpus was checked by hand and is a Traditional
+    form, not a rare Simplified one.
+    """
+    if not (0x4E00 <= ord(ch) <= 0x9FFF):
+        return False
+    try:
+        ch.encode("gb2312")
+    except (UnicodeEncodeError, LookupError):
+        return True
+    return False
+
+
+def script_profile(pack: dict | None) -> dict:
+    """Which language-specific checks apply, read off the PACK.
+
+    `allowed_scripts` and `lemma_allowed_set` are the same two pack fields the
+    prompt's script contract interpolates. Reading them here rather than keeping
+    a second table is the point: the 2025 pipeline shipped English lemmas on
+    Chinese cards because the generator prompt and the reviewer prompt were two
+    prose paragraphs that disagreed, and two prose paragraphs is exactly what a
+    gate with its own table would recreate.
+
+    A language with NO pack keeps only the universal checks. That is correct
+    rather than lenient: a brand-new target language must run with zero
+    hand-prepared files (D-10), and "no pack" means nobody has yet said what
+    that language's letters are -- so the gate says nothing about them either,
+    while still refusing Cyrillic in a Spanish cell.
+
+    "Says nothing" is now literal on both halves that used to make a POSITIVE
+    claim out of the pack's ABSENCE:
+
+      * `forbidden_scripts` is DERIVED. A pack that names Hiragana or Hangul as
+        one of its scripts removes that block from its own forbidden set, so a
+        Japanese or Korean target is a pack away rather than a rewrite away.
+      * `han_outside_the_target` is only asked when there IS a pack. Without
+        one, `han_allowed` was False and every Han character in the cell became
+        a BLOCK-tier finding -- so a Han-script target language with no pack
+        failed every cell of its first wave, at ingest, after the money.
+    """
+    pack = pack or {}
+    allowed = str(pack.get("allowed_scripts") or "").lower()
+    lemma_set = str(pack.get("lemma_allowed_set") or "").lower()
+    gloss_set = str(pack.get("gloss_allowed_set") or "").lower()
+    han_allowed = "han" in allowed
+    haystack = " ".join((allowed, lemma_set, gloss_set))
+    for phrase in _NOT_A_SCRIPT_PHRASE:
+        haystack = haystack.replace(phrase, " ")
+    named = {name for name, words in _SCRIPT_NAMED_BY.items()
+             if any(w in haystack for w in words)}
+    forbidden = tuple((name, a, b) for name, a, b in _SCRIPT_BLOCKS
+                      if name not in named)
+    return {
+        "has_pack": bool(pack),
+        "han_allowed": han_allowed,
+        # A Han-based lemma charset does not admit Latin letters unless the pack
+        # says so. For a Latin-script language the question does not arise.
+        "latin_in_lemma_allowed": (not han_allowed) or ("latin" in lemma_set),
+        "simplified_required": han_allowed,
+        "forbidden_scripts": forbidden,
+        "scripts_the_pack_names": tuple(sorted(named)),
+    }
+
+
+def script_findings(cells: dict, *, lang: str, kind: str, pack=None,
+                    legacy_prefixes=LEGACY_PROVENANCE_PREFIXES) -> list:
+    """One finding per (cell, class). Pure function of the cells and the pack.
+
+    Reads only `lemma`, `gloss` and `provenance`. It never reads the Danish
+    source text, so it cannot put DDO material into a report artifact.
+    """
+    profile = script_profile(pack)
+    blocks = profile["forbidden_scripts"]
+    out = []
+    for key in sorted(cells):
+        row = cells[key] or {}
+        lemma = str(row.get("lemma") or "")
+        gloss = str(row.get("gloss") or "")
+        prov = str(row.get("provenance") or "")
+        legacy = any(prov.startswith(pre) for pre in legacy_prefixes)
+        hits = {}
+
+        def hit(cls, field, ch=""):
+            slot = hits.setdefault(cls, {"fields": set(), "chars": set()})
+            slot["fields"].add(field)
+            if ch:
+                slot["chars"].add(ch)
+
+        # The characters this cell's GLOSS explains: a Greek letter that stands
+        # clear of Latin letters in the gloss is the gloss talking ABOUT the
+        # letter, which is the mechanical signature of an entry whose own
+        # subject is that letter. Computed before the field loop because the
+        # lemma's verdict depends on it -- see greek_subject_lemma below.
+        gloss_mentions = _greek_mentions(gloss)
+        if not lemma.strip() or not gloss.strip():
+            hit("empty_field", "lemma" if not lemma.strip() else "gloss")
+        for field, text in (("lemma", lemma), ("gloss", gloss)):
+            for i, ch in enumerate(text):
+                script = _script_of(ch, blocks)
+                if script:
+                    hit("forbidden_script", field, ch)
+                    continue
+                if _in(ch, _GREEK):
+                    latin_hugged = ((i and _is_latin_letter(text[i - 1]))
+                                    or (i + 1 < len(text)
+                                        and _is_latin_letter(text[i + 1])))
+                    if field == "gloss":
+                        hit("greek_latin_internal" if latin_hugged
+                            else "greek_mention", field, ch)
+                    elif latin_hugged:
+                        # A Greek letter inside a run of Latin letters is
+                        # contamination wherever it sits: a beta typed for a
+                        # German sharp s.
+                        hit("greek_latin_internal", field, ch)
+                    elif ch in gloss_mentions and _names_a_letter(lemma, ch):
+                        # THE two-cell case the clean redo would otherwise fail
+                        # on. The Chinese lemmas for the DDO entries `my` and
+                        # `ny` are phrases meaning "Greek letter M" / "Greek
+                        # letter N", and the gloss of each explains that same
+                        # letter -- so the entry's subject IS the character, and
+                        # the natural target lemma names it. The pipeline had no
+                        # way to translate those two entries without failing the
+                        # gate, at ingest, after the money.
+                        hit("greek_subject_lemma", field, ch)
+                    else:
+                        hit("greek_in_lemma", field, ch)
+                    continue
+                if _in(ch, _HAN):
+                    if not profile["han_allowed"]:
+                        if profile["has_pack"]:
+                            hit("han_outside_the_target", field, ch)
+                    elif profile["simplified_required"] and _is_traditional(ch):
+                        hit("traditional_han", field, ch)
+        if profile["han_allowed"] and not profile["latin_in_lemma_allowed"]:
+            latin = [ch for ch in lemma if _is_latin_letter(ch)]
+            if latin:
+                romanised = ("(" in lemma or "\uff08" in lemma
+                             or any(ch in _TONE_MARKS for ch in lemma))
+                hit("pinyin_in_lemma" if romanised else "latin_in_han_lemma",
+                    "lemma")
+        for cls, slot in hits.items():
+            if cls in _REVIEW_CLASSES:
+                tier = REVIEW
+            else:
+                tier = BASELINE if legacy else BLOCK
+            out.append({"key": key, "lang": lang, "kind": kind, "class": cls,
+                        "tier": tier, "legacy": legacy,
+                        "fields": sorted(slot["fields"]),
+                        "chars": "".join(sorted(slot["chars"]))})
+    return out
+
+
+def script_contract(findings: list, baseline=None, *, lang: str = "",
+                    kind: str = "", examples: int = 5):
+    """G-SCRIPT. Three tiers over one language's cells of one kind.
+
+    Fails when either is true:
+
+      1. ANY finding is BLOCK tier -- a class this dictionary forbids, on a cell
+         this pipeline wrote. There is no tolerance and no baseline for those:
+         the whole reason the baselines exist is so that this number can be
+         zero from the first run instead of after a cleanup nobody schedules.
+      2. A BASELINE class exceeds its pinned count, or has no pinned count at
+         all. An unpinned population is how 325 contaminated cells became
+         invisible for a year, and the fix is the same one G-SUPPRESS and
+         G-ADMIT use: the number lives in registry/gates.json and it is edited
+         in the same commit as whatever moved it.
+
+    SHRINKING a baseline is reported, never failed, and the asymmetry is the
+    point: the clean redo rewrites every cell, so every one of these baselines
+    is supposed to go to zero. A gate that failed on that would fail on success.
+    """
+    pinned = dict(baseline or {})
+    block = [f for f in findings if f["tier"] == BLOCK]
+    counts, review, over, unpinned, shrunk = {}, {}, [], [], []
+    for f in findings:
+        if f["tier"] == BASELINE:
+            counts[f["class"]] = counts.get(f["class"], 0) + 1
+        elif f["tier"] == REVIEW:
+            review[f["class"]] = review.get(f["class"], 0) + 1
+    for cls, n in sorted(counts.items()):
+        limit = pinned.get(cls)
+        if limit is None:
+            unpinned.append({"class": cls, "cells": n})
+        elif n > int(limit):
+            over.append({"class": cls, "cells": n, "baseline": int(limit)})
+    for cls, limit in sorted(pinned.items()):
+        got = counts.get(cls, 0)
+        if got < int(limit):
+            shrunk.append({"class": cls, "cells": got, "baseline": int(limit)})
+    ok = not block and not over and not unpinned
+    by_class = {}
+    for f in block:
+        by_class.setdefault(f["class"], []).append(f["key"])
+    return ok, {
+        "lang": lang, "kind": kind, "cells_examined": None,
+        "block_tier_findings": len(block),
+        "block_tier_by_class": {c: len(v) for c, v in sorted(by_class.items())},
+        "block_tier_examples": {c: v[:examples]
+                                for c, v in sorted(by_class.items())},
+        "baseline_tier_counts": counts,
+        "baseline_pinned": {k: int(v) for k, v in sorted(pinned.items())},
+        "baseline_over": over,
+        "baseline_unpinned": unpinned,
+        "baseline_shrunk_reported_not_failed": shrunk,
+        "review_tier_counts": review,
+    }
+
+
+def script_gate_rows(cfg, cells_by_kind: dict, *, lang: str, pack=None,
+                     policy=None, stage: str = "42") -> list:
+    """The Gate objects for one language: one row per kind, so a failing
+    definitions file cannot be hidden by a clean expressions file.
+
+    extra={"lang":..., "kind":...} keys the report row, which is what stops the
+    second language's PASS from overwriting the first language's FAIL.
+    """
+    baselines = _policy(policy, "script_baseline", {}) or {}
+    rows = []
+    for kind in sorted(cells_by_kind):
+        cells = cells_by_kind[kind] or {}
+        pinned = ((baselines.get(lang) or {}).get(kind) or {})
+
+        def make(kind=kind, cells=cells, pinned=pinned):
+            findings = script_findings(cells, lang=lang, kind=kind, pack=pack)
+            ok, detail = script_contract(findings, pinned, lang=lang, kind=kind)
+            detail["cells_examined"] = len(cells)
+            return ok, detail
+
+        rows.append(Gate(
+            G_SCRIPT,
+            "every lemma and gloss stays inside the target language's script "
+            "(three tiers: BLOCK on cells this run wrote, BASELINE on 2025 "
+            "cells, REVIEW for the rest)",
+            make, stage=stage, extra={"lang": lang, "kind": kind}))
+    return rows
 
 
 def _label_reconciles(label, n_articles) -> bool:

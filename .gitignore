@@ -9,7 +9,13 @@ wiktionary_danish_wordlist.txt
 
 # Registry files are the ONE tracked exception to the *.json rule above:
 # they contain only word identities and rules, never DDO text.
-!src/ankidkdeck/registry/*.json
+# The negation must be RECURSIVE. `registry/*.json` does not reach the
+# subdirectory registry/prompt_packs/, so the four hand-reviewed prompt packs
+# were silently unstageable: `git add` exited 0 and added nothing, `git status
+# --untracked-files=all` never listed them, and a commit prepared that way
+# ships a tree (and a wheel) with no packs at all -- where every RICH prompt
+# degrades to LEAN while prompt_id still reports rich-core-1.
+!src/ankidkdeck/registry/**/*.json
 
 # Runtime workspace (corpus, parses, ledgers, fixtures) - lives on the run host.
 work/

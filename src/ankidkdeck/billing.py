@@ -779,15 +779,31 @@ def estimated_prompt_tokens(text: str, stats: dict):
     return int(math.ceil(len(text) / ratio))
 
 
+def _pack_matches(declared, live) -> bool:
+    """Does one language's declaration match the pack that is installed?
+
+    Accepts the older shape (a bare version string) so an artifact written
+    before the sha was recorded still says something rather than everything.
+    """
+    if isinstance(declared, str):
+        return declared == (live or {}).get("version")
+    if not isinstance(declared, dict):
+        return False
+    if declared.get("version") != (live or {}).get("version"):
+        return False
+    want = declared.get("sha256")
+    return want is None or want == (live or {}).get("sha256")
+
+
 def consumption_rules(cfg, stats: dict, prompts: dict | None = None,
                       today=None) -> list:
     """The N-09 consumption rules, one row per CHECK: (id, spec_rule, ok,
     blocking, detail).
 
-    Nine rows for six spec rules, because three of the six decompose into
-    independently checkable halves (rule 1 -> the constants exist / the model
+    Ten rows for six spec rules, because three of the six decompose into
+    independently checkable parts (rule 1 -> the constants exist / the model
     matches / the measurement is not older than the model / the artifact carries
-    no consumption guard; rule 6 -> pack version and size band). `spec_rule` is
+    no consumption guard; rule 6 -> prompt family, PACK VERSION and size band). `spec_rule` is
     the authority for which plan rule a row belongs to. Spec rule 5 is not here:
     it is a POST-wave assertion and lives in gates.cache_hit_is_complete.
 
@@ -838,6 +854,49 @@ def consumption_rules(cfg, stats: dict, prompts: dict | None = None,
                  "version change invalidates them until somebody re-measures. "
                  "An artifact that does not declare which pack it was measured "
                  "on cannot authorise a spend on any pack.")})
+
+    # Rule 6, third half: the PACK. `prompt_id` names the block family; the
+    # pack is the rest of the prompt text, and editing `fixed_renderings_table`
+    # is editing what the model is told. Measured: a 60-character pack edit
+    # moved the Chinese rich prompt's sha while prompt_id stayed rich-core-1 and
+    # the size drifted 0.5% against this rule's 10% tolerance -- so both of the
+    # halves above passed a run that measured one prompt and sent another.
+    #
+    # Only asked for a variant that READS a pack. The frozen prompt does not
+    # (verified: a pack overlay moves none of the four frozen shas), so under
+    # v4-frozen this row is informational and never blocks: making it blocking
+    # there would refuse every spend on a text no pack can change.
+    declared_packs = (lineage_packs := ((stats or {}).get("prompt_lineage")
+                                        or {}).get("pack_versions"))
+    live_packs, pack_reads = {}, False
+    try:
+        from . import prompts as _prompts             # noqa: PLC0415
+        pack_reads = _prompts.variant_for(cfg.prompt_id) != _prompts.LEAN
+        live_packs = _prompts.pack_identity(
+            getattr(cfg, "langs", None) or [])
+    except Exception as exc:                          # noqa: BLE001
+        live_packs = {"_error": str(exc)}
+    # BOTH halves. The version is a human's claim, the sha is the fact: a pack
+    # edit that does not bump the version changes what the model is told,
+    # changes prompt_sha256, and leaves the version and the 10% size band
+    # exactly where they were. Comparing only the version would refuse the
+    # honest case and pass the dishonest one.
+    mismatch = (None if not pack_reads else
+                sorted(lg for lg, live in live_packs.items()
+                       if not _pack_matches((declared_packs or {}).get(lg),
+                                            live)))
+    add("R6-pack-version", "6",
+        (not pack_reads) or (isinstance(lineage_packs, dict) and not mismatch),
+        {"declared": declared_packs, "live": live_packs,
+         "prompt_reads_a_pack": pack_reads, "disagreeing_languages": mismatch,
+         "compares": "pack_version and the sha256 of the pack text",
+         "why": ("the pack IS the prompt: a pack bump changes prompt_sha256 and "
+                 "the thinking constant belongs to the text that was measured. "
+                 "Declare it the same way a prompt_id is declared -- "
+                 "tools/backfill_probe_stats.py --declare-prompt-id "
+                 "--rebase-measurement -- which is the explicit rebase this "
+                 "rule exists to require.")},
+        blocking=pack_reads)
 
     # The guard the backfill tool sets when the artifact is not fit to authorise
     # a spend. It had no reader at all: the tool's docstring said "doctor and the

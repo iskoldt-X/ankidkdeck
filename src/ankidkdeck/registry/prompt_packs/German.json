@@ -1,0 +1,88 @@
+{
+  "_note": [
+    "Hand-reviewed prompt pack for the German definition and expression prompts.",
+    "Mined from the 2025 corpus (12,947 definition cells -- 4.2% fewer than the",
+    "other languages -- and 8,589 expression cells) by the same method as the",
+    "Chinese pack; the measured basis for every value is recorded in",
+    "observations/v3-patch-crew-C.md.",
+    "One shipped cell substitutes a Greek beta for the German sharp s",
+    "(11036073:21056491, `äuβere` for `äußere`). That single cell is why the",
+    "script contract names both characters explicitly and why G-SCRIPT treats a",
+    "Greek letter inside a run of Latin letters as a BLOCK-tier defect.",
+    "COVERAGE METHOD for fixed_renderings_table: each percentage is the share of",
+    "definition cells whose DANISH definition contains the left-hand formula (for",
+    "the frame rows, the `der` form: `person der`, `noget der`) and whose target",
+    "gloss contains the right-hand rendering. Stated because a reviewer read the",
+    "`der/som` label as the denominator and could not land on the value: the",
+    "`der|som` denominator gives 60.0 / 36.5 / 58.9% for noget and 76.5 / 81.1 /",
+    "73.2% for person (EN/DE/ES), i.e. the whole table would shift, not one row.",
+    "Re-derived 2026-08-26: the `der`-form numbers reproduce exactly.",
+    "Danish text in the worked examples is HAND-AUTHORED in DDO's editorial style.",
+    "No DDO source text is stored in this file."
+  ],
+  "pack_version": "de-1",
+  "allowed_scripts": "Latin letters including ä, ö, ü and ß, German punctuation, and Arabic digits",
+  "orthography_rules": "Write German with its own letters: ä, ö, ü and ß. NEVER substitute the Greek letter β for ß -- one shipped cell reads äuβere where äußere was meant, and it is invisible at a glance. Write compounds as one word, not hyphenated (0.49% of shipped lemmas contain a hyphen). Begin the `gloss` with a capital letter and end it with a single full stop (80.7% of cells; verb glosses are the least regular bucket at 67.4% against 98.8% for nouns).",
+  "lemma_charset_rule": "German letters including ä, ö, ü and ß, plus spaces and rarely a hyphen. No article, no gender marker, no digits, no quotation marks.",
+  "punctuation_rule": "German punctuation with ASCII marks. Commas are the norm (65.7% of glosses -- the house shape is a noun phrase followed by a relative clause) and a semicolon may carry a short synonym tail (15.2%). Colons (0.25%) and slashes (0.32%) are effectively absent; do not introduce them.",
+  "pos_vb": "Give the bare lowercase infinitive: 95.9% of shipped verb-sense lemmas are lowercase and 85.9% end in -en, -ern or -eln. Keep `sich` when the verb is genuinely reflexive (7.1% of verb lemmas).",
+  "pos_sb": "Capitalise the noun, but NEVER add der, die or das and never mark gender: only 0.33% of shipped noun lemmas carry an article, and those 18 cells are defects. Write a compound as one word.",
+  "pos_function": "Open the `gloss` with `Wird` and name the use: 29.6% of function-word glosses and 80.1% of interjection glosses do this.",
+  "worked_example_output": {
+    "headword": "træk",
+    "definitions": [
+      {
+        "lemma": "Ziehen",
+        "gloss": "Der Vorgang, etwas mit Kraft zu sich hin zu bewegen."
+      },
+      {
+        "lemma": "Zugluft",
+        "gloss": "Ein Strom kalter Luft, der sich durch einen Raum bewegt, z.B. von einer offenen Tür."
+      },
+      {
+        "lemma": "Merkmal",
+        "gloss": "Eine charakteristische Eigenschaft einer Person oder Sache, oft eine, die leicht zu erkennen ist."
+      }
+    ]
+  },
+  "fixed_renderings_table": [
+    "fx              -> z.B. (59.6%, and it beats `zum Beispiel` 3:1)",
+    "el.lign.        -> o. Ä. (61.2%)",
+    "ofte            -> oft (85.7%)",
+    "især            -> besonders (68.1%) / insbesondere (24.7%)",
+    "typisk          -> typischerweise",
+    "evt.            -> eventuell (27.9%) / ggf.",
+    "dvs.            -> d.h. (45.0%)",
+    "m.m. / osv.     -> usw. (84.8% / 92.2%)",
+    "undertiden      -> manchmal",
+    "det at ...      -> der Vorgang, ... (11.0%)",
+    "person der/som  -> eine Person, die ... (87.5%)",
+    "noget der/som   -> etwas, das ... (52.1%)",
+    "om person       -> auf eine Person bezogen",
+    "med hensyn til  -> in Bezug auf (74.1%)"
+  ],
+  "anti_patterns": [
+    "bad lemma das Haus -> an article in the lemma; only 0.33% of shipped noun lemmas carry der, die or das, and every one of them is a defect -> good lemma Haus",
+    "bad gloss Das äuβere Ende einer Stange. -> a Greek beta standing in for the German sharp s; exactly one cell shipped this way in 2025 -> good gloss Das äußere Ende einer Stange.",
+    "bad lemma Zug-Luft -> a hyphenated compound; only 0.49% of shipped lemmas contain a hyphen -> good lemma Zugluft",
+    "bad gloss Der Vorgang, etwas mit Kraft zu sich hin zu bewegen, was in der Physik Zugkraft heißt. -> over-explaining past the Danish definition (V4 gloss rule 2) -> good gloss Der Vorgang, etwas mit Kraft zu sich hin zu bewegen."
+  ],
+  "length_targets": [
+    "lemma: one token is the norm (76.0% of cells), two 17.3%, three 5.6%. Median 10 characters, 90th percentile 17; the longest lemmas are solid compounds, which is correct.",
+    "gloss: 11 words is the median, 20 the 90th percentile, 32 the 99th; above 25 words needs a reason. Exactly one sentence, capital letter to a single full stop."
+  ],
+  "lemma_allowed_set": "German letters including ä, ö, ü and ß, spaces, and hyphens",
+  "gloss_allowed_set": "German letters including ä, ö, ü and ß, German punctuation including the low-9 and left double quotation marks, Arabic digits, the Danish letters æ ø å when a Danish word is named, and rarely a concise English word",
+  "expr_worked_example_output": {
+    "fixed_expressions": [
+      {
+        "lemma": "Rückgrat haben",
+        "gloss": "Willensstark sein und sich durchsetzen können."
+      },
+      {
+        "lemma": "total ausrasten",
+        "gloss": "Völlig begeistert sein oder die Kontrolle vollständig verlieren."
+      }
+    ]
+  }
+}
