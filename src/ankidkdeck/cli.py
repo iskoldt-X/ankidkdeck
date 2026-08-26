@@ -395,9 +395,10 @@ def doctor(cfg) -> int:
     non-zero when the run is not fit to spend.
     """
     from .config import VERIFIED_MODELS
-    from .stages.s42_translate import (REQUIRED_STATS_KEYS, missing_stats_keys,
-                                       prompt_shas, rate_card_for,
-                                       thinking_per_request)
+    from .stages.s42_translate import (CACHEABLE_KINDS, REQUIRED_STATS_KEYS,
+                                       missing_stats_keys, prompt_shas,
+                                       rate_card_for, thinking_per_request,
+                                       unmeasured_thinking_prior)
     problems = []
     print("--- effective spend configuration ---")
     print("  work_dir            %s" % cfg.work_dir)
@@ -481,6 +482,24 @@ def doctor(cfg) -> int:
         low = thinking_per_request(stats, "LOW", "p95")
         print("  thinking @ LOW      %s (p95)"
               % ("MISSING" if low is None else low))
+        # The measured zero is PROMPT-scoped, not level-scoped: the ranking
+        # prompt produced 236-275 thought tokens at the same LOW. So the bill
+        # books an unmeasured kind at a labelled prior, and the one output a
+        # human reads before --confirm-spend has to say which of the two numbers
+        # on that line is a measurement.
+        prior, prior_source = unmeasured_thinking_prior(stats)
+        print("  thinking @ LOW      %s/request on kinds NOBODY MEASURED "
+              "(expression, pos) -- a PRIOR, not a measurement" % prior)
+        print("    source            %s" % prior_source)
+        print("    scope of the 0    %s"
+              % ((stats.get("thinking") or {})
+                 .get("THINKING_PER_REQUEST_LOW_scope")
+                 or "NOT RECORDED -- the artifact states a bare zero"))
+        print("  cached input rate   applies to %s only (the measured "
+              "explicit-cache minimum is %s tokens; every other kind pays the "
+              "uncached rate in every scenario)"
+              % (", ".join(CACHEABLE_KINDS),
+                 (stats.get("wave2") or {}).get("EXPLICIT_CACHE_FLOOR")))
         # No fallback for the implicit floor: it is a DIFFERENT number from the
         # explicit one and the real artifact does not carry it, so printing a
         # source constant here would put an invented 4096 in the one output a

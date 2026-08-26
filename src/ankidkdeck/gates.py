@@ -20,9 +20,11 @@ A gate that cannot fail is not a gate: every helper below returns the measured
 detail alongside the verdict, so a passing gate still leaves evidence.
 """
 
+import json
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +84,35 @@ G_SUPPRESS = "G-SUPPRESS"
 # demoted and land in G-ANCHOR's all_demoted_families, but `hr.` is `sb.` and is
 # invisible there.
 G_ADMIT = "G-ADMIT"
+# The MONEY gates. Before these, ALL_GATE_IDS had 26 ids and not one of them was
+# about money, tokens, the cache, thinking or the prompt version -- i.e. the
+# whole gate framework adjudicated the deck and nothing adjudicated the only
+# irreversible act in the pipeline. Every one of the five has a specific
+# measured failure behind it:
+#
+#   G-BILL    the old bill counted the Danish payload and nothing else, which
+#             under-stated a clean redo by ~17x. A quote nobody checks against
+#             the invoice is a wish.
+#   G-THINK   thinkingLevel defaults to MEDIUM, measured at mean 578.7 (p95
+#             1,042) thought tokens per request against an n=20 batch's entire
+#             1,115-token cap. Derived thinking must be 0, and a non-zero row is
+#             how "we accidentally ran at MEDIUM" becomes visible.
+#   G-PROMPT  the constants, the cache and the bill are all properties of ONE
+#             prompt. Rows written with a second prompt are unbilled work.
+#   G-CACHE   the discount is the entire economic case for the explicit cache,
+#             and an expired or misplaced cache is a full-price wave.
+#   G-BUDGET  Google's project-level cap does NOT stop an already-submitted
+#             batch wave (measured: the same job submitted twice, both accepted,
+#             both billed), so the $10/month ceiling can only be enforced here.
+#   G-SCOPE-FROZEN  the refreeze reselects 22 guid_seeds and merges three alias
+#             pairs. Paying to translate a scope that is about to change is
+#             paying twice.
+G_BILL = "G-BILL"
+G_THINK = "G-THINK"
+G_PROMPT = "G-PROMPT"
+G_CACHE = "G-CACHE"
+G_BUDGET = "G-BUDGET"
+G_SCOPE_FROZEN = "G-SCOPE-FROZEN"
 
 # The declared set, so a report can say what it did NOT check. "11 gates PASS"
 # was read as a release verdict when it meant "11 rows are on file, 8 of them
@@ -90,11 +121,15 @@ G_ADMIT = "G-ADMIT"
 # adjudicates merge_report.sitemap_shortfall_families. A gate that never ran is
 # not a gate that passed.
 ALL_GATE_IDS = (
-    G_ADMIT, G_AFFIX, G_ANCHOR, G_ASSIGN, G_BIND, G_CASE, G_COV, G_DET,
-    G_EMPTY_C, G_GUID, G_LABEL, G_MEDIA, G_NOTE, G_ORDER, G_ORPH, G_OVERRIDE,
-    G_RANK, G_RATE, G_REGKEY, G_REL, G_SEED, G_SEP, G_SITEMAP, G_SITEMAP_INV,
-    G_SUPPRESS, G_TIE,
+    G_ADMIT, G_AFFIX, G_ANCHOR, G_ASSIGN, G_BILL, G_BIND, G_BUDGET, G_CACHE,
+    G_CASE, G_COV, G_DET, G_EMPTY_C, G_GUID, G_LABEL, G_MEDIA, G_NOTE, G_ORDER,
+    G_ORPH, G_OVERRIDE, G_PROMPT, G_RANK, G_RATE, G_REGKEY, G_REL, G_SCOPE_FROZEN,
+    G_SEED, G_SEP, G_SITEMAP, G_SITEMAP_INV, G_SUPPRESS, G_THINK, G_TIE,
 )
+
+# The money gates, as a set, so a caller can ask "has anything adjudicated this
+# spend?" without hard-coding six strings.
+MONEY_GATE_IDS = (G_BILL, G_BUDGET, G_CACHE, G_PROMPT, G_SCOPE_FROZEN, G_THINK)
 
 # Gates that are a HUMAN signature, not a script; they can never appear in
 # gates_report.json, so they are named here rather than silently missing.
@@ -868,3 +903,633 @@ def separator_golden(registry, fixtures_dir=None):
                         "misses": miss_expr},
         "min_correct_rate": SEP_MIN_CORRECT_RATE,
         "violations": problems}
+
+
+# --------------------------------------------------------------------------
+# The money gates (patch plan 2.4, 2.6, 2.7). Predicates first, then the two
+# builders a stage calls: pre_spend_gates() before the first paid call and
+# post_wave_gates() after a wave is in.
+#
+# Every predicate is a plain function over data so it can be tested without a
+# workspace, a stage or a transport -- and so the criterion that was measured
+# WRONG (cached/prompt >= 0.90) can be pinned as wrong by a test forever.
+# --------------------------------------------------------------------------
+
+# Defaults for the two policy numbers. registry/gates.json carries them so they
+# are reviewable next to the deck's other baselines; these are the fallbacks if
+# a caller passes no policy dict at all.
+BILL_TOLERANCE_FACTOR = 1.10        # patch plan 2.6: actual <= quoted x 1.10
+CACHE_HIT_MIN_SHARE = 0.95          # patch plan 2.6, second form of G-CACHE
+
+# The refreeze signature. A human writes it once, at the release freeze, after
+# the 22 guid_seed reselections and the three alias merges. Never written by
+# code: it is a signature, and a program that can sign for the human is not a
+# gate. Looked up in <work>/registry/ first so a run host can carry its own.
+REFREEZE_STAMP = "refreeze_stamp.json"
+
+
+def _policy(policy, key: str, default):
+    if isinstance(policy, dict) and policy.get(key) is not None:
+        return policy[key]
+    return default
+
+
+def read_gates_policy(cfg):
+    """registry/gates.json -- packaged defaults with the <work>/registry overlay
+    on top, through the same reader every other baseline in that file gets.
+
+    This exists because the two money policy numbers were DEAD DATA. They sat in
+    registry/gates.json under a `_note_money_gates` that declares the file a
+    human sign-off point, no production caller ever passed a policy dict, and the
+    values that actually decided G-BILL and G-CACHE were the module constants
+    below. Editing the file a human had signed changed nothing -- a review gate
+    that cannot change behaviour is worse than none, because it manufactures the
+    belief that those two numbers were reviewed.
+
+    The precedent is in the tree already: s40_migrate reads
+    `gates_cfg.get("tie_break_byte_order_max", 0)` off the same file.
+    """
+    from .registry import Registry              # noqa: PLC0415 - cycle-free
+    return dict(Registry(cfg).gates or {})
+
+
+def _packaged_registry(name: str):
+    """A registry file as it ships INSIDE the package, or None.
+
+    Addressed through the top-level package because this module's sibling is
+    itself called `registry` (registry.py), so files("ankidkdeck.registry")
+    resolves to the module and not to the data directory.
+    """
+    try:
+        ref = resources.files("ankidkdeck").joinpath("registry", name)
+        with ref.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, OSError, ValueError, ModuleNotFoundError):
+        return None
+
+
+def read_refreeze_stamp(cfg):
+    """The refreeze stamp, local copy winning, or None with the paths tried."""
+    local = Path(cfg.registry_local) / REFREEZE_STAMP
+    if local.exists():
+        return read_json(local, default=None), str(local)
+    packaged = _packaged_registry(REFREEZE_STAMP)
+    if packaged is not None:
+        return packaged, "package registry/%s" % REFREEZE_STAMP
+    return None, "%s or package registry/%s" % (local, REFREEZE_STAMP)
+
+
+def scope_is_frozen(stamp, families: int, card_keys=None, where: str = ""):
+    """G-SCOPE-FROZEN. No refreeze signature, no spending.
+
+    Two things have to be true, and the second is the one that makes the first
+    worth anything:
+
+      1. A stamp exists and its family count equals len(words.json). The
+         refreeze is the LAST scope change before release, so a stamp that
+         disagrees with the current scope is a stamp for a different deck.
+      2. card_keys.json ships inside the package and still has the row count the
+         stamp signed for. card_keys is the users' study progress -- a
+         guid_seed reselection after the signature is exactly the event this
+         gate exists to catch, and comparing row counts is what makes the stamp
+         a freeze rather than a date.
+
+    A missing stamp is a FAILURE, not a skip: "the refreeze has not happened
+    yet" is the state this gate is for, and it is the state the pipeline is in
+    until the release freeze.
+    """
+    rows = len(card_keys) if isinstance(card_keys, dict) else None
+    detail = {"stamp": where, "families_now": families,
+              "card_keys_rows_now": rows}
+    if not isinstance(stamp, dict):
+        detail["why"] = ("no refreeze stamp. The refreeze (22 guid_seed "
+                         "reselections + three alias merges) is a once-only "
+                         "pre-release step, and paying to translate a scope "
+                         "that is about to change is paying twice. Write "
+                         "registry/%s with {refrozen_at, families, "
+                         "card_keys_rows, by} after the freeze." % REFREEZE_STAMP)
+        return False, detail
+    detail.update({k: stamp.get(k) for k in
+                   ("refrozen_at", "families", "card_keys_rows", "by")})
+    problems = []
+    if not stamp.get("refrozen_at"):
+        problems.append("the stamp has no refrozen_at date")
+    if stamp.get("families") != families:
+        problems.append("the stamp signed for %r families, words.json has %d"
+                        % (stamp.get("families"), families))
+    if rows in (None, 0):
+        problems.append("card_keys.json is missing or empty inside the package")
+    elif stamp.get("card_keys_rows") is not None \
+            and stamp["card_keys_rows"] != rows:
+        problems.append("the stamp signed for %r card_keys rows, the package "
+                        "has %d -- the registry moved after the signature"
+                        % (stamp.get("card_keys_rows"), rows))
+    detail["violations"] = problems
+    return not problems, detail
+
+
+def budget_has_room(spent_usd, forecast_usd, cap_usd, period: str = "month",
+                    period_key: str = "", ledger_anomalies=None):
+    """G-BUDGET. period-to-date + this run's forecast must fit under the cap.
+
+    The forecast is not optional. A run that cannot be forecast cannot be
+    authorised: `None` here means the bill could not be priced, and the honest
+    answer to "will this fit in $10" is then "unknown", which is a refusal.
+
+    `ledger_anomalies` are the events that make period-to-date itself doubtful:
+    a stage usage file truncated, deleted or replaced since the ledger absorbed
+    it. The ledger now re-reads such a file from the top and the per-call uids
+    reconcile it, but a rotation may not be a silent event -- under-counting is
+    how money gets spent that nobody approved. So it refuses ONCE, on the run
+    that discovers it; the next run sees the new generation on file and passes.
+    """
+    detail = {"period": period, "period_key": period_key,
+              "spent_usd": spent_usd, "forecast_usd": forecast_usd,
+              "cap_usd": cap_usd,
+              "ledger_anomalies": list(ledger_anomalies or [])}
+    if detail["ledger_anomalies"]:
+        detail["why"] = (
+            "the spend ledger absorbed %d usage-file rotation(s) or "
+            "truncation(s) on this run, so the period-to-date total this cap is "
+            "checked against changed shape underneath it: %s. The rows were "
+            "re-read from the top and reconciled per call, but a spend is not "
+            "authorised against a total nobody has looked at. See "
+            "reports/spend_ledger.json:ingest_anomalies, then re-run."
+            % (len(detail["ledger_anomalies"]),
+               "; ".join(str(a.get("why"))
+                         for a in detail["ledger_anomalies"])))
+        return False, detail
+    if cap_usd is None:
+        detail["why"] = "no spend_cap_usd configured; the cap is the gate"
+        return False, detail
+    if forecast_usd is None:
+        detail["why"] = ("the bill has no dollar figure for the scenario this "
+                         "run would take, so the ceiling cannot be checked. "
+                         "An unpriced run is not a cheap run.")
+        return False, detail
+    total = round(float(spent_usd or 0.0) + float(forecast_usd), 6)
+    detail["would_total_usd"] = total
+    detail["headroom_usd"] = round(float(cap_usd) - total, 6)
+    if total > float(cap_usd):
+        detail["why"] = ("%.4f already spent this %s + %.4f forecast = %.4f > "
+                         "the %.2f cap. Google's project-level cap does not "
+                         "stop an already-submitted batch wave, so this "
+                         "arithmetic is the only thing that does."
+                         % (float(spent_usd or 0.0), period, float(forecast_usd),
+                            total, float(cap_usd)))
+        return False, detail
+    return True, detail
+
+
+def bill_within_ceiling(quoted_usd, actual_usd,
+                        factor: float = BILL_TOLERANCE_FACTOR):
+    """G-BILL. What was actually spent, against what the human accepted.
+
+    The tolerance is on the QUOTE, not on the ceiling: the number a human read
+    and approved was the scenario figure, and 10% is the band inside which a
+    forecast built from measured constants may miss.
+    """
+    detail = {"quoted_usd": quoted_usd, "actual_usd": actual_usd,
+              "tolerance_factor": factor}
+    if quoted_usd is None:
+        detail["why"] = "the run was never quoted, so nothing can be compared"
+        return False, detail
+    allowed = round(float(quoted_usd) * float(factor), 6)
+    detail["allowed_usd"] = allowed
+    detail["overrun_usd"] = round(float(actual_usd or 0.0) - allowed, 6)
+    ok = float(actual_usd or 0.0) <= allowed
+    if not ok:
+        detail["why"] = ("the wave cost more than the quote plus %.0f%%. Either "
+                         "the token model is wrong or the wave did something "
+                         "the bill did not describe."
+                         % ((float(factor) - 1) * 100))
+    return ok, detail
+
+
+def thinking_is_at_the_measured_level(rows, level: str = "LOW",
+                                      allowance: float = 0.0,
+                                      strict_kinds=("definition",),
+                                      alarm_at=None):
+    """G-THINK. Derived thinking per request, against what was measured.
+
+    At LOW the allowance is 0 and it is a MEASURED 0 -- 62 observations on the
+    definition prompt in the raw probe ledger, the thoughtsTokenCount field
+    absent every time, cross-checked against a MEDIUM arm where it was present.
+    A non-zero row there means the request did not go out at LOW, which is the
+    accident worth catching: unset means MEDIUM, MEDIUM was measured at mean
+    578.7 (p95 1,042) thought tokens per request, and the derived output cap has
+    no thinking term.
+
+    BUT THE MEASURED ZERO IS SCOPED TO THAT PROMPT, NOT TO THE LEVEL. In the
+    same ledger, at the same thinkingLevel=LOW, the homograph-ranking prompt
+    produced 236 and 275 thought tokens with the field PRESENT and
+    finishReason=STOP. So a gate that fails on ANY non-zero row would fail
+    every healthy ranking wave -- the same shape of mistake as the
+    cached/prompt criterion that G-CACHE had to abandon. Hence:
+
+      strict_kinds  the kinds whose LOW cost was measured (the definition wave,
+                    which is also the only kind whose OUTPUT was measured). A
+                    non-zero row here FAILS.
+      alarm_at      the MEDIUM band, read off the probe artifact. Any kind whose
+                    thinking reaches it FAILS -- that is "we are accidentally
+                    running at MEDIUM", whatever the request was.
+      otherwise     a non-zero row on an unmeasured kind is a WARNING carried in
+                    the detail: it is real, it is on file, and it is not
+                    grounds to call a wave broken on the strength of a constant
+                    nobody measured for it.
+    """
+    strict = set(strict_kinds or ())
+    violations, warnings = [], []
+    for row in rows:
+        value = float(row.get("thinking_tokens") or 0)
+        if value <= allowance:
+            continue
+        item = {"label": row.get("label"), "kind": row.get("kind"),
+                "thinking_tokens": row.get("thinking_tokens"),
+                "finish_reason": row.get("finish_reason")}
+        if (row.get("kind") or "") in strict:
+            violations.append(dict(item, why="measured 0 for this kind"))
+        elif alarm_at is not None and value >= float(alarm_at):
+            violations.append(dict(item, why="at or above the MEDIUM band (%s)"
+                                             % alarm_at))
+        else:
+            warnings.append(item)
+    values = sorted({int(r.get("thinking_tokens") or 0) for r in rows})
+    detail = {"requests": len(rows), "thinking_level": level,
+              "allowance_per_request": allowance,
+              "kinds_held_to_the_measured_zero": sorted(strict),
+              "medium_band_alarm_at": alarm_at,
+              "distinct_thinking_values": values[:20],
+              "violations": violations[:10],
+              "warnings": warnings[:10],
+              "warning_note": ("non-zero thinking on a kind nobody measured at "
+                              "this level: recorded, not failed. LOW was "
+                              "measured 0 on the definition prompt and 236-275 "
+                              "on the ranking prompt.") if warnings else None}
+    if violations:
+        detail["why"] = ("thinkingLevel is pinned to LOW and these requests "
+                         "thought anyway. Thinking is billed at the OUTPUT "
+                         "rate and shares maxOutputTokens with the answer.")
+    return not violations, detail
+
+
+def one_prompt_per_wave(rows, bill_shas=None, bill_prompt_id: str = "",
+                        cache_prompt_shas=None):
+    """G-PROMPT. Every row written by this run carries the bill's prompt.
+
+    Two independent readings, on purpose: the bill's sha comes from the prompt
+    builder at bill time, the row's sha comes from the request that was actually
+    sent. Comparing a copy of one reading against itself is how a prompt change
+    can pass a prompt gate.
+
+    THE CACHED PATH IS THE EXPECTED PATH, and on it the row has no sha of its
+    own. systemInstruction and cachedContent are mutually exclusive (hard 400),
+    so a cached request carries prompt_sha256 = None -- and this gate used to
+    `continue` past every one of them and report ok=True with the word "checked"
+    nowhere in its detail. On the one wave this program is actually going to run,
+    the sha half of G-PROMPT verified nothing and said nothing.
+
+    So a cached row's prompt identity is taken from THE CACHE instead, in order:
+
+      1. row["cache_prompt_sha256"]  the sha of the prompt that was put in the
+                                     cache object, stamped on the row by the
+                                     transport at cache-creation time. Preferred:
+                                     it is per row, so a wave that used two cache
+                                     objects is still checkable row by row.
+      2. cache_prompt_shas[name]     {cache resource name: prompt sha} handed to
+                                     the builder by the transport.
+
+    And `rows_checked` is ALWAYS reported, because two failures print as ok=True
+    without it. Both are refusals now:
+
+      * a row whose prompt sits in a CACHE whose sha nobody recorded. The prompt
+        exists, it went on the wire, and it is unverified.
+      * zero rows checked while the bill DID quote a sha for a kind in this wave.
+        "I verified nothing" and "everything verified" may not print the same
+        verdict -- the same anti-pattern G-CACHE was already forbidden from
+        (report n/a explicitly, never a quiet pass).
+
+    A call that legitimately has no system prompt and whose kind the bill quotes
+    no sha for (the manual review call) is still not a violation: there is
+    nothing to compare, and it says so in `kinds_the_bill_does_not_cover`.
+    """
+    shas = dict(bill_shas or {})
+    cache_shas = dict(cache_prompt_shas or {})
+    ids = sorted({r.get("prompt_id") or "" for r in rows})
+    mismatched, unknown_kind, unverifiable, blind = [], [], [], []
+    checked = 0
+    via = {"row_sha": 0, "cache_row_sha": 0, "cache_name_map": 0}
+    for row in rows:
+        got = row.get("prompt_sha256")
+        source = "row_sha"
+        if got is None:
+            got = row.get("cache_prompt_sha256")
+            source = "cache_row_sha"
+        if got is None and row.get("cache_name"):
+            got = cache_shas.get(row.get("cache_name"))
+            source = "cache_name_map"
+        quoted = shas.get(row.get("kind") or "")
+        if got is None:
+            item = {"label": row.get("label"), "kind": row.get("kind"),
+                    "cache_name": row.get("cache_name"),
+                    "the_bill_quotes_a_sha_for_this_kind": quoted is not None}
+            if row.get("cache_name"):
+                item["why"] = ("the prompt is inside cache %r and no sha was "
+                               "recorded for it, so it went on the wire "
+                               "unverified" % row.get("cache_name"))
+                blind.append(item)
+            else:
+                item["why"] = "no system prompt on this call"
+                unverifiable.append(item)
+            continue
+        if quoted is None:
+            unknown_kind.append(row.get("kind"))
+            continue
+        checked += 1
+        via[source] += 1
+        if got != quoted:
+            mismatched.append({"label": row.get("label"),
+                               "kind": row.get("kind"), "checked_via": source,
+                               "row_sha256": got, "bill_sha256": quoted})
+    id_ok = (not rows) or ids == [bill_prompt_id]
+    # Zero checked is only a pass when the bill quoted no sha for anything in
+    # this wave. If it quoted one and nothing was compared against it, the
+    # comparison did not happen.
+    quotable = any(shas.get(r.get("kind") or "") is not None for r in rows)
+    nothing_checked = bool(rows) and checked == 0 and quotable
+    detail = {"requests": len(rows), "bill_prompt_id": bill_prompt_id,
+              "row_prompt_ids": ids, "bill_shas": shas,
+              # The disclosure that was missing: a verdict without this number
+              # cannot be read.
+              "rows_checked": checked,
+              "rows_checked_via": via,
+              "rows_whose_cached_prompt_is_unverified": blind[:10],
+              "rows_whose_cached_prompt_is_unverified_count": len(blind),
+              "rows_with_no_system_prompt": len(unverifiable),
+              "rows_with_a_different_sha": mismatched[:10],
+              "kinds_the_bill_does_not_cover": sorted(set(unknown_kind)),
+              "prompt_id_consistent": id_ok}
+    if not id_ok:
+        detail["why"] = ("the rows and the bill disagree about which prompt "
+                         "pack this run used, and prompt_id is what the "
+                         "measured constants are indexed by")
+    elif blind:
+        detail["why"] = ("%d row(s) carried their system prompt inside an "
+                         "explicit cache whose prompt sha nobody recorded. The "
+                         "transport has to stamp cache_prompt_sha256 on the row "
+                         "at cache-creation time, or hand this gate a "
+                         "{cache_name: sha} map; otherwise the wave this program "
+                         "is actually going to run is the one wave G-PROMPT "
+                         "cannot check." % len(blind))
+    elif nothing_checked:
+        detail["why"] = ("the bill quotes a prompt sha for a kind in this wave "
+                         "and not one of %d row(s) was compared against it. A "
+                         "gate that checked nothing does not pass." % len(rows))
+    return (id_ok and not mismatched and not blind and not nothing_checked), \
+        detail
+
+
+def cache_hit_is_complete(rows, declared_cache_tokens=None,
+                          min_share: float = CACHE_HIT_MIN_SHARE,
+                          cache_expected: bool = False,
+                          cached_kinds=("definition",)):
+    """G-CACHE. cached == declared, per row -- NOT cached/prompt.
+
+    The audit's criterion was `cached/prompt >= 0.90` per row. It is measured
+    WRONG: on a fully cached wave the cached count is constant (1,135) while the
+    prompt grows with the payload, so the ratio slides from 0.935 at n=1 to
+    0.632 at n=20 and the criterion would condemn a perfectly healthy wave. The
+    quantity that means "the cache was used" is cached vs DECLARED, which was
+    1.00 on 30 of 30 batch rows and on every interactive arm.
+
+    THE DENOMINATOR IS THE WAVE, NOT THE HITS. The patch plan's formula is
+    sum(cached) / (declared x REQUESTS); this used to divide by the number of
+    rows that happened to carry a cache name, which makes the share a ratio of
+    the hits to themselves. Measured consequence: a 100-request definition wave
+    in which ONE row used the cache and 99 quietly fell back to an inlined
+    system prompt scored share = 1.00 and PASSED, while 99% of the requests paid
+    full price. That is the most likely real failure -- an expired cache cannot
+    be updated, only recreated, and a recreate changes the resource name, so
+    some jobs carry the new name and some fall back.
+
+    `cached_kinds` is what keeps the correct denominator from condemning a
+    healthy MIXED wave: the expression prompt is 336 tokens against a measured
+    1,024-token floor, so expression requests are uncached BY DESIGN and dividing
+    by every row of the wave would fail every real run. The denominator is
+    therefore every request of the wave THAT WAS SUPPOSED TO BE CACHED.
+
+    Reports n/a rather than passing when no cache was declared -- unless a cache
+    was CONFIGURED, in which case a wave with no cached tokens is the failure
+    the gate is for.
+    """
+    kinds = tuple(cached_kinds or ())
+    scope = [r for r in rows if (r.get("kind") or "") in kinds]
+    scope_basis = "kind in %s" % (list(kinds),)
+    if kinds and not scope and rows and not any(r.get("kind") for r in rows):
+        # Rows with no kind at all (a synthetic or legacy wave): hold the whole
+        # wave to the criterion rather than silently checking nothing.
+        scope, scope_basis = list(rows), "every row (no kind on any row)"
+    with_cache = [r for r in scope if r.get("cache_name")]
+    cached = [int(r.get("cached_tokens") or 0) for r in with_cache]
+    prompts = [int(r.get("prompt_tokens") or 0) for r in with_cache]
+    ratios = [round(c / p, 4) for c, p in zip(cached, prompts) if p]
+    detail = {"requests": len(rows),
+              # The disclosure fields: what the denominator was and how much of
+              # it was actually looked at. A share without these cannot be read.
+              "cached_kinds": list(kinds),
+              "rows_checked": len(scope),
+              "rows_checked_basis": scope_basis,
+              "requests_with_a_cache": len(with_cache),
+              "requests_without_a_cache": len(scope) - len(with_cache),
+              "declared_cache_tokens": declared_cache_tokens,
+              "min_share": min_share,
+              # Recorded as EVIDENCE, never as the criterion: this is the
+              # metric the audit proposed and the probes disproved.
+              "cached_over_prompt_range": ([min(ratios), max(ratios)]
+                                           if ratios else None),
+              "cached_over_prompt_note": ("not the criterion: 0.632 at n=20 on "
+                                          "a wave whose cache hit 1.00")}
+    if not with_cache or not declared_cache_tokens:
+        detail["checked"] = False
+        detail["verdict"] = "n/a"
+        if cache_expected:
+            detail["why"] = ("cache_enabled is set but no row carries a cache "
+                             "name or the wave declared no cached tokens, so "
+                             "this wave paid the full uncached rate while the "
+                             "configuration said otherwise")
+            return False, detail
+        return True, detail
+    declared = int(declared_cache_tokens)
+    exact = [c == declared for c in cached]
+    # len(scope), not len(with_cache): see the docstring.
+    share = round(sum(cached) / float(declared * len(scope)), 4)
+    detail.update({"checked": True, "rows_exactly_declared": sum(exact),
+                   "sum_cached_over_declared_x_requests": share,
+                   "misses": [{"label": r.get("label"),
+                               "cached_tokens": r.get("cached_tokens")}
+                              for r, ok in zip(with_cache, exact) if not ok][:10]})
+    ok = (len(with_cache) == len(scope) and all(exact)) \
+        or share >= float(min_share)
+    if not ok:
+        detail["why"] = ("cached != declared on %d row(s), %d of %d request(s) "
+                         "that should have been cached carried no cache at all, "
+                         "and the aggregate share %.4f is under %.2f. An "
+                         "expired, misplaced or unreferenced cache is a "
+                         "full-price wave."
+                         % (len(exact) - sum(exact),
+                            len(scope) - len(with_cache), len(scope),
+                            share, float(min_share)))
+    return ok, detail
+
+
+# ---- the two builders a stage calls -------------------------------------
+
+def pre_spend_gates(cfg, bill: dict, *, families: int, ledger=None,
+                    stage: str = "42") -> list:
+    """The gates that must pass BEFORE the first paid call of a run.
+
+    Call site (stage 42, immediately after probe_stats/validate and before the
+    first request):
+
+        from ..gates import pre_spend_gates, run_gates
+        run_gates(pre_spend_gates(cfg, bill, families=len(families)), cfg,
+                  stage="42")
+
+    `bill` is report["bill"] -- the same dict print_bill() just printed, so the
+    gate adjudicates the number the human read and not a second computation.
+
+    There is deliberately no `policy` parameter here (there used to be one, and
+    the function body never read it, which is how a dead parameter advertises a
+    capability that does not exist). Neither pre-spend gate has a registry policy
+    number: the cap is configuration (cfg.spend_cap_usd) and the refreeze stamp
+    is a human signature. The two numbers that ARE policy are read from
+    registry/gates.json by post_wave_gates.
+    """
+    from .billing import SpendLedger, forecast          # noqa: PLC0415
+    fc = forecast(bill, cfg)
+    led = ledger if ledger is not None else SpendLedger(cfg)
+    # Absorb anything the stage's own fsync'd usage files hold and the ledger
+    # has not seen: a wave that CRASHED still spent money, and month-to-date
+    # has to know before it authorises the next one. Safe to call even when the
+    # per-call sink was wired up -- the rows carry a per-call uid, so whichever
+    # door ran first owns the row.
+    absorbed = led.ingest()
+    spent = led.period_to_date()
+    stamp, where = read_refreeze_stamp(cfg)
+    card_keys = _packaged_registry("card_keys.json")
+    return [
+        Gate(G_SCOPE_FROZEN,
+             "the scope was refrozen and card_keys.json has not moved since",
+             lambda: scope_is_frozen(stamp, families, card_keys, where),
+             stage=stage),
+        Gate(G_BUDGET,
+             "period-to-date spend plus this run's forecast fits under the cap",
+             lambda: budget_has_room(
+                 spent["usd"], fc["usd"], cfg.spend_cap_usd,
+                 period=spent["period"], period_key=spent["period_key"],
+                 ledger_anomalies=absorbed.get("anomalies")),
+             stage=stage, extra={"scenario": fc["scenario"]}),
+    ]
+
+
+def billed_row(cfg, bill: dict, lang: str) -> dict:
+    """One language's bill, from the report dict, completed from the FILE.
+
+    report["bill"][lang] does not carry prompt_id or prompt_sha256 --
+    reports/translate_bill_<lang>.json does, and that file is the artifact the
+    human read before pressing --confirm-spend. Filling the gaps from disk is
+    what lets G-PROMPT compare the wire against the QUOTE rather than against
+    the configuration (which would agree with itself by construction).
+    """
+    row = dict((bill or {}).get(lang) or {})
+    if row.get("prompt_sha256") is None or row.get("prompt_id") is None:
+        path = Path(cfg.report_dir) / ("translate_bill_%s.json" % lang)
+        if path.exists():
+            disk = read_json(path, default={}) or {}
+            for key in ("prompt_sha256", "prompt_id", "dollars", "mode"):
+                if row.get(key) is None:
+                    row[key] = disk.get(key)
+    return row
+
+
+def post_wave_gates(cfg, bill: dict, rows, *, lang: str = "",
+                    declared_cache_tokens=None, cache_prompt_shas=None,
+                    stats=None, policy=None, stage: str = "42") -> list:
+    """The gates that adjudicate a wave that has already been paid for.
+
+    `rows` are the usage rows of THIS wave (stage 42's UsageLog.rows, or the
+    ledger lines it wrote). `bill` is the same report["bill"] the run quoted.
+
+    `policy` defaults to registry/gates.json (packaged + <work>/registry
+    overlay), so the two numbers a human signs in that file are the two numbers
+    the gates use. Pass a dict to override -- that is for tests, not for
+    production.
+
+    `cache_prompt_shas` is {cache resource name: sha of the prompt inside it},
+    from whoever created the cache. Without it, a wave whose rows carry no
+    cache_prompt_sha256 has no verifiable prompt identity and G-PROMPT refuses
+    instead of passing on an empty check.
+    """
+    from .billing import expected_scenario, rows_usd_priced  # noqa: PLC0415
+    if policy is None:
+        policy = read_gates_policy(cfg)
+    scenario = expected_scenario(cfg)
+    langs = [lang] if lang else sorted(bill)
+    billed = {lg: billed_row(cfg, bill, lg) for lg in langs}
+    quoted = 0.0
+    quotable = True
+    for lg in langs:
+        value = (billed[lg].get("dollars") or {}).get(scenario)
+        if value is None:
+            quotable = False
+        else:
+            quoted += float(value)
+    actual = rows_usd_priced(rows, default_model=cfg.gemini_model,
+                             default_mode=cfg.mode)
+    level = getattr(cfg, "thinking_level", "LOW")
+    allowance = 0.0
+    alarm_at = None
+    # MEASURED_OUTPUT_KINDS is the same set for the same reason: the definition
+    # wave is the one whose behaviour was probed, so it is the one a measured
+    # constant may be enforced against.
+    from .stages.s42_translate import (CACHEABLE_KINDS,  # noqa: PLC0415
+                                       MEASURED_OUTPUT_KINDS,
+                                       thinking_per_request)
+    strict_kinds = tuple(MEASURED_OUTPUT_KINDS)
+    if stats:
+        if level != "LOW":
+            allowance = float(thinking_per_request(stats, level, "p95") or 0.0)
+        # The band that means "this ran at MEDIUM". Read off the artifact, never
+        # hard-coded: without the measurement there is no band and unmeasured
+        # kinds are only warned about.
+        alarm_at = thinking_per_request(stats, "MEDIUM", "mean")
+    shas = {}
+    for lg in langs:
+        for kind, sha in (billed[lg].get("prompt_sha256") or {}).items():
+            shas[kind] = sha
+    quoted_prompt_id = (billed[langs[0]].get("prompt_id") if langs
+                        else None) or cfg.prompt_id
+    tol = _policy(policy, "bill_tolerance_factor", BILL_TOLERANCE_FACTOR)
+    share = _policy(policy, "cache_hit_min_share", CACHE_HIT_MIN_SHARE)
+    extra = {"lang": lang} if lang else {}
+    return [
+        Gate(G_BILL, "the wave cost no more than the quote plus the tolerance",
+             lambda: bill_within_ceiling(quoted if quotable else None,
+                                         actual["usd"], tol),
+             stage=stage, extra=extra),
+        Gate(G_THINK, "derived thinking per request is the measured value for "
+                      "the configured level",
+             lambda: thinking_is_at_the_measured_level(
+                 rows, level, allowance, strict_kinds, alarm_at),
+             stage=stage, extra=extra),
+        Gate(G_PROMPT, "every row carries the prompt id and sha the bill quoted",
+             lambda: one_prompt_per_wave(rows, shas, quoted_prompt_id,
+                                        cache_prompt_shas),
+             stage=stage, extra=extra),
+        Gate(G_CACHE, "cached tokens equal the declared cache on every row",
+             lambda: cache_hit_is_complete(
+                 rows, declared_cache_tokens, share,
+                 cache_expected=bool(getattr(cfg, "cache_enabled", False)),
+                 cached_kinds=tuple(CACHEABLE_KINDS)),
+             stage=stage, extra=extra),
+    ]

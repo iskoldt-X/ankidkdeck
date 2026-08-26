@@ -750,8 +750,20 @@ def test_the_bill_shows_three_dollar_figures_and_the_ceiling(cfg, registry,
                                                              monkeypatch):
     """Spec 4.2(1): cache-works / LEAN-uncached / RICH-uncached, offline, with
     the accepted ceiling, four languages. The tokens are computed here from the
-    measured constants; the RATE CARD is the money stack's, and until it lands
-    every figure is None with a stated reason rather than a plausible number."""
+    measured constants; the RATE CARD is the money stack's.
+
+    ONE LINE CHANGED BY CREW B: this used to assert that the dollar figures were
+    None because ankidkdeck/prices.py did not exist yet. It exists now, so the
+    figures are real, and the no-rate-card branch is asserted in
+    tests/test_money.py (dollar_figures with rates=None) -- where it does not
+    depend on a module being absent.
+
+    TWO LINES CHANGED BY THE CREW-B FIXER (review round, both reviewers): the
+    bill used to book thinking at 0 for EVERY kind and charge the cached input
+    rate to EVERY kind. Both were wrong in the direction that under-states the
+    only figure a human reads before pressing --confirm-spend, and correcting
+    them moved the four-language program from $9.78 to over the cap. The old
+    assertions are kept as the per-kind statements they were true of."""
     _workspace(cfg)
     report = S42.run(cfg, registry, lang="German", confirm=False)
     tokens = report["bill"]["German"]["tokens"]
@@ -760,15 +772,30 @@ def test_the_bill_shows_three_dollar_figures_and_the_ceiling(cfg, registry,
     assert tokens["lean_uncached"]["cached_input_tokens"] == 0
     assert (tokens["rich_uncached"]["uncached_input_tokens"]
             > tokens["lean_uncached"]["uncached_input_tokens"])
-    # thinking is a MEASURED zero, read off disk, not an assumed one
-    assert tokens["cache_works"]["thinking_tokens"] == 0
+    # thinking on the DEFINITION wave is a MEASURED zero, read off disk
     assert tokens["thinking_per_request_p95"] == 0.0
+    assert tokens["thinking_basis"]["definition"] == "measured_p95"
+    # ...and on a kind nobody measured it is a labelled PRIOR, not a zero. The
+    # measured 0 belongs to the definition PROMPT, not to thinkingLevel=LOW: the
+    # ranking prompt thought 236-275 tokens at the same level.
+    assert tokens["thinking_basis"]["expression"] == \
+        "unmeasured_conservative_prior"
+    assert tokens["thinking_per_request_unmeasured_kinds"] > 0
+    assert tokens["cache_works"]["thinking_tokens"] > 0
+    # only the definition prompt clears the measured 1,024-token cache floor, so
+    # the cached input rate may not be quoted for anything else
+    assert tokens["cacheable_kinds"] == ["definition"]
+    n_def = report["bill"]["German"]["definition_requests"]
+    assert (tokens["cache_works"]["cached_input_tokens"]
+            == n_def * tokens["system_tokens_lean"])
     money = report["bill"]["German"]["dollars"]
-    assert money["cache_works"] is None and "no rate card" in money["why"]
+    assert money["cache_works"] < money["lean_uncached"] < money["rich_uncached"]
+    assert money["rates"]["cached_input_usd_per_mtok"] == 0.075
     assert money["ceiling_usd"] == cfg.spend_cap_usd
     assert money["forbidden"] == "rich_uncached"
 
-    # ...and the same file lights up the moment prices.rate_card exists
+    # ...and a DIFFERENT rate card moves every figure: the bill reads the card,
+    # it does not carry one
     import sys
     import types
 

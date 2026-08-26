@@ -24,5 +24,8 @@
     "Dr", "Mrs", "ca", "frk", "hr", "kl", "kr", "ma", "mia", "mio", "mr",
     "no", "nr", "on", "oz", "pga", "phil", "st", "th"
   ],
-  "tie_break_byte_order_max": 3
+  "tie_break_byte_order_max": 3,
+  "_note_money_gates": "The two policy numbers of the money gates (patch plan 2.6), READ by gates.post_wave_gates through gates.read_gates_policy: change a value here and the verdict changes, which test_the_registry_policy_numbers_are_not_dead_data asserts. They were DEAD DATA for one review round -- no caller passed a policy dict, the module constants decided both gates, and editing a file a human had signed changed nothing. G-BILL passes when a wave cost no more than the quote x bill_tolerance_factor. G-CACHE passes when cached == declared on every request that should have been cached, OR sum(cached) / (declared x THE REQUESTS OF THE WAVE THAT SHOULD HAVE BEEN CACHED) >= cache_hit_min_share. The denominator is the wave, not the rows that happen to carry a cache name: dividing by the hits made 1 hit + 99 full-price fallbacks score 1.00 and pass. The audit's cached/prompt >= 0.90 criterion is measured WRONG (0.632 at n=20 on a wave whose cache hit 1.00) and must never come back. Both values are the patch plan's; like every other baseline in this file they need a human signature.",
+  "bill_tolerance_factor": 1.1,
+  "cache_hit_min_share": 0.95
 }

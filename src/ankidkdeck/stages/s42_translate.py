@@ -58,6 +58,7 @@ measured rather than reasoned:
 
 import dataclasses
 import datetime
+import itertools
 import json
 import math
 import os
@@ -492,6 +493,73 @@ def bill_row(todo: list, pos_todo: list) -> dict:
 BILL_SCENARIOS = ("cache_works", "lean_uncached", "rich_uncached")
 FORBIDDEN_SCENARIO = "rich_uncached"
 
+# The request kinds whose system prompt is over the measured explicit-cache floor
+# and may therefore be quoted at the CACHED input rate.
+#
+# The floor is 1,024 tokens, and it is the server's own number: a cache object
+# under it is refused with `400 INVALID_ARGUMENT ... 'Cached content is too
+# small. total_token_count=23, min_total_token_count=1024'`. The definition
+# prompt is 1,135 tokens and clears it. The expression prompt is ~336 tokens
+# today and ~512 in the frozen target, so it CANNOT be cached -- which means an
+# expression request pays the full uncached input rate in every scenario,
+# cache_works included.
+#
+# The bill used to charge the definition prompt's 1,135 tokens at the cached rate
+# for ALL 5,565 requests of a German clean redo, 1,922 of them expression
+# requests that provably cannot be cached. That under-stated the one column that
+# decides go/no-go while over-stating the fallback column -- i.e. the error had
+# opposite signs in the two figures, and the favourable sign landed on the
+# figure a human reads before pressing --confirm-spend.
+CACHEABLE_KINDS = ("definition",)
+
+# Thinking on a request kind NOBODY HAS MEASURED.
+#
+# The bill used to book 0 thinking tokens for every request, from
+# THINKING_PER_REQUEST_LOW.p95 = 0. That zero is real, but it is PROMPT-scoped
+# and not level-scoped: in the same probe ledger, at the same thinkingLevel=LOW,
+# the definition prompt (5,123 characters) produced 0 in 62 observations with the
+# thoughtsTokenCount field absent every time, while the homograph-ranking prompt
+# (1,503 characters) produced 236 and 275 thought tokens with the field PRESENT
+# and finishReason=STOP. The expression prompt is 1,376 characters -- nearer the
+# ranking prompt than the definition prompt -- and has never been probed at any
+# level.
+#
+# So an expression request's thinking is UNKNOWN, and "unknown" may not be
+# booked as zero on 1,922 requests per language: at the ranking prompt's measured
+# rate that is $0.99/language, $3.97 across four, which is the whole difference
+# between a program that fits under the $10 cap and one that does not. It is
+# booked at the highest LOW value anyone has measured, and the bill labels the
+# term `unmeasured_conservative_prior` so nobody reads it as a measurement.
+# One canary job on the expression wave replaces it with a real number.
+UNMEASURED_THINKING_PRIOR = 275
+UNMEASURED_THINKING_BASIS = "unmeasured_conservative_prior"
+MEASURED_THINKING_BASIS = "measured_p95"
+
+
+def unmeasured_thinking_prior(stats: dict | None) -> tuple:
+    """(tokens per request, where it came from) for an unmeasured request kind.
+
+    Prefers the artifact: THINKING_AT_LOW_BY_PROMPT_FAMILY carries the per-prompt
+    split the probe ledger actually supports, so a re-measurement reaches the
+    bill by landing on disk. The module constant is the floor under that, with
+    the same provenance, for an artifact written before the split existed.
+    """
+    families = ((stats or {}).get("thinking") or {}) \
+        .get("THINKING_AT_LOW_BY_PROMPT_FAMILY") or {}
+    seen = []
+    for key, value in families.items():
+        if not str(key).startswith("LOW|") or "definition" in str(key):
+            continue
+        top = (value or {}).get("max") if isinstance(value, dict) else None
+        if isinstance(top, (int, float)):
+            seen.append(float(top))
+    if seen:
+        return int(math.ceil(max(seen))), \
+            "THINKING_AT_LOW_BY_PROMPT_FAMILY (highest non-definition family)"
+    return UNMEASURED_THINKING_PRIOR, ("s42.UNMEASURED_THINKING_PRIOR (the "
+                                       "ranking prompt's measured maximum at "
+                                       "LOW)")
+
 
 def bill_requests(todo: list, pos_todo: list, lang: str) -> list:
     """One row per REQUEST that would be placed: its size, not its contents.
@@ -535,14 +603,22 @@ def bill_tokens(todo: list, pos_todo: list, lang: str,
     Tokens first, dollars second (spec 2.2). The token model, term by term:
 
       output           ceil(a*n + b) per request. MEASURED: 62 points, R2 0.985.
-      thinking         requests x THINKING_PER_REQUEST_LOW (p95). MEASURED 0 --
-                       and it has to be a measured 0, not an assumed one.
+      thinking         definition requests: THINKING_PER_REQUEST_LOW (p95), a
+                       MEASURED 0 and not an assumed one. Every OTHER kind: a
+                       labelled conservative PRIOR, because the measured zero is
+                       a property of the definition prompt and not of the level
+                       (see UNMEASURED_THINKING_PRIOR).
       definition input the measured total-prompt fit (pa*n + pb) minus the
                        measured system-prompt size: the payload+schema half
-                       that stays uncached when the cache works.
+                       that stays uncached when the cache works. This is the
+                       ONLY kind whose system half may be quoted at the cached
+                       rate (see CACHEABLE_KINDS).
       expression input ESTIMATED. The expression prompt's size has never been
                        probed, so its payload is source_chars / 4 and its system
-                       half is priced at the definition prompt's measured size.
+                       half is priced at the definition prompt's measured size --
+                       an over-statement of about 3.4x on that one term, in the
+                       deliberate direction, with the offline estimate reported
+                       next to it so the size of the over-statement is visible.
                        Said out loud in `basis` rather than blended into a
                        number that would look measured.
 
@@ -574,49 +650,92 @@ def bill_tokens(todo: list, pos_todo: list, lang: str,
                                              MAX_DEFS_PER_BATCH)),
                ("expression", _group_by_entry(todo, "expression",
                                               MAX_EXPR_PER_BATCH)))
+    prior, prior_source = unmeasured_thinking_prior(stats)
+    expr_offline = math.ceil(len(system_prompt("expression", lang))
+                             / CHARS_PER_TOKEN_ESTIMATE)
     out: dict = {"available": True, "thinking_per_request_p95": think,
                  "system_tokens_lean": lean, "system_tokens_rich": rich,
+                 # The two assumptions this bill is carrying, named where the
+                 # numbers are, because both of them used to be invisible.
+                 "cacheable_kinds": list(CACHEABLE_KINDS),
+                 "cache_floor_note": ("only the definition prompt (%s tokens) "
+                                      "clears the measured 1,024-token explicit "
+                                      "cache floor; expression and pos requests "
+                                      "pay the uncached input rate in EVERY "
+                                      "scenario" % lean),
+                 "thinking_per_request_unmeasured_kinds": prior,
+                 "thinking_basis": {"definition": MEASURED_THINKING_BASIS,
+                                    "expression": UNMEASURED_THINKING_BASIS,
+                                    "pos": UNMEASURED_THINKING_BASIS},
+                 "thinking_basis_source": {
+                     MEASURED_THINKING_BASIS:
+                         "thinking.THINKING_PER_REQUEST_LOW.p95",
+                     UNMEASURED_THINKING_BASIS: prior_source},
+                 "thinking_basis_note": (
+                     "the measured 0 is a property of the DEFINITION prompt, "
+                     "not of thinkingLevel=LOW: the ranking prompt produced "
+                     "236-275 thought tokens at the same level with the field "
+                     "present and finishReason=STOP. The expression prompt has "
+                     "never been probed, so its thinking is a PRIOR (%d "
+                     "tokens/request) and not a measurement. One canary job on "
+                     "the expression wave replaces it." % prior),
+                 "expression_system_tokens_priced_as": lean,
+                 "expression_system_tokens_offline_estimate": expr_offline,
+                 "expression_system_tokens_note": (
+                     "priced at the definition prompt's MEASURED %s tokens "
+                     "because the expression prompt was never probed; the "
+                     "offline estimate from its own text is %d tokens, so this "
+                     "term is over-stated by about %.1fx -- deliberately, and "
+                     "visibly" % (lean, expr_offline,
+                                  float(lean) / expr_offline if expr_offline
+                                  else 0.0)),
                  "basis": ("output and definition input are MEASURED "
                            "(EXPECTED_OUTPUT, PROMPT_TOKENS_fit, "
                            "PROMPT_TOKENS_system_only); expression and pos "
                            "input are ESTIMATED at %d chars/token, with the "
                            "definition prompt's measured size standing in for "
-                           "an expression prompt nobody has probed"
+                           "an expression prompt nobody has probed; expression "
+                           "and pos thinking is a labelled PRIOR"
                            % CHARS_PER_TOKEN_ESTIMATE)}
     for scenario in BILL_SCENARIOS:
         system = rich if scenario == "rich_uncached" else lean
-        cached = uncached = output = requests = 0
+        cached = uncached = output = requests = thinking = 0
         for kind, groups in batches:
+            # A measured constant is enforced only on the kind it was measured
+            # on; every other kind carries the prior.
+            per_request = (think if kind in MEASURED_OUTPUT_KINDS else prior)
+            cacheable = (scenario == "cache_works"
+                         and kind in CACHEABLE_KINDS)
             for _eid, batch in groups:
                 n = len(batch)
                 requests += 1
                 output += expected_output_tokens(n, fit)
+                thinking += int(math.ceil(per_request))
                 if kind == "definition":
                     payload = max(0, math.ceil(pfit[0] * n + pfit[1]) - lean)
                 else:
                     chars = sum(len(r["text"]) + len(r.get("grammar") or "")
                                 + len(r["hint"]) for r in batch)
                     payload = math.ceil(chars / CHARS_PER_TOKEN_ESTIMATE)
-                if scenario == "cache_works":
+                if cacheable:
                     cached += system
                     uncached += payload
                 else:
                     uncached += system + payload
         if pos_todo:
+            # "pos" is not in CACHEABLE_KINDS or in MEASURED_OUTPUT_KINDS: one
+            # request per language, uncached system prompt, prior thinking.
             requests += 1
+            thinking += int(math.ceil(prior))
             payload = math.ceil(sum(len(k) for k in pos_todo)
                                 / CHARS_PER_TOKEN_ESTIMATE)
             output += expected_output_tokens(len(pos_todo), fit)
-            if scenario == "cache_works":
-                cached += system
-                uncached += payload
-            else:
-                uncached += system + payload
+            uncached += system + payload
         out[scenario] = {"requests": requests,
                          "cached_input_tokens": cached,
                          "uncached_input_tokens": uncached,
                          "output_tokens": output,
-                         "thinking_tokens": int(math.ceil(requests * think))}
+                         "thinking_tokens": thinking}
     return out
 
 
@@ -733,6 +852,24 @@ def print_bill(bill: dict, model: str, expr_model: str | None = None,
             if money.get("over_ceiling"):
                 print("           OVER THE CEILING: %s"
                       % ", ".join(money["over_ceiling"]))
+        # The two assumptions inside those figures, printed where the figures
+        # are. Both used to be invisible, and both moved the total by more than
+        # the headroom: only the definition prompt may be quoted at the cached
+        # rate, and the thinking term on every other kind is a PRIOR.
+        toks = r.get("tokens") or {}
+        if toks.get("available"):
+            print("           cached rate applies to %s only (%s-token prompt "
+                  "vs the measured 1,024 floor); expression/pos system prompt "
+                  "is uncached in every scenario"
+                  % (", ".join(toks.get("cacheable_kinds") or ["nothing"]),
+                     toks.get("system_tokens_lean")))
+            print("           thinking: definition %s/request (%s), "
+                  "expression+pos %s/request (%s -- NOT measured, one canary "
+                  "job replaces it)"
+                  % (toks.get("thinking_per_request_p95"),
+                     (toks.get("thinking_basis") or {}).get("definition"),
+                     toks.get("thinking_per_request_unmeasured_kinds"),
+                     (toks.get("thinking_basis") or {}).get("expression")))
     print("  TOTAL %d cells across %d language(s)" % (total, len(bill)))
     print("  request ceiling includes transport retries; source tokens are the "
           "Danish payload only, not a bill")
@@ -848,8 +985,12 @@ def definition_prompt(lang: str) -> str:
     cells per language were produced by this text; changing a word makes the new
     cells stylistically foreign to the old ones.
 
-    ONE EDIT, and it is the whole point of this function's signature (2026-08-26,
-    +50 characters): the last line used to interpolate n_defs, so the "constant"
+    ONE EDIT, and it is the whole point of this function's signature (2026-08-26;
+    German went from a measured 5,124 characters to 5,134, i.e. +10 characters /
+    0.2% -- the "+50 characters, 1.0%" figure this comment and the artifact both
+    carried was never measured, and it was the number consumption rule 6's size
+    band was justified with): the last line used to interpolate n_defs, so the
+    "constant"
     system prompt was a different string for every batch size -- 30 measured
     payloads produced 7 distinct sha256 values, one per value of n, differing by
     one or two characters. An explicit cache is keyed on exact content, so that
@@ -1379,8 +1520,37 @@ def _usage_int(usage, snake: str, camel: str) -> int:
     return 0
 
 
+# A monotonic sequence number and a wall-clock stamp on every usage row. Two
+# rows describing two different PAID calls were otherwise byte-identical -- a
+# failed call has every count 0, and two identical retranslate requests produce
+# the same counts -- which broke the ledger in two measured ways:
+#
+#   * the ingest cursor recognised "still the same file" from ONE line's sha, so
+#     a usage file that was deleted and recreated with an identical prefix was
+#     resumed from the old offset: 8 rows on disk, 5 in the ledger, no warning.
+#   * a row could only be filed on the day it was INGESTED, so a wave that ran
+#     over midnight (or crashed and was absorbed later) landed in the wrong
+#     capped period.
+#
+# (seq, ts) fixes both: it is the row's own identity, so the ledger can dedupe
+# across its two entry points instead of double-counting, and it carries the
+# call's own date. `seq` restarts at 1 per process on purpose -- it orders one
+# run's calls; `ts` is what makes the pair unique across runs.
+_USAGE_SEQ = itertools.count(1)
+
+
+def usage_stamp() -> dict:
+    """{"ts", "seq"} for one usage row. Microseconds, UTC, monotonic sequence."""
+    return {
+        "ts": datetime.datetime.now(datetime.timezone.utc)
+        .isoformat(timespec="microseconds"),
+        "seq": next(_USAGE_SEQ),
+    }
+
+
 def normalize_usage(usage, *, model: str, label: str, kind: str = "",
                     mode: str = "standard", cache_name: str | None = None,
+                    cache_prompt_sha256: str | None = None,
                     prompt_id: str = "", finish_reason: str = "",
                     n_expected: int | None = None) -> dict:
     """One usage row, in the shape the ledger and the gates read.
@@ -1388,6 +1558,13 @@ def normalize_usage(usage, *, model: str, label: str, kind: str = "",
     Used by BOTH transports on purpose: the derived-thinking rule and the
     "cached is a SUBSET of prompt, never an addend" rule have to be implemented
     once or they will disagree.
+
+    `cache_prompt_sha256` is the sha of the system prompt that was put INSIDE
+    the explicit cache, known at cache-creation time. On the cached path
+    systemInstruction and cachedContent are mutually exclusive (hard 400), so
+    the row's own prompt_sha256 is None and G-PROMPT has nothing to compare --
+    it used to `continue` past every such row and report a green verdict on a
+    wave in which it checked nothing. This field is what it checks instead.
     """
     prompt = _usage_int(usage, "prompt_token_count", "promptTokenCount")
     cached = _usage_int(usage, "cached_content_token_count",
@@ -1396,9 +1573,11 @@ def normalize_usage(usage, *, model: str, label: str, kind: str = "",
     total = _usage_int(usage, "total_token_count", "totalTokenCount")
     tools = _usage_int(usage, "tool_use_prompt_token_count",
                        "toolUsePromptTokenCount")
-    return {
+    row = dict(usage_stamp())
+    row.update({
         "label": label, "kind": kind, "model": model, "mode": mode,
         "prompt_id": prompt_id, "cache_name": cache_name,
+        "cache_prompt_sha256": cache_prompt_sha256,
         "finish_reason": finish_reason, "n_expected": n_expected,
         "prompt_tokens": prompt,
         # A SUBSET of prompt_tokens. Adding the two is the single easiest way to
@@ -1409,7 +1588,8 @@ def normalize_usage(usage, *, model: str, label: str, kind: str = "",
         "tool_use_tokens": tools,
         "thinking_tokens": derived_thinking(usage),
         "total_tokens": total,
-    }
+    })
+    return row
 
 
 def append_jsonl(path, obj) -> None:
