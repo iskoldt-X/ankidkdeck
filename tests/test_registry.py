@@ -117,6 +117,43 @@ def test_the_shipped_registry_carries_no_pre_release_since(registry):
         assert not PRE_RELEASE.search(str(row.get("since", ""))), (fid, row)
 
 
+def test_the_upstream_dead_audio_registry_is_reviewable_and_baselined(registry):
+    """known_missing_audio.json excuses a declared audio slot from the only gate
+    that adjudicates it (both halves of G-MEDIA), so every row has to be
+    reviewable BY A HUMAN and the population has to be pinned.
+
+    Row count == baseline is the bump-in-the-same-commit rule, in the suite: a
+    fifth row with the number untouched fails here as well as at the gate. The
+    evidence fields are the etag DDO serves (nginx's "<mtime-hex>-0", the -0
+    being the size, byte-identical on all four URLs -- one shared zero-byte
+    placeholder) and the date a human verified it. `entry_keeps_slots` is the
+    precondition that made accepting these rows acceptable at all: every affected
+    card keeps at least one working pronunciation, so none goes silent.
+    """
+    rows = registry.known_missing_audio
+    assert len(rows) == 4
+    assert registry.gates["known_missing_audio_max"] == 4
+    # file-level documentation is not a URL, and code must never read it as one
+    assert "_note" in registry.data["known_missing_audio"]
+    assert not any(k.startswith("_") for k in rows)
+    for url, row in sorted(rows.items()):
+        assert url.startswith("https://static.ordnet.dk/mp3/"), url
+        assert row["url_slot"] in url, url
+        assert row["entry_id"] in url and row["lemma"], url
+        assert row["reason"] == "upstream_zero_byte", url
+        assert row["verified_by"], url
+        assert row["entry_keeps_slots"], url
+        ev = row["evidence"]
+        assert ev["http_status"] == 200 and ev["content_length"] == 0, url
+        assert ev["content_type"] == "text/html", url
+        assert ev["etag"] == '"5b06c6d8-0"', url
+        assert ev["verified_on"] == "2026-08-27", url
+        assert ev["attempts"] >= 2, url        # one attempt is not a verdict
+    # the four etags are the SAME string: that is the evidence it is one
+    # placeholder file upstream, not four coincidences
+    assert len({r["evidence"]["etag"] for r in rows.values()}) == 1
+
+
 def test_paradigm_labels_only_for_recognised_shapes(registry):
     assert registry.paradigm_labels("sb.", (3,)) == [
         "definite singular", "indefinite plural", "definite plural"]

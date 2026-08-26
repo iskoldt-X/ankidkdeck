@@ -16,6 +16,7 @@ FILES = [
     "card_keys.json",
     "form_to_lemma.json",
     "known_no_entry.json",
+    "known_missing_audio.json",
     "wordlist_invalid.json",
     "alias_pairs.json",
     "alias_merge_pending.json",
@@ -102,6 +103,35 @@ class Registry:
         not be able to grow silently.
         """
         return self.data["known_no_entry"]
+
+    @property
+    def known_missing_audio(self) -> dict:
+        """Audio slots DDO DECLARES and DDO's audio host cannot serve.
+        {audio_url: {url_slot, entry_id, lemma, entry_keeps_slots, reason,
+        evidence, verified_by}}.
+
+        Only the KEY -- the exact audio_url -- is read by code. Both halves of
+        G-MEDIA (s60_audio._media_gate over the cache, s70_export.media_gate over
+        the notes) baseline themselves against it: a slot in here is reported as
+        `known_missing_upstream` instead of counted as a failure, and a missing
+        slot that is NOT in here still fails both.
+
+        Filled 2026-08-27 from the four slots the stage-60 delta run could not
+        fetch: HTTP 200, content-length 0, content-type text/html and the same
+        etag "5b06c6d8-0" -- nginx's etag for a zero-byte file -- on all four,
+        deterministic over 3 attempts each, while sibling slots of the same
+        entries answered with real mp3 bodies. That is an upstream data defect
+        per SLOT; no retry ladder reaches it.
+
+        The population is baselined (gates.json:known_missing_audio_max) and the
+        file's `_note` carries the review contract, including the two rules that
+        keep it from becoming a suppression list: a file missing for any reason of
+        OURS is not an entry here, and a slot that starts working is reported as
+        `recovered` and must then be deleted from the file. Keys starting with
+        "_" are file-level documentation, not URLs.
+        """
+        return {k: v for k, v in (self.data.get("known_missing_audio") or {}).items()
+                if not str(k).startswith("_")}
 
     @property
     def wordlist_invalid(self) -> dict:

@@ -1,0 +1,67 @@
+{
+  "_note": "Audio slots DDO's own article DECLARES and DDO's own audio host cannot serve. An EXTERNAL data defect, recorded here so G-MEDIA can pass honestly instead of being switched off. Each of the four rows below answers HTTP 200 with content-length 0, content-type text/html and etag \"5b06c6d8-0\" -- nginx's etag for a ZERO-BYTE file (the -0 is the size), byte-identical across all four URLs, i.e. one shared empty placeholder on the host. Deterministic over 3 attempts per URL on 2026-08-27 (1 in the stage-60 download plus 2 verification probes at 2.0 s spacing, never tighter than the stage's own 1.0 s). Sibling slots of the SAME entries answer normally with 8,358-9,403-byte mp3 bodies, so the defect is per SLOT, not per entry and not per host: it is not a WAF challenge, not throttling, and not transient, and no retry ladder can fix it. THE CONTRACT. (1) This file is for a persistent upstream 200-with-no-audio ONLY. A file missing because OUR cache was lost, a download failed, a legacy seed was skipped or a challenge page was served is NOT an entry here -- it stays a G-MEDIA FAILURE, at stage 60 and again at stage 70, and every missing URL that is not a key below still fails both. (2) Every row carries the evidence a human verified and the name of the human who verified it. A row with no evidence is not reviewed, and an unreviewed row is a suppression list. (3) The population is BASELINED (registry/gates.json:known_missing_audio_max, checked by G-MEDIA at both stages). Growing it means editing that number in the same commit as the row, exactly as for known_no_entry_max and wordlist_invalid_max: a registry that removes rows from the only gate that adjudicates them must not be able to grow silently. (4) A row that STARTS WORKING is reported, never failed. Stage 60 re-probes every row on every run (four requests, the failure deliberately kept off the circuit breaker so four known-dead probes cannot trip a breaker whose job is to notice a degraded HOST), and a slot that answers with real audio is downloaded, reported as `recovered` by both G-MEDIA halves, and should then be DELETED from this file with the baseline bumped down in the same commit. Same asymmetry as G-ADMIT: the day DDO repairs the file is the mechanism working, not a regression. (5) WHAT MAKES THIS ACCEPTABLE, and the thing to re-check before ever adding a row: every affected entry keeps at least one working pronunciation (`entry_keeps_slots` below), so no card goes silent -- and s70_export.Media.sound_tag already returns \"\" for an absent file, so no dead [sound:] tag is emitted for these slots either. A row whose entry would be left with NO audio at all does not belong here; that is a content decision for the owner, not a gate baseline.",
+  "https://static.ordnet.dk/mp3/11008/11008788_2.mp3": {
+    "url_slot": "11008788_2",
+    "entry_id": "11008788",
+    "lemma": "derfor",
+    "entry_keeps_slots": [1, 3, 4],
+    "reason": "upstream_zero_byte",
+    "evidence": {
+      "http_status": 200,
+      "content_length": 0,
+      "content_type": "text/html",
+      "etag": "\"5b06c6d8-0\"",
+      "attempts": 3,
+      "verified_on": "2026-08-27"
+    },
+    "verified_by": "Binghan"
+  },
+  "https://static.ordnet.dk/mp3/11008/11008790_1.mp3": {
+    "url_slot": "11008790_1",
+    "entry_id": "11008790",
+    "lemma": "derhen",
+    "entry_keeps_slots": [2, 3, 4, 5],
+    "reason": "upstream_zero_byte",
+    "evidence": {
+      "http_status": 200,
+      "content_length": 0,
+      "content_type": "text/html",
+      "etag": "\"5b06c6d8-0\"",
+      "attempts": 3,
+      "verified_on": "2026-08-27"
+    },
+    "verified_by": "Binghan"
+  },
+  "https://static.ordnet.dk/mp3/11030/11030243_2.mp3": {
+    "url_slot": "11030243_2",
+    "entry_id": "11030243",
+    "lemma": "lev",
+    "entry_keeps_slots": [1],
+    "reason": "upstream_zero_byte",
+    "evidence": {
+      "http_status": 200,
+      "content_length": 0,
+      "content_type": "text/html",
+      "etag": "\"5b06c6d8-0\"",
+      "attempts": 3,
+      "verified_on": "2026-08-27"
+    },
+    "verified_by": "Binghan"
+  },
+  "https://static.ordnet.dk/mp3/11034/11034312_2.mp3": {
+    "url_slot": "11034312_2",
+    "entry_id": "11034312",
+    "lemma": "mor",
+    "entry_keeps_slots": [1],
+    "reason": "upstream_zero_byte",
+    "evidence": {
+      "http_status": 200,
+      "content_length": 0,
+      "content_type": "text/html",
+      "etag": "\"5b06c6d8-0\"",
+      "attempts": 3,
+      "verified_on": "2026-08-27"
+    },
+    "verified_by": "Binghan"
+  }
+}

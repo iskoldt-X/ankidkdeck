@@ -9,6 +9,8 @@
   "empty_rate_tolerance_pp": 1.0,
   "note_count_range": [2800, 3100],
   "media_floor": 4629,
+  "_note_known_missing_audio": "The baseline of registry/known_missing_audio.json, READ by both halves of G-MEDIA (s60_audio._media_gate on the cache, s70_export.media_gate on the notes). That registry excuses a declared audio slot from the only gate that adjudicates it, so its population is pinned here for the same reason known_no_entry_max and wordlist_invalid_max are: adding a row means editing this number in the SAME commit, and a row that DDO repairs means removing the row and bumping this number down. Fail-closed on a missing key, exactly like G-SUPPRESS and G-ADMIT: delete this line and every registry row is over its baseline, so the excuse cannot be granted by deleting the check. 4 = the four slots verified zero-byte upstream on 2026-08-27. Like every other baseline in this file it needs a human signature.",
+  "known_missing_audio_max": 4,
   "affix_count_range": [150, 600],
   "sitemap_total_range": null,
   "label_error_max_rate": 0.01,

@@ -336,7 +336,8 @@ def run_command(args, cfg) -> int:
         from .stages import s60_audio
         print_report("audio", s60_audio.run(cfg, _net(cfg),
                                             seed_legacy=args.seed_legacy,
-                                            sweep_orphans=args.sweep_orphans))
+                                            sweep_orphans=args.sweep_orphans,
+                                            registry=_registry(cfg)))
         return 0
     if cmd == "export":
         from .stages import s70_export

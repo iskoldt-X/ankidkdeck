@@ -485,6 +485,43 @@ def test_media_gate(cfg):
     assert S70.media_gate(media2, 4629, [])[0] is False
 
 
+def test_the_export_media_gate_is_baselined_against_the_upstream_dead_registry(cfg):
+    """The EXPORT half of G-MEDIA, over the notes actually written. Stage 60
+    passing the cache is not enough: this gate re-runs the same question and
+    would have blocked the release on the same four slots."""
+    dead = "https://static.ordnet.dk/mp3/11034/11034312_2.mp3"   # shipped row
+    live = "https://static.ordnet.dk/mp3/11034/11034312_1.mp3"
+    (cfg.audio_dir / "11034312_1.mp3").write_bytes(b"ID3-real-audio")
+    media = S70.Media(cfg)                 # reads the registry by default
+    assert len(media.known_missing) == 4
+    assert media.sound_tag(live, "11034312", 1) == "[sound:11034312_1.mp3]"
+    # no dead [sound:] tag is emitted either way -- that part never changed
+    assert media.sound_tag(dead, "11034312", 2) == ""
+    ok, detail = S70.media_gate(media, 1, ["11034312_1.mp3"], 4)
+    assert ok is True
+    assert detail["declared_but_absent"] == 0        # excused
+    assert detail["declared_but_absent_total"] == 1   # but still counted
+    known = detail["known_missing_upstream"]
+    assert known["n_still_missing"] == 1 and known["still_missing"] == [dead]
+    assert len(known["no_longer_declared"]) == 3
+
+    # a miss the registry does NOT name still fails
+    assert media.sound_tag("https://static.ordnet.dk/mp3/11034/11034312_9.mp3",
+                           "11034312", 9) == ""
+    ok, detail = S70.media_gate(media, 1, ["11034312_1.mp3"], 4)
+    assert ok is False and detail["declared_but_absent"] == 1
+
+    # fail-closed: deleting the baseline must not grant the excuse
+    assert S70.media_gate(S70.Media(cfg), 0, [], 0)[0] is False
+    # a repaired slot is reported, and its tag IS emitted
+    (cfg.audio_dir / "11034312_2.mp3").write_bytes(b"ID3-repaired")
+    media2 = S70.Media(cfg)
+    assert media2.sound_tag(dead, "11034312", 2) == "[sound:11034312_2.mp3]"
+    known = S70.media_gate(media2, 1, ["11034312_2.mp3"], 4)[1][
+        "known_missing_upstream"]
+    assert known["recovered"] == [dead] and known["n_still_missing"] == 0
+
+
 def test_media_list_must_be_sorted(cfg):
     media = S70.Media(cfg)
     for name in ("b.mp3", "a.mp3"):
@@ -621,10 +658,13 @@ def test_a_dead_gate_id_is_not_declared_and_gate_extra_is_used():
 # --------------------------------------------- the net layer's own accounting
 
 class _Resp:
-    def __init__(self, status=200, content=b"id3"):
+    def __init__(self, status=200, content=b"id3", headers=None):
         self.status_code = status
         self.content = content
-        self.headers = {}
+        # Real headers matter for the audio ladder: the four upstream-dead slots
+        # are a 200 whose content-type is text/html, and a body's declared type is
+        # the only signal static.ordnet.dk gives (it has no WAF to check for).
+        self.headers = dict(headers or {})
         self.text = ""
         self.history = []
 
@@ -673,6 +713,72 @@ def test_one_audio_failure_does_not_trip_the_breaker(cfg, monkeypatch):
         n.get_audio("https://static.ordnet.dk/mp3/11021/11021722_1.mp3")
     n.get_audio("https://static.ordnet.dk/mp3/11021/11021722_2.mp3")
     assert n.circuit.consecutive_failures == 0
+
+
+# The zero-byte placeholder DDO serves on the four dead slots, verbatim:
+# HTTP 200, content-length 0, content-type text/html, etag "5b06c6d8-0".
+_DEAD_HEADERS = {"content-type": "text/html", "content-length": "0",
+                 "etag": '"5b06c6d8-0"'}
+_DEAD_SLOT = "https://static.ordnet.dk/mp3/11030/11030243_2.mp3"   # shipped row
+
+
+def test_a_200_with_no_audio_is_retried_once_and_never_returned(cfg, monkeypatch):
+    """get_audio had NO rung for a 200 that carries no audio -- a 5xx was
+    retried, a 404 was fatal, and a 200-with-nothing was simply RETURNED. That
+    is the exact failure DDO produced on four declared slots, and it meant only
+    stage 60's own `if not r.content` kept the body off the disk; a challenge
+    page served as 200 (this host has no WAF header to check) would have been
+    written as an mp3 and G-MEDIA, which tests for zero bytes, would have passed
+    it."""
+    from ankidkdeck.util import AudioUnavailable
+    n = _fake_net(cfg, monkeypatch, [_Resp(200, b"", headers=_DEAD_HEADERS)] * 2)
+    with pytest.raises(AudioUnavailable) as exc:
+        n.get_audio(_DEAD_SLOT)
+    assert exc.value.why == "empty body" and exc.value.retried is True
+    assert exc.value.status == 200 and exc.value.n_bytes == 0
+    assert n.request_count == 2            # the first attempt plus ONE retry
+    # ONE host failure for one unfetchable URL, recorded on the first attempt
+    # and not again on the raise -- the 5xx rung's accounting exactly. Recording
+    # both attempts would make two dead slots look like four to a breaker that
+    # trips on 3 failures in a rolling 50 requests.
+    assert n.circuit.results == [False]
+
+    # A non-audio body with real bytes in it is the same failure: the point is
+    # that the response never comes back, so it can never be written to a file.
+    page = _Resp(200, b"<html>are you a robot</html>",
+                 headers={"content-type": "text/html; charset=utf-8"})
+    n2 = _fake_net(cfg, monkeypatch, [page, page])
+    with pytest.raises(AudioUnavailable) as exc:
+        n2.get_audio(_DEAD_SLOT)
+    assert exc.value.why == "content-type is not audio"
+
+    # A slot already recorded upstream-dead is probed ONCE and its failure is
+    # kept off the breaker: four known-dead probes in a row are four consecutive
+    # failures, and tripping on them would abort an otherwise fully cached rerun.
+    n3 = _fake_net(cfg, monkeypatch, [_Resp(200, b"", headers=_DEAD_HEADERS)] * 2)
+    with pytest.raises(AudioUnavailable):
+        n3.get_audio(_DEAD_SLOT, expected_missing=True)
+    assert n3.request_count == 1 and n3.circuit.results == []
+
+    # A real mp3 is unaffected, with or without a content-type header.
+    n4 = _fake_net(cfg, monkeypatch,
+                   [_Resp(200, b"ID3real", headers={"content-type": "audio/mpeg"}),
+                    _Resp(200, b"\xff\xfbPreal")])
+    assert n4.get_audio(_DEAD_SLOT).content == b"ID3real"
+    assert n4.get_audio(_DEAD_SLOT).content == b"\xff\xfbPreal"
+    assert n4.circuit.results == [True, True]
+
+    # But three UNKNOWN no-audio URLs in a row still stop the run: a host that
+    # has started serving empty bodies wholesale wants a human, not a report
+    # listing 5,893 gaps.
+    from ankidkdeck.util import FatalError
+    n5 = _fake_net(cfg, monkeypatch, [_Resp(200, b"", headers=_DEAD_HEADERS)] * 6)
+    for _ in range(2):
+        with pytest.raises(AudioUnavailable):
+            n5.get_audio(_DEAD_SLOT)
+    with pytest.raises(FatalError) as exc:
+        n5.get_audio(_DEAD_SLOT)
+    assert "circuit breaker" in str(exc.value)
 
 
 # ------------------------------------------------------- stage 60 audio cache
@@ -754,6 +860,127 @@ def test_orphans_are_counted_always_and_swept_only_on_request(cfg):
     report = S60.run(cfg, None, sweep_orphans=True)
     assert report["quarantined_orphans"] == 1
     assert (cfg.audio_dir / "_orphans" / "19999999_1.mp3").exists()
+
+
+# ------------------------------- the upstream-dead audio registry (G-MEDIA)
+#
+# DDO's own article declares 5,893 audio slots and DDO's own host cannot serve
+# four of them: HTTP 200, content-length 0, content-type text/html, and the same
+# etag "5b06c6d8-0" -- nginx's etag for a zero-byte file -- on all four, while
+# sibling slots of the same entries serve real mp3 bodies. The four are recorded
+# in registry/known_missing_audio.json and BASELINED by
+# gates.json:known_missing_audio_max, so G-MEDIA passes on a defect that is not
+# ours without ceasing to be a gate.
+
+_LIVE_SLOT = "https://static.ordnet.dk/mp3/11030/11030243_1.mp3"
+
+
+def _lev_workspace(cfg, slots=(1, 2)):
+    """entries.json with `lev` (11030243), whose slot 2 is a shipped registry
+    row and whose slot 1 is a normal, working slot."""
+    from ankidkdeck.util import write_json
+    udtale = [{"ipa": "leːˀv" if n == 1 else "", "label": None, "slot_n": n,
+               "audio_url": "https://static.ordnet.dk/mp3/11030/11030243_%d.mp3" % n}
+              for n in slots]
+    e = make_entry("11030243", "lev", pos_key="sb.",
+                   senses=[make_sense("21000001", "livet")], udtale=udtale)
+    write_json(cfg.json_dir / "entries.json", {"11030243": e})
+    return e
+
+
+def _media_row(cfg):
+    from ankidkdeck.util import read_json
+    rows = read_json(cfg.report_dir / "gates_report.json")["results"]
+    return next(r for r in rows if r["id"] == "G-MEDIA" and r["stage"] == "60")
+
+
+def test_an_upstream_dead_slot_is_reported_and_never_lands_on_disk(cfg, monkeypatch):
+    """The registry row is honoured: G-MEDIA passes, the slot is reported as
+    known_missing_upstream rather than counted absent, and the zero-byte
+    text/html body is not written -- a zero-byte mp3 imports into Anki as a
+    silent card, which no later gate would notice."""
+    from ankidkdeck.stages import s60_audio as S60
+    _lev_workspace(cfg)
+    (cfg.audio_dir / "11030243_1.mp3").write_bytes(b"ID3-real-audio")
+    n = _fake_net(cfg, monkeypatch, [_Resp(200, b"", headers=_DEAD_HEADERS)])
+
+    report = S60.run(cfg, n)               # no FatalError == G-MEDIA passed
+
+    assert report["known_missing_upstream"] == 1
+    assert report["recovered_upstream"] == 0
+    assert report["n_no_audio_from_host"] == 1
+    assert report["no_audio_from_host"][0]["url"] == _DEAD_SLOT
+    assert report["no_audio_from_host"][0]["why"] == "empty body"
+    assert report["known_missing_audio"]["still_missing"] == [_DEAD_SLOT]
+    # the other three shipped rows are not declared by this one-entry corpus,
+    # which is reported so a row the corpus dropped stops being carried silently
+    assert len(report["known_missing_audio"]["no_longer_declared"]) == 3
+    assert not (cfg.audio_dir / "11030243_2.mp3").exists()
+    from ankidkdeck.util import read_json
+    assert _DEAD_SLOT not in read_json(cfg.audio_dir / "manifest.json")
+    row = _media_row(cfg)
+    assert row["ok"] is True
+    assert row["detail"]["n_missing"] == 0 and row["detail"]["n_zero_byte"] == 0
+    known = row["detail"]["known_missing_upstream"]
+    assert known["registry_rows"] == 4 and known["max"] == 4
+    assert known["n_still_missing"] == 1 and known["over_baseline"] is False
+
+
+def test_a_missing_slot_the_registry_does_not_name_still_fails_g_media(cfg,
+                                                                       monkeypatch):
+    """The population the gate exists for -- a lost cache, a failed download, a
+    skipped seed -- is untouched by the registry."""
+    from ankidkdeck.stages import s60_audio as S60
+    from ankidkdeck.util import FatalError
+    _lev_workspace(cfg)
+    # slot 1 is NOT a registry row, and the host serves it the same empty 200
+    n = _fake_net(cfg, monkeypatch, [_Resp(200, b"", headers=_DEAD_HEADERS)] * 4)
+    with pytest.raises(FatalError) as exc:
+        S60.run(cfg, n)
+    assert "G-MEDIA" in str(exc.value)
+    detail = _media_row(cfg)["detail"]
+    assert detail["missing"] == [_LIVE_SLOT] and detail["n_missing"] == 1
+    assert detail["known_missing_upstream"]["n_still_missing"] == 1
+    assert not (cfg.audio_dir / "11030243_1.mp3").exists()
+    # and with no net at all, an absent non-registry file is still a failure
+    with pytest.raises(FatalError):
+        S60.run(cfg, None)
+
+
+def test_a_recovered_upstream_slot_is_reported_not_hidden(cfg, monkeypatch):
+    """The day DDO repairs the file is the mechanism working, not a regression:
+    the row is reported as recovered -- through the DISK, so a legacy seed or an
+    earlier run counts too -- and the report says to delete it."""
+    from ankidkdeck.stages import s60_audio as S60
+    _lev_workspace(cfg)
+    for name in ("11030243_1.mp3", "11030243_2.mp3"):
+        (cfg.audio_dir / name).write_bytes(b"ID3-real-audio")
+
+    report = S60.run(cfg, None)            # nothing to fetch, nothing to fail
+
+    assert report["known_missing_audio"]["recovered"] == [_DEAD_SLOT]
+    assert report["known_missing_upstream"] == 0 and report["recovered_upstream"] == 1
+    assert "known_missing_audio_max" in report["recovered_hint"]
+    known = _media_row(cfg)["detail"]["known_missing_upstream"]
+    assert known["recovered"] == [_DEAD_SLOT] and known["n_still_missing"] == 0
+
+
+def test_the_upstream_dead_registry_cannot_grow_past_its_baseline(cfg):
+    """Bump-in-the-same-commit, and fail-closed on a missing key -- the same
+    discipline G-SUPPRESS and G-ADMIT have. A registry that excuses rows from the
+    only gate that adjudicates them must not be able to grow silently, and the
+    excuse must not be grantable by DELETING the baseline line."""
+    from ankidkdeck.stages import s60_audio as S60
+    status = {"registry_rows": 5, "still_missing": [_DEAD_SLOT],
+              "recovered": [], "no_longer_declared": []}
+    assert S60._media_gate([_DEAD_SLOT], [], 1, status, 5)[0] is True
+    ok, detail = S60._media_gate([_DEAD_SLOT], [], 1, status, 4)
+    assert ok is False and detail["known_missing_upstream"]["over_baseline"] is True
+    # no baseline at all: every row is over it
+    assert S60._media_gate([], [], 1, status, 0)[0] is False
+    # and with no registry in play the gate is exactly what it always was
+    assert S60._media_gate([], [], 1)[0] is True
+    assert S60._media_gate([_LIVE_SLOT], [], 1)[0] is False
 
 
 # ------------------------------------------------- stage 10 governance / gzip
