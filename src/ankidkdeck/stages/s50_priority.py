@@ -39,9 +39,23 @@ AFTER the anchor. Reviewers: this is the one place where the guide and the
 launch instruction disagree.
 
 Unranked entries go last -- 09:534-537's fallback, kept because it is safe.
+
+TWO THINGS ABOUT THIS STAGE THAT ARE EASY TO GET WRONG:
+
+  * THE DRY PATH WRITES words.json. `priority` without --confirm-spend places no
+    call, but it does rewrite work/json/words.json (every family's entry_ids),
+    priority_orders.json, priority_conflicts.json and ranking_queue.json. That is
+    also why the runbook order is build -> priority -> translate: s30_merge and
+    this stage write the same field, so a build after a priority run silently
+    restores every homograph order and G-ORDER, which only runs here, never
+    says a word.
+  * THE RANKING ALWAYS RUNS ON THE STANDARD SURFACE. 621 requests at most,
+    language-independent, one short permutation each; it is not worth a batch
+    wave, a cache or a JSONL file, and it must not inherit mode=batch from the
+    config. This is a deliberate exception to "three modes everywhere", stated
+    here so nobody ports it later by symmetry.
 """
 
-import datetime
 import json
 import time
 
@@ -49,9 +63,12 @@ from ..config import Config
 from ..gates import G_ORDER, Gate, run_gates
 from ..util import FatalError, read_json, write_json
 
-# One family per call, as in 03_rank_homographs.py; 1.6s keeps the free tier's
-# 30 RPM with margin.
-RANK_REQUEST_INTERVAL = 1.6
+# The permutation lock gets the same ladder as stage 42's count lock: a bad
+# permutation is the classic transient, and FatalError on the first one threw
+# away every ranking already paid for in the run.
+MAX_PERMUTATION_ATTEMPTS = 5
+# The ranking never leaves the interactive surface (see the module docstring).
+RANK_MODE = "standard"
 
 
 def dedupe_keep_first(seq) -> list:
@@ -104,13 +121,23 @@ def _order_gate(rows: list):
     return not bad, {"families": len(rows), "violations": bad[:20]}
 
 
-def _rank_schema(n_ids: int) -> dict:
+def _rank_schema(n_ids: int, ids=None) -> dict:
     """03: the permutation lock -- exactly the input ids, no extras, no
-    omissions."""
+    omissions.
+
+    The `enum` on the items is measured, not hopeful: with and without it, every
+    response was a legal permutation and zero ids fell outside the enum. It
+    turns "the array is the right length" into "the array is made of these
+    exact strings", which is most of what the client-side check was for -- the
+    check stays, because a schema is a request and not a guarantee.
+    """
+    items: dict = {"type": "string"}
+    if ids:
+        items["enum"] = list(ids)
     return {"type": "object",
             "properties": {"sorted_ids": {"type": "array", "minItems": n_ids,
                                           "maxItems": n_ids,
-                                          "items": {"type": "string"}}},
+                                          "items": items}},
             "required": ["sorted_ids"]}
 
 
@@ -324,22 +351,48 @@ def run(cfg: Config, registry=None, confirm: bool = False) -> dict:
           % len(queue))
     print("  %d two-source contradictions logged to reports/priority_conflicts.json"
           % len(conflicts))
+    report["dry_path_wrote"] = ["json/words.json (entry_ids)",
+                                "json/priority_orders.json",
+                                "reports/priority_conflicts.json",
+                                "reports/ranking_queue.json"]
     if not confirm:
-        print("  nothing has been sent. Re-run with --confirm-spend to place calls.")
+        print("  nothing has been sent, but words.json / priority_orders.json / "
+              "ranking_queue.json HAVE been written: the queue is a computed "
+              "artifact, not a preview.")
         report["note"] = ("queue only: no LLM module was imported and no request "
                           "was made.")
         write_json(cfg.report_dir / "priority_report.json", report)
         return report
 
     # ---------------- past this line, money is spent ----------------
-    from .s42_translate import _generate, _pool_from_env
+    from .s42_translate import (CallContext, UsageLog, _pool_from_env,
+                                _provenance, output_fit, probe_stats,
+                                transport_guard)
 
-    pool = _pool_from_env()
+    cfg.validate()
+    # The same gate stage 42 has. This stage never runs in batch mode
+    # (RANK_MODE), but `doctor` says "NOT fit to spend" on mode=batch or
+    # cache_enabled while this stage used to spend anyway -- two commands
+    # disagreeing about whether a configuration may place calls is worse than
+    # either answer.
+    transport_guard(cfg)
+    stats = probe_stats(cfg)
+    cfg.validate(spending=True, stats=stats)
     # The ranking is a short permutation, not prose: it shares the expressions
-    # model rather than the definition model (config.expressions_model).
+    # model rather than the definition model (config.expressions_model), and it
+    # always runs on the standard surface (see the module docstring).
     model = cfg.expressions_model
-    prov = "gemini:%s@%s" % (model, datetime.date.today().isoformat())
+    fit = output_fit(stats=stats)
+    pool = _pool_from_env(cfg)
+    # Per-call, fsync'd: an interrupted ranking wave leaves its own token
+    # record on disk, not only in the report it never got to write.
+    usage = UsageLog(path=cfg.report_dir / "priority_usage.jsonl")
+    ctx = CallContext(cfg=cfg, pool=pool, fit=fit, lang="-", usage=usage,
+                      prompt_id=cfg.prompt_id, mode=RANK_MODE)
+    prov = _provenance(model, cfg.prompt_id, cfg.thinking_level)
+    report["mode"] = RANK_MODE
     ranked = 0
+    violations: list = []
     for row in queue:
         fid = row["family_id"]
         fam = families[fid]
@@ -348,15 +401,40 @@ def run(cfg: Config, registry=None, confirm: bool = False) -> dict:
         user = ('--- YOUR TURN ---\nInput headword: "%s"\nEntries:\n%s'
                 % (fam.get("lemma"), json.dumps(payload, ensure_ascii=False,
                                                 indent=2)))
-        time.sleep(RANK_REQUEST_INTERVAL)
-        parsed = _generate(pool, model, rank_prompt(), user,
-                           _rank_schema(len(eids)), 0.1, "ranking %s" % fid)
-        sorted_ids = parsed.get("sorted_ids")
-        if not isinstance(sorted_ids, list) or set(sorted_ids) != set(eids) \
-                or len(sorted_ids) != len(eids):
+        sorted_ids = None
+        # The ladder stage 42 has and this stage did not: the first malformed
+        # permutation used to abort the run outright, discarding every ranking
+        # already paid for, and the log could not say whether the model had
+        # improvised or the response had been truncated.
+        for attempt in range(1, MAX_PERMUTATION_ATTEMPTS + 1):
+            time.sleep(cfg.rank_request_interval)
+            req = ctx.request("rank", "ranking %s" % fid, user,
+                              _rank_schema(len(eids), eids), len(eids),
+                              rank_prompt())
+            comp = ctx.call(model, req)
+            candidate = comp.parsed.get("sorted_ids")
+            if isinstance(candidate, list) and len(candidate) == len(eids) \
+                    and set(candidate) == set(eids):
+                sorted_ids = candidate
+                break
+            violations.append({"family_id": fid, "attempt": attempt,
+                               "returned": candidate,
+                               "expected_ids": eids,
+                               "finish_reason": comp.finish_reason,
+                               "max_output_tokens": req.max_output_tokens})
+            print("  permutation lock: family %s returned %s, expected a "
+                  "permutation of %d ids, finishReason=%s (attempt %d/%d)"
+                  % (fid, candidate, len(eids), comp.finish_reason, attempt,
+                     MAX_PERMUTATION_ATTEMPTS))
+        if sorted_ids is None:
+            write_json(cfg.review_dir / "ranking_violations.json", violations)
+            write_json(cfg.report_dir / "priority_usage.json", usage.rows)
             raise FatalError(
-                "ranking for family %s returned %s, which is not a permutation "
-                "of %s" % (fid, sorted_ids, eids))
+                "ranking for family %s never returned a permutation of %s after "
+                "%d attempts; the families ranked before it are checkpointed. "
+                "Violations (with finishReason) are in "
+                "review/ranking_violations.json"
+                % (fid, eids, MAX_PERMUTATION_ATTEMPTS))
         new_order = anchor_first(fam["anchor_entry_id"], sorted_ids)
         fam["entry_ids"] = new_order
         fam["priority_source"] = "gemini"
@@ -383,5 +461,10 @@ def run(cfg: Config, registry=None, confirm: bool = False) -> dict:
                                         if r.get("status") != "ranked")
     report["api"] = {"requests": pool.total_requests,
                      "key_rotations": pool.rotations}
+    report["usage"] = usage.totals()
+    report["permutation_violations"] = len(violations)
+    if violations:
+        write_json(cfg.review_dir / "ranking_violations.json", violations)
+    write_json(cfg.report_dir / "priority_usage.json", usage.rows)
     write_json(cfg.report_dir / "priority_report.json", report)
     return report

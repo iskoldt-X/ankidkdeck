@@ -21,7 +21,6 @@ spend.
 
 import json
 import sys
-import types
 
 import pytest
 from conftest import make_entry, make_sense
@@ -179,69 +178,38 @@ def test_priority_refuses_to_run_before_migrate(cfg, registry):
 
 # ------------------------------------------------- the confirm path (FAKE)
 
-class _FakeResp:
-    def __init__(self, text):
-        self.text = text
-
-
-class _FakeModels:
-    def __init__(self, calls):
-        self.calls = calls
-
-    def generate_content(self, model=None, contents=None, config=None):
-        self.calls.append(model)
-        payload = json.loads(contents[0].split("Entries:\n", 1)[1])
-        # a deterministic "ranking": reverse the input
-        return _FakeResp(json.dumps(
-            {"sorted_ids": [r["id"] for r in reversed(payload)]}))
-
-
 @pytest.fixture
-def fake_genai(monkeypatch):
-    """A fake google.genai. No network, no key, no spend -- and it also proves
-    the dry path never imports the real one, because the real one is not here."""
-    calls = []
+def ranker(fake_genai, no_sleep, probe_stats):
+    """A deterministic "ranking": reverse the ids the payload carried.
 
-    class _Client:
-        def __init__(self, api_key=None):
-            self.models = _FakeModels(calls)
-
-    class _Config:
-        def __init__(self, **kw):
-            self.kwargs = kw
-
-    google = types.ModuleType("google")
-    genai = types.ModuleType("google.genai")
-    gtypes = types.ModuleType("google.genai.types")
-    genai.Client = _Client
-    gtypes.GenerateContentConfig = _Config
-    genai.types = gtypes
-    google.genai = genai
-    monkeypatch.setitem(sys.modules, "google", google)
-    monkeypatch.setitem(sys.modules, "google.genai", genai)
-    monkeypatch.setitem(sys.modules, "google.genai.types", gtypes)
-    monkeypatch.setenv("GEMINI_API_KEYS", "fake-key")
-    monkeypatch.setattr(S50.time, "sleep", lambda *a, **k: None)
-    return calls
+    probe_stats is a requirement, not decoration: a confirmed run reads the
+    measured output fit off disk and refuses to size a paid request without it.
+    """
+    @fake_genai.respond
+    def _reverse(call):
+        payload = json.loads(call["contents"][0].split("Entries:\n", 1)[1])
+        return {"sorted_ids": [r["id"] for r in reversed(payload)]}
+    return fake_genai
 
 
 def test_confirm_after_a_dry_run_actually_ranks_the_queued_families(
-        cfg, registry, fake_genai):
+        cfg, registry, ranker):
     """The R4 repro, as a test: dry run, then confirm IN THE SAME WORKSPACE."""
     _workspace(cfg)
     dry = S50.run(cfg, registry, confirm=False)
     assert dry["queue_for_ranking"] == 2
-    assert fake_genai == []                       # the bill placed no call
+    assert ranker.calls == []                     # the bill placed no call
 
     done = S50.run(cfg, registry, confirm=True)
     assert done["queue_for_ranking"] == 2
     assert done["families_ranked"] == 2
-    assert len(fake_genai) == 2
+    assert len(ranker.calls) == 2
     assert done["api"]["requests"] == 2
+    # the ranking never leaves the interactive surface
+    assert done["mode"] == "standard"
 
 
-def test_a_resolved_queue_keeps_its_rows_with_a_status(cfg, registry,
-                                                      fake_genai):
+def test_a_resolved_queue_keeps_its_rows_with_a_status(cfg, registry, ranker):
     """Overwriting ranking_queue.json with [] once a confirm run had resolved it
     destroyed the only record of what had needed ranking -- and an interrupted
     run left no trace of what was still pending."""
@@ -256,7 +224,7 @@ def test_a_resolved_queue_keeps_its_rows_with_a_status(cfg, registry,
 
 
 def test_a_gemini_order_is_reusable_and_keeps_its_provenance(cfg, registry,
-                                                            fake_genai):
+                                                            ranker):
     _workspace(cfg)
     S50.run(cfg, registry, confirm=True)
     stored = read_json(cfg.json_dir / "priority_orders.json")
@@ -275,17 +243,83 @@ def test_a_gemini_order_is_reusable_and_keeps_its_provenance(cfg, registry,
     assert stored2["11000010"]["ranked"] is True
 
 
-def test_the_permutation_lock_fires_on_a_bad_ranking(cfg, registry, fake_genai,
-                                                     monkeypatch):
+def test_the_permutation_lock_fires_on_a_bad_ranking(cfg, registry, ranker):
+    """It is a LADDER now, not an immediate abort: the first bad permutation used
+    to discard every ranking already paid for in the run, and the log could not
+    say whether the model had improvised or the response had been truncated."""
     _workspace(cfg)
 
-    def bad(self, model=None, contents=None, config=None):
-        return _FakeResp(json.dumps({"sorted_ids": ["99999999"]}))
+    @ranker.respond
+    def _bad(call):
+        return {"sorted_ids": ["99999999"]}
 
-    monkeypatch.setattr(_FakeModels, "generate_content", bad)
     with pytest.raises(FatalError) as exc:
         S50.run(cfg, registry, confirm=True)
     assert "permutation" in str(exc.value)
+    assert len(ranker.calls) == S50.MAX_PERMUTATION_ATTEMPTS
+    rows = read_json(cfg.review_dir / "ranking_violations.json")
+    assert len(rows) == S50.MAX_PERMUTATION_ATTEMPTS
+    # N-08 / 5.8: a lock violation records the finishReason, so "the model
+    # improvised" and "the cap truncated the JSON" are distinguishable.
+    assert all(r["finish_reason"] == "STOP" for r in rows)
+    assert all(r["max_output_tokens"] >= 1024 for r in rows)
+
+
+def test_the_ranking_schema_pins_the_ids_it_will_accept(cfg, registry, ranker):
+    """RANK_ENUM_HONOURED was measured true: with and without the enum every
+    response was a legal permutation and no id fell outside it. So the schema
+    carries the enum, and the client-side check stays anyway."""
+    _workspace(cfg)
+    S50.run(cfg, registry, confirm=True)
+    schema = ranker.configs[0].kwargs["response_schema"]
+    items = schema["properties"]["sorted_ids"]["items"]
+    assert items["enum"] and all(i.isdigit() for i in items["enum"])
+    assert schema["properties"]["sorted_ids"]["minItems"] == len(items["enum"])
+
+
+def test_the_ranking_call_sends_thinking_and_no_temperature(cfg, registry,
+                                                            ranker):
+    _workspace(cfg)
+    S50.run(cfg, registry, confirm=True)
+    kwargs = ranker.configs[0].kwargs
+    assert "temperature" not in kwargs
+    assert kwargs["thinking_config"].kwargs == {"thinking_level": "LOW"}
+    assert kwargs["max_output_tokens"] >= 1024
+
+
+def test_ranking_refuses_a_transport_that_does_not_exist(cfg, registry, ranker):
+    """F6. `doctor` said "NOT fit to spend" on mode=batch or cache_enabled while
+    this stage spent anyway. The ranking is always RANK_MODE=standard so nothing
+    was mislabelled, but two commands disagreeing about whether a configuration
+    may place calls is worse than either answer."""
+    _workspace(cfg)
+    cfg.mode = "batch"
+    with pytest.raises(FatalError) as exc:
+        S50.run(cfg, registry, confirm=True)
+    assert "batch transport" in str(exc.value)
+    assert ranker.calls == []
+    cfg.mode, cfg.cache_enabled = "standard", True
+    with pytest.raises(FatalError) as exc:
+        S50.run(cfg, registry, confirm=True)
+    assert "cache_enabled" in str(exc.value)
+    assert ranker.calls == []
+
+
+def test_an_interrupted_ranking_leaves_its_usage_on_disk(cfg, registry, ranker):
+    """F1 for stage 50: the per-call ledger is appended and fsync'd, so the
+    families already paid for are countable after a failure."""
+    _workspace(cfg)
+
+    @ranker.respond
+    def _bad(call):
+        return {"sorted_ids": ["99999999"]}
+
+    with pytest.raises(FatalError):
+        S50.run(cfg, registry, confirm=True)
+    lines = (cfg.report_dir / "priority_usage.jsonl").read_text(
+        encoding="utf-8").strip().splitlines()
+    assert len(lines) == S50.MAX_PERMUTATION_ATTEMPTS
+    assert len(read_json(cfg.report_dir / "priority_usage.json")) == len(lines)
 
 
 def test_the_dry_path_imports_no_llm_module(cfg, registry):

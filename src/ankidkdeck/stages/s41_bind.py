@@ -29,12 +29,26 @@ The entry is present but every word that saw it rejected it -> the classifier
 dropped it (`rejected_article`, guide 6.3 population 3). Otherwise it binds.
 """
 
+import re
+
 from ..config import Config
 from ..gates import DROP_REASONS, G_BIND, Gate, bind_accounting, run_gates
 from ..util import NFC, FatalError, read_json, sha256_str, write_json
 from .s21_resolve import rejected_everywhere_ids
 
 WARN_BIND_RATE = 0.97
+
+# A row written by a v3 PAID translate, told apart from the 2025 asset by the
+# shape of its provenance: the migrated rows carry "gemini:<model>@<date>", the
+# v3 ones "gemini:<model>+<prompt_id>+<THINKING>@<date>". Newer than the legacy
+# asset by construction -- nothing else writes that form.
+PAID_PROVENANCE_RE = re.compile(r"^gemini:[^+@]+\+[^+@]+\+[A-Z]+@")
+
+
+def _paid_rows(table: dict) -> int:
+    return sum(1 for row in table.values()
+               if isinstance(row, dict)
+               and PAID_PROVENANCE_RE.match(str(row.get("provenance") or "")))
 
 
 def _legacy(cfg: Config, name: str):
@@ -112,6 +126,17 @@ def run(cfg: Config, registry=None) -> dict:
         tdir = cfg.json_dir / "translations" / lang
         out_defs = read_json(tdir / "definitions.json", default={})
         out_exprs = read_json(tdir / "expressions.json", default={})
+        # Spec 5.9. These counts are THE audit of the recovered 2025 asset, and
+        # they are computed against the live tables -- so once a paid translate
+        # has written v3 rows there, a re-bind is answering a different
+        # question: keys a legacy row would have taken are occupied, `_place`
+        # keeps the incumbent, and the row is filed as a shared_dannetid
+        # conflict. The bind rate then falls for a reason that has nothing to do
+        # with 2025. The counts are SPLIT and the report says so rather than
+        # refusing to run: bind is part of `build`, and a hard stop here would
+        # brick a rebuild after the first paid wave.
+        paid = {"definitions": _paid_rows(out_defs),
+                "expressions": _paid_rows(out_exprs)}
         dropped: list = []
         counts = {"definitions": {"bound": 0, "dropped": 0, "legacy": 0,
                                   "via_text": 0, "via_sense_path": 0,
@@ -253,12 +278,33 @@ def run(cfg: Config, registry=None) -> dict:
                               counts["definitions"]["bound_on_unused_entries"]
                               + counts["expressions"]["bound_on_unused_entries"],
                           "keys_definitions": len(out_defs),
-                          "keys_expressions": len(out_exprs)}
+                          "keys_expressions": len(out_exprs),
+                          # The provenance_source split (spec 5.9, option 3).
+                          # keys_* counts everything in the live table; these
+                          # say how much of it this bind did not put there.
+                          "keys_from_paid_translate": paid,
+                          "audit_integrity":
+                              "clean: no paid gemini rows in the live tables"
+                              if not any(paid.values()) else
+                              "SPLIT: the live tables already contain %d paid "
+                              "row(s) from a v3 translate. n_legacy / n_bound / "
+                              "n_dropped are still computed from the legacy "
+                              "files and are sound, but keys_* and any "
+                              "shared_dannetid_conflict drops describe a table "
+                              "the LLM has written to. The pre-LLM audit is "
+                              "reports/bind_report_pre_translate.json."
+                              % sum(paid.values())}
         rate = per_lang[lang]["bind_rate"]
         if rate is not None and rate < WARN_BIND_RATE:
             report["warnings"].append(
                 f"{lang}: bind rate {rate:.2%} is below {WARN_BIND_RATE:.0%} -- read "
                 f"translations/{lang}/dropped.json before trusting the deck")
+        if any(paid.values()):
+            report["warnings"].append(
+                f"{lang}: {sum(paid.values())} live row(s) come from a paid v3 "
+                f"translate, not from the 2025 asset. This bind report is NOT "
+                f"the migration audit -- read "
+                f"reports/bind_report_pre_translate.json for that.")
 
     run_gates([
         Gate(G_BIND, "n_bound + n_dropped == n_legacy per language, every drop "
@@ -267,6 +313,15 @@ def run(cfg: Config, registry=None) -> dict:
     ], cfg, stage="41")
 
     report["per_language"] = per_lang
+    report["audit_is_pre_llm"] = not any(
+        sum(s["keys_from_paid_translate"].values()) for s in per_lang.values())
+    report["audit_note"] = (
+        "the migration audit (n_legacy / n_bound / n_dropped / bind_rate) is "
+        "computed from json/legacy/*, so it is unaffected by later LLM writes. "
+        "keys_* and the shared_dannetid_conflict drops are NOT: they read the "
+        "live tables. audit_is_pre_llm says whether any paid row was present "
+        "when this report was written; stage 42 freezes a copy of the last "
+        "clean one in reports/bind_report_pre_translate.json before it spends.")
     report["drop_reason_codes"] = sorted(DROP_REASONS)
     report["sense_text_changed_split"] = {
         lang: {"expression_sense_match":

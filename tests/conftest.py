@@ -90,6 +90,174 @@ def registry(cfg):
 
 
 # --------------------------------------------------------------------------
+# the measured LLM constants, and a fake SDK
+# --------------------------------------------------------------------------
+#
+# Nothing measured is hard-coded in the package: the stage reads
+# work/probes/stats.json and REFUSES to spend if it is missing, if it was
+# measured on another model, or if a key it needs is absent. So any test that
+# drives a confirmed run needs the artifact, and it must carry the real measured
+# values -- a test fixture with invented numbers would let a wrong formula pass.
+#
+# Values: work/probes/stats.json, schema 3, measured 2026-08-26 on
+# gemini-3.7-flash across the three probe keys.
+MEASURED_CONSTANTS = {
+    "schema": 3,
+    "measured_at": "2026-08-26T01:45+02:00",
+    "model": "gemini-3.7-flash",
+    "EXPECTED_OUTPUT": {"a": 35.964, "b": 23.07, "r2": 0.985, "points": 62},
+    # Total prompt tokens ~= a*n + b for a DEFINITION request (system prompt +
+    # schema + n Danish payload rows). Subtracting the system half is how the
+    # bill separates "cacheable" from "uncached payload".
+    "PROMPT_TOKENS_fit": {"a": 23.917, "b": 1164.2, "r2": 0.9325, "points": 75},
+    "PROMPT_TOKENS_system_only": {"Chinese": 1135, "English": 1092,
+                                  "German": 1135, "Spanish": 1135},
+    "thinking": {
+        "THINKING_SOURCE": "derived",
+        "THINKING_PER_REQUEST_LOW": {"mean": 0, "p95": 0.0, "max": 0,
+                                     "n_observations": 38},
+        "THINKING_PER_REQUEST_MEDIUM": {"mean": 578.7, "p95": 1042.0,
+                                        "max": 1156, "n_observations": 13},
+    },
+    "budget": {"MAX_OUTPUT_FORMULA": "ceil(a*n + b) * 1.5 with NO thinking term",
+               "MIN_SAFE_BUDGET": {"8": 1024}, "UNSET_BUDGET_HANGS": False},
+    "wave2": {"EXPLICIT_CACHE_FLOOR": 1024, "PRODUCTION_PROMPT_TOKENS": 1135,
+              # The enrichment probe: 4,564 cacheable tokens, so this is the
+              # size the FORBIDDEN "rich prompt, no cache" figure is priced at.
+              "W2_2_rich": {"cached": 4564, "prompt": 4779, "verdict": "PASS"}},
+    # NOTE: there is deliberately no IMPLICIT_CACHE_FLOOR here. The real
+    # artifact does not carry that key -- the documented 4096 is a docs value,
+    # not a measurement -- and a fixture that invents it would let code depend
+    # on a number no probe produced.
+    "TEMPERATURE": None,
+    "SCHEMA_SURFACE_VERIFIED": "responseSchema",
+    "RANK_ENUM_HONOURED": True,
+}
+
+
+@pytest.fixture
+def probe_stats(cfg):
+    """work/probes/stats.json in the test workspace, with the measured values."""
+    from ankidkdeck.util import write_json
+    write_json(cfg.probe_stats_path, MEASURED_CONSTANTS)
+    return MEASURED_CONSTANTS
+
+
+class FakeUsage:
+    """usageMetadata, SDK-shaped (snake_case attributes).
+
+    thoughtsTokenCount is deliberately ABSENT: protobuf omits zero-valued
+    fields, so the real object has no such attribute when thinking is 0, and
+    that is exactly why the code derives thinking from the identity instead of
+    reading the field.
+    """
+
+    def __init__(self, prompt=1135, cached=0, candidates=120, thoughts=0,
+                 tool_use=0):
+        self.prompt_token_count = prompt
+        self.cached_content_token_count = cached
+        self.candidates_token_count = candidates
+        self.tool_use_prompt_token_count = tool_use
+        self.total_token_count = prompt + candidates + thoughts + tool_use
+
+
+class FakeCandidate:
+    def __init__(self, finish_reason="STOP"):
+        self.finish_reason = finish_reason
+
+
+class FakeResponse:
+    def __init__(self, text, finish_reason="STOP", usage=None):
+        self.text = text
+        self.candidates = [FakeCandidate(finish_reason)]
+        self.usage_metadata = usage if usage is not None else FakeUsage()
+
+
+class FakeGenai:
+    """A recording stand-in for google.genai. No network, no key, no spend.
+
+    `responder(call) -> FakeResponse | str | dict` decides what comes back; the
+    recorded calls carry the model, the contents and the config object the stage
+    actually built, which is what makes "temperature is never sent" and
+    "thinkingLevel is always sent" checkable.
+    """
+
+    def __init__(self):
+        self.calls: list = []
+        self.responder = None
+
+    def respond(self, fn):
+        self.responder = fn
+        return fn
+
+    def handle(self, call) -> FakeResponse:
+        out = self.responder(call) if self.responder else "{}"
+        if isinstance(out, FakeResponse):
+            return out
+        if isinstance(out, (dict, list)):
+            import json as _json
+            return FakeResponse(_json.dumps(out))
+        return FakeResponse(out)
+
+    @property
+    def models(self) -> list:
+        return [c["model"] for c in self.calls]
+
+    @property
+    def configs(self) -> list:
+        return [c["config"] for c in self.calls]
+
+
+@pytest.fixture
+def fake_genai(monkeypatch):
+    """Install the fake SDK under google.genai and hand back the recorder."""
+    import sys
+    import types as _types
+
+    recorder = FakeGenai()
+
+    class _Models:
+        def generate_content(self, model=None, contents=None, config=None):
+            call = {"model": model, "contents": contents, "config": config}
+            recorder.calls.append(call)
+            return recorder.handle(call)
+
+    class _Client:
+        def __init__(self, api_key=None):
+            self.api_key = api_key
+            self.models = _Models()
+
+    class _Config:
+        def __init__(self, **kw):
+            self.kwargs = kw
+
+    class _ThinkingConfig:
+        def __init__(self, **kw):
+            self.kwargs = kw
+
+    google = _types.ModuleType("google")
+    genai = _types.ModuleType("google.genai")
+    gtypes = _types.ModuleType("google.genai.types")
+    genai.Client = _Client
+    gtypes.GenerateContentConfig = _Config
+    gtypes.ThinkingConfig = _ThinkingConfig
+    genai.types = gtypes
+    google.genai = genai
+    monkeypatch.setitem(sys.modules, "google", google)
+    monkeypatch.setitem(sys.modules, "google.genai", genai)
+    monkeypatch.setitem(sys.modules, "google.genai.types", gtypes)
+    monkeypatch.setenv("GEMINI_API_KEYS", "fake-key")
+    return recorder
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    """The throttle intervals are real seconds; a test does not wait them out."""
+    import time as _time
+    monkeypatch.setattr(_time, "sleep", lambda *a, **k: None)
+
+
+# --------------------------------------------------------------------------
 # synthetic entries: the same shape stage 20 writes, minus the HTML
 # --------------------------------------------------------------------------
 

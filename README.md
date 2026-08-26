@@ -32,6 +32,10 @@ ankidkdeck crawl --full                      # ~5,000 pages, 4-5 h, resumable
 ankidkdeck crawl --phase-b                   # lemma pages the inflections need
 
 ankidkdeck build                             # parse -> classify -> resolve -> merge -> bind
+ankidkdeck priority                          # homograph display order (no calls)
+
+cp -a work work.before-translate             # see "the dry path is not read-only"
+ankidkdeck doctor                            # what a spend would actually use
 
 export GEMINI_API_KEYS="key1,key2"
 ankidkdeck translate --lang German           # prints a BILL and stops
@@ -41,10 +45,32 @@ ankidkdeck audio --seed-legacy               # reuse a previous run's mp3s
 ankidkdeck export --lang German              # dist/DDO_Danish_Frequency_Deck_German.apkg
 ```
 
+The order is `build -> priority -> translate -> audio -> export`, and `priority`
+is not optional bookkeeping: `merge` and `priority` write the same `entry_ids`
+field of `words.json`, so a `build` after a `priority` run silently restores
+every homograph display order -- and `G-ORDER`, which only runs inside
+`priority`, never says a word about it.
+
+### The dry path is not read-only
+
+`translate` and `priority` without `--confirm-spend` place no API call and import
+nothing from the Gemini SDK. They are not, however, read-only:
+
+* `translate` runs the archive GC and writes `definitions.json`,
+  `expressions.json`, `archive.json`, `reports/translate_bill_<lang>.json` and
+  `reports/translate_report.json`, and it runs `G-ORPH` -- which can fail the run
+  before a human ever sees the bill;
+* `priority` rewrites `words.json`, `priority_orders.json`,
+  `priority_conflicts.json` and `ranking_queue.json`.
+
+"Nothing was sent" is true. "Nothing changed" is not. Snapshot `work/` before the
+first dry run of either.
+
 `ankidkdeck status` prints where you are; `ankidkdeck gates` prints every quality
-gate and whether it passed. `ankidkdeck --help` lists every stage individually
+gate and whether it passed; `ankidkdeck doctor` prints the configuration a paid
+run would actually use. `ankidkdeck --help` lists every stage individually
 (`wordlist`, `sitemap`, `parse`, `classify`, `resolve`, `merge`, `bind`,
-`migrate`, `priority`).
+`migrate`, `priority`, `review`).
 
 Options worth knowing:
 
@@ -53,7 +79,9 @@ Options worth knowing:
 | `--work PATH` | where the corpus, JSON and reports live (default `./work`) |
 | `--config PATH` | TOML config (default `./ankidkdeck.toml`): languages, model, sleep range, copyright year |
 | `--legacy-workspace PATH` | a previous run's workspace, for reusing its translations, rankings and audio |
-| `--confirm-spend` | the only way `translate` and `priority` place a paid API call |
+| `--confirm-spend` | the only way `translate`, `priority` and `review` place a paid API call |
+| `--mode {standard,batch,flex}` | transport for one `translate` run. `batch` is half price and asynchronous; nothing downgrades by itself |
+| `--retranslate-all` | bill (and with `--confirm-spend`, redo) every cell in scope, not only the missing and changed ones |
 | `--check-determinism` | build twice and compare, before writing the `.apkg` |
 
 ## You need a residential IP
@@ -74,12 +102,65 @@ Translation is the only step that costs money, so it is the only step that asks:
 
 ```
 $ ankidkdeck translate --lang German
---- translation bill (model: gemini-2.0-flash) ---
-  German     571 cells  (definitions 571: 571 new / 0 changed | expressions 0: ...)
-             412 entries, 43-43 API requests, ~18k source tokens
+--- translation bill (model: gemini-3.7-flash) ---
+  mode standard | thinking LOW | prompt v4-frozen
+  German     571 cells  (definitions 571: 571 new / 0 changed / 0 redo | expressions 0: ...)
+             412 entries, 43-1075 API requests, ~18k source tokens
   TOTAL 571 cells across 1 language(s)
+  request ceiling includes transport retries; source tokens are the Danish payload only, not a bill
   nothing has been sent. Re-run with --confirm-spend to place calls.
 ```
+
+`ankidkdeck doctor` prints the configuration a spend would actually use -- the
+effective model, the transport, the thinking level, the prompt hashes, the spend
+cap, and the state of the measured constants under `work/probes/` -- and exits
+non-zero when the run is not fit to spend on. The two numbers in the request
+range are "one request per batch" and "every retry ladder at full stretch,
+transport retries included".
+
+The bill also carries three dollar figures per language -- the cache working, the
+cache failing with the current prompt inlined on every request, and the forbidden
+case of an enriched prompt inlined -- next to the accepted ceiling. The tokens
+behind them come from `work/probes/stats.json`; the prices come from the rate
+card, and while that module is absent every figure reads `null` with the reason
+stated rather than a plausible number.
+
+`--retranslate-all` bills every cell in scope instead of the missing and changed
+ones. With `--confirm-spend` it moves the existing rows into `archive.json` with
+`reason=clean_redo` and does not read them back; without it, it only quotes the
+price and touches nothing.
+
+A clean retranslation is **resumable**, which matters because one language is
+~5,565 requests over several hours:
+
+* rows that already carry the running redo's provenance (same model, same prompt
+  pack, same thinking level -- any date) are kept, are not billed again and are
+  not re-archived, so re-running the same command after a crash pays for the
+  remainder only, and the bill prints the arithmetic;
+* a row the redo retired is **never** restored from `archive.json`. Before that,
+  a plain `translate` after a crashed redo -- the natural "carry on" -- silently
+  brought every old row home, reported 0 cells, and left two translators mixed
+  into one file.
+
+### What a paid run leaves behind
+
+Every spend record is on disk before anything can fail, because a crash is the
+only time it matters:
+
+| file | when |
+|---|---|
+| `reports/translate_usage.jsonl` | one line per call, flushed and fsync'd as it happens |
+| `reports/translate_usage.json` | the same rows as an array, on the way out (crash or not) |
+| `review/count_lock_violations_<lang>.json` | as each violation happens |
+| `reports/translate_report.json` | always, with a `crashed` block on a fatal path |
+| `reports/bind_report_pre_translate.json` | once, before the first paid call: the pre-LLM migration audit |
+
+Five paid calls followed by a crash leave five rows. `priority` writes the same
+kind of per-call ledger to `reports/priority_usage.jsonl`.
+
+`ankidkdeck review --lang German --fix <keys>` is the hand-run correction pass.
+Nothing triggers it automatically: its work list is a file under `work/review/`,
+and one invocation is one pass.
 
 Without `--confirm-spend` nothing is imported from the Gemini SDK and no request
 is made. Keys come from `GEMINI_API_KEYS` (comma-separated; the pool rotates

@@ -199,3 +199,54 @@ def test_rows_on_entries_no_family_renders_are_reported(cfg):
     assert per["n_bound"] == 2
     assert per["n_bound_on_unused_entries"] == 1
     assert "entry-scoped by design" in report["bind_scope"]
+
+
+def test_a_paid_translate_cannot_silently_pollute_the_migration_audit(cfg):
+    """Spec 5.9. n_legacy / n_bound / n_dropped are the audit of the recovered
+    2025 asset, but they are computed against the LIVE translation tables -- so
+    once a paid v3 translate has written rows there, a re-bind (or a `build`,
+    which runs bind) answers a different question under the same name: the key a
+    legacy row would have taken is occupied, `_place` keeps the incumbent, and
+    the row is filed as a shared_dannetid_conflict. The bind rate then falls for
+    a reason that has nothing to do with 2025.
+
+    The counts are SPLIT and labelled rather than refused: bind is part of
+    `build`, so a hard stop here would brick a rebuild after the first paid
+    wave.
+    """
+    _one_lang(cfg)
+    e = make_entry("11000400", "hus", pos_key="sb.",
+                   senses=[make_sense("21000050", "bygning")])
+    families = {"11000400": {"family_id": "11000400",
+                             "anchor_entry_id": "11000400",
+                             "entry_ids": ["11000400"]}}
+    legacy = {"11000400": {"bygning": _legacy_row("house", "a building",
+                                                  "bygning")}}
+    _workspace(cfg, {"11000400": e}, {}, families, defs=legacy)
+
+    clean = bind_run(cfg)
+    assert clean["audit_is_pre_llm"] is True
+    per = clean["per_language"]["English"]
+    assert per["keys_from_paid_translate"] == {"definitions": 0,
+                                              "expressions": 0}
+    assert per["audit_integrity"].startswith("clean")
+
+    # ...now a paid v3 run has written its own row over that key
+    write_json(cfg.json_dir / "translations" / "English" / "definitions.json",
+               {"11000400:21000050": {
+                   "lemma": "building", "gloss": "a structure",
+                   "src_sha": sha256_str(NFC("bygning")),
+                   "provenance": "gemini:gemini-3.7-flash+v4-frozen+LOW@2026-08-26"}})
+    polluted = bind_run(cfg)
+    per = polluted["per_language"]["English"]
+    assert polluted["audit_is_pre_llm"] is False
+    assert per["keys_from_paid_translate"]["definitions"] == 1
+    assert per["audit_integrity"].startswith("SPLIT")
+    assert any("paid v3 translate" in w for w in polluted["warnings"])
+    # the legacy accounting itself still balances: it is read from json/legacy/
+    assert per["n_bound"] + per["n_dropped"] == per["n_legacy"]
+    assert per["reasons"] == {"shared_dannetid_conflict": 1}
+    # ...and the migrated row was NOT overwritten by the legacy one
+    row = read_json(cfg.json_dir / "translations" / "English"
+                    / "definitions.json")["11000400:21000050"]
+    assert row["lemma"] == "building"
