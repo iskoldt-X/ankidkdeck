@@ -637,9 +637,109 @@ GREEK_MU = "\u039c"           # greek capital mu
 GREEK_BETA = "\u03b2"         # greek small beta, the German defect
 CYRILLIC = "\u0442"           # cyrillic te
 
+# Traditional characters that DO have a distinct simplified form, so their
+# presence in a Simplified cell is evidence of a leak. All three are from the
+# one genuine leak of the 2026-08-27 Chinese wave, cell 11017121:21026245.
+TRAD_YAN = "\u95b9"            # U+95B9, simplifies to U+9609
+TRAD_ZHU = "\u8c6c"            # U+8C6C, simplifies to U+732A
+TRAD_GUO = "\u904e"            # U+904E, simplifies to U+8FC7
+# Characters the GB2312 test called Traditional and that are nothing of the
+# kind. U+9CC0 and U+8137 are not in a Traditional charset at all (they are
+# rare SIMPLIFIED characters), U+7947 and U+77AD are retained in Simplified,
+# U+808F is the same character in both scripts. Eight of the nine
+# traditional_han findings of the 2026-08-27 wave were these.
+NOT_TRAD = "\u7947\u77ad\u808f\u9cc0\u8137"
+# U+5F8C, "after": one of the most common Traditional characters there is
+# (simplifies to U+540E) and GB2312 CAN encode it, so the old test was blind to
+# it. 54 table entries are in that position.
+TRAD_GB2312_OK = "\u5f8c"
+
+# Real 2026-08-27 wave lemmas, verbatim. The 18 BLOCK findings of the first
+# Chinese wave were adjudicated cell by cell; these are the ones that decided
+# each of the three fixes.
+#
+# Latin-symbol subjects: the entry IS the pronoun / the card / the note, so the
+# lemma has to be able to name it. Seven cells, all REVIEW.
+ZH_SUBJECT_LEMMAS = {
+    "11008678:28135789": (
+        "TA\uff08\u5bbe\u683c\uff0c\u975e\u4e8c\u5143\u6027\u522b\uff09",
+        "\u4eba\u79f0\u4ee3\u8bcd\u201cde\u201d\u7684\u5bbe\u683c\u5f62\u5f0f"
+        "\uff0c\u7528\u4e8e\u6307\u4ee3\u504f\u597d\u4f7f\u7528\u6027\u522b"
+        "\u4e2d\u7acb\u4ee3\u8bcd\u800c\u975e\u201c\u4ed6\u201d\u6216\u201c"
+        "\u5979\u201d\u7684\u5355\u4e2a\u4eba\u3002"),
+    "11008678:28135794": (
+        "TA\uff08\u5bbe\u683c\uff0c\u6027\u522b\u672a\u77e5\u6216\u65e0\u5173"
+        "\uff09",
+        "\u4eba\u79f0\u4ee3\u8bcd\u201cde\u201d\u7684\u5bbe\u683c\u5f62\u5f0f"
+        "\uff0c\u7528\u4e8e\u6307\u4ee3\u67d0\u4f4d\u5df2\u77e5\u6216\u521a"
+        "\u63d0\u53ca\u7684\u5355\u4e2a\u4eba\u3002"),
+    "49003153:28135708": (
+        "TA\uff08\u4e2d\u6027\u6307\u4ee3\uff09",
+        "\u7528\u4e8e\u6307\u4ee3\u67d0\u4f4d\u5df2\u77e5\u6216\u521a\u63d0"
+        "\u53ca\u7684\u4eba\u3002"),
+    "49003153:28135887": (
+        "TA\uff08\u975e\u4e8c\u5143\u6027\u522b\u4ee3\u8bcd\uff09",
+        "\u7528\u4e8e\u6307\u4ee3\u67d0\u4f4d\u5df2\u77e5\u6216\u521a\u63d0"
+        "\u53ca\u7684\u4eba\uff08\u4ed6/\u5979\uff09\u3002"),
+    "11009756:91001204": (
+        "Q\uff08\u6251\u514b\u724c\uff09",
+        "\u6251\u514b\u724c\u4e2d\u70b9\u6570\u4ecb\u4e8eJ\uff08\u9a91\u58eb"
+        "\uff09\u548cK\uff08\u56fd\u738b\uff09\u4e4b\u95f4\u7684\u724c\u9762"
+        "\u3002"),
+    "11026729:21041711": (
+        "\uff08\u6251\u514b\u724c\u7684\uff09J",
+        "\u6251\u514b\u724c\u4e2d\u5e26\u6709\u56fe\u50cf\u7684\u4e00\u5f20"
+        "\u724c\uff0c\u5927\u5c0f\u4ecb\u4e8e10\u548cQ\uff08\u738b\u540e\uff09"
+        "\u4e4b\u95f4\u3002"),
+    "11029382:21045989": (
+        "\u5531\u540dla\uff08\u7b2c\u516d\u97f3\uff09",
+        "\u81ea\u7136\u97f3\u9636\u4e2d\u7684\u7b2c\u516d\u4e2a\u97f3\u7ea7"
+        "\uff0c\u5728C\u5927\u8c03\u5531\u540d\u4e2d\u901a\u5e38\u5bf9\u5e94"
+        "\u97f3\u540dA\u3002"),
+}
+
+# The two REAL foreign-text leaks: a Chinese translation with the DANISH family
+# headword parenthesised into it. Both BLOCK, and note what makes them
+# different from the seven above -- not the gloss (both of these glosses DO
+# repeat their own token, and none of the seven does), but that `lille` and
+# `undskylde` are words rather than symbols, and that `lille` sits inside the
+# parenthesis.
+ZH_FOREIGN_LEMMAS = {
+    "11048138:91006185": (
+        "\u5c0f\uff08lille\u7684\u590d\u6570\uff09",
+        "\u5f62\u5bb9\u8bcdlille\uff08\u5c0f\u7684\uff09\u7684\u590d\u6570"
+        "\u5f62\u5f0f\u3002"),
+    "12004949:91007535": (
+        "\u53c2\u89c1 undskylde\uff08\u539f\u8c05\u3001\u9053\u6b49\uff09",
+        "\u52a8\u8bcd undskylde\uff08\u539f\u8c05\u3001\u9053\u6b49\uff09"
+        "\u7684\u7948\u4f7f\u5f0f\u3002"),
+}
+
+# Archive expression cell 21002216 verbatim: REAL pinyin, tone-marked. This is
+# what pinyin_in_lemma means, and all 20 of the pinned cells look like it.
+ZH_PINYIN_LEMMA = "\u7a76\u7adf (ji\u016b j\u00ecng)"
+# The same shape with the tone marks removed. Nine cells of the 2026-08-27 wave
+# were reported as pinyin on no better evidence than the parenthesis.
+ZH_TONELESS_PINYIN = "\u7a76\u7adf (jiu jing)"
+# The foreign-text shape at its shortest: a Han lemma with a parenthesised
+# Danish word.
+ZH_DANISH_IN_PARENS = HAN_PULL + "\uff08lille\uff09"
+
 
 def _zh_cell(lemma, gloss, prov="migrated:2025:x"):
     return {"lemma": lemma, "gloss": gloss, "provenance": prov}
+
+
+def _zh_cells(pairs, prov):
+    return {k: _zh_cell(lemma, gloss, prov=prov)
+            for k, (lemma, gloss) in pairs.items()}
+
+
+def _zh_classes(cells):
+    return {f["key"]: (f["class"], f["tier"])
+            for f in gates.script_findings(cells, lang="Chinese",
+                                           kind="definitions",
+                                           pack=packs.load("Chinese"))}
 
 
 def test_g_script_is_a_declared_gate():
@@ -662,8 +762,12 @@ def test_g_script_baseline():
         "1:3": _zh_cell(HAN_PULL, TRAD_DONG + FULL_STOP),
         # a cross-reference: REVIEW, never a failure
         "1:4": _zh_cell("\u89c1afgore", HAN_MEANS + FULL_STOP),
-        # pinyin: a real defect class, baselined for 2025
-        "1:5": _zh_cell(HAN_PULL + " (la)", HAN_MEANS + FULL_STOP),
+        # pinyin: a real defect class, baselined for 2025. Tone-marked, which
+        # is the whole of what the class means now.
+        "1:5": _zh_cell(ZH_PINYIN_LEMMA, HAN_MEANS + FULL_STOP),
+        # the same shape with no tone mark is a DIFFERENT defect with its own
+        # class -- see test_g_script_splits_pinyin_from_foreign_text_on_a_tone
+        "1:6": _zh_cell(ZH_DANISH_IN_PARENS, HAN_MEANS + FULL_STOP),
     }
     findings = gates.script_findings(cells, lang="Chinese", kind="definitions",
                                      pack=pack)
@@ -672,9 +776,11 @@ def test_g_script_baseline():
     assert tiers["1:3"] == ("traditional_han", gates.BASELINE)
     assert tiers["1:4"] == ("latin_in_han_lemma", gates.REVIEW)
     assert tiers["1:5"] == ("pinyin_in_lemma", gates.BASELINE)
+    assert tiers["1:6"] == ("foreign_text_in_lemma", gates.BASELINE)
     assert "1:1" not in tiers
     ok, detail = gates.script_contract(
-        findings, {"traditional_han": 2, "pinyin_in_lemma": 1},
+        findings, {"traditional_han": 2, "pinyin_in_lemma": 1,
+                   "foreign_text_in_lemma": 1},
         lang="Chinese", kind="definitions")
     assert ok, detail
     assert detail["review_tier_counts"] == {"latin_in_han_lemma": 1}
@@ -696,6 +802,260 @@ def test_g_script_blocks_a_cell_this_run_wrote():
     assert not ok
     assert detail["block_tier_by_class"] == {"traditional_han": 1}
     assert detail["block_tier_examples"]["traditional_han"] == ["1:1"]
+
+
+# --------------------------------------------------------------------------
+# The three G-SCRIPT classifier fixes of 2026-08-27. The first real Chinese
+# wave produced 18 BLOCK findings; the owner adjudicated every one and 15 were
+# gate defects, not translation defects. Fixtures below are the real cells.
+# --------------------------------------------------------------------------
+
+PROV_NEW = "gemini:gemini-3.7-flash+v4-frozen+LOW@2026-08-27"
+
+GB2312_UPPER_BOUND_CHARS = NOT_TRAD + TRAD_YAN + TRAD_ZHU + TRAD_GUO
+
+
+def _gb2312_is_traditional(ch):
+    """The test _is_traditional USED to be, kept here so the mutation tests can
+    put it back and show what it costs."""
+    if not (0x4E00 <= ord(ch) <= 0x9FFF):
+        return False
+    try:
+        ch.encode("gb2312")
+    except (UnicodeEncodeError, LookupError):
+        return True
+    return False
+
+
+def test_g_script_traditional_means_a_distinct_simplified_form():
+    """FIX 1. "Traditional leaked" can only honestly mean "this character HAS a
+    different simplified form", and that is a table lookup, not an encoding
+    accident.
+
+    The eight characters below are the ones the 2026-08-27 wave turned up. Five
+    have to pass and three have to fail, and the GB2312 test flagged all eight.
+    """
+    for ch in NOT_TRAD:
+        assert not gates._is_traditional(ch), ch
+        # ... and every one of them was a finding under the old test.
+        assert _gb2312_is_traditional(ch), ch
+    for ch in (TRAD_YAN, TRAD_ZHU, TRAD_GUO):
+        assert gates._is_traditional(ch), ch
+        assert ch in gates.traditional_variants()
+        simplified = gates.traditional_variants()[ch]
+        assert simplified and ch not in simplified
+
+
+def test_the_traditional_table_catches_what_gb2312_could_encode():
+    """The old test did not only over-report. GB2312 encodes U+5F8C, one of the
+    most common Traditional characters there is, so the test that called itself
+    an UPPER BOUND was also a floor with holes in it."""
+    assert not _gb2312_is_traditional(TRAD_GB2312_OK)
+    assert gates._is_traditional(TRAD_GB2312_OK)
+    blind = [ch for ch in gates.traditional_variants()
+             if not _gb2312_is_traditional(ch)]
+    assert len(blind) >= 50, len(blind)
+
+
+def test_the_traditional_variant_table_is_honest_about_itself():
+    """A data file that catches real leaks without claiming to be exhaustive
+    Unicode. If it ever loses its source or its coverage statement, the number
+    it produces stops being auditable."""
+    from importlib import resources
+    ref = resources.files("ankidkdeck").joinpath(
+        "registry", gates.TRADITIONAL_VARIANTS_FILE)
+    raw = ref.read_text(encoding="utf-8")
+    assert raw.isascii(), "the table ships as \\u escapes"
+    doc = json.loads(raw)
+    assert "OpenCC" in doc["_source"] and "Apache-2.0" in doc["_source"]
+    assert doc["_regenerate"] and doc["_coverage"] and doc["_rule"]
+    assert len(doc["variants"]) == len(gates.traditional_variants()) > 3000
+    for key in doc["variants"]:
+        assert len(key) == 1
+        assert 0x3400 <= ord(key) <= 0xFAFF
+
+
+def test_g_script_splits_pinyin_from_foreign_text_on_a_tone_mark():
+    """FIX 2. Two unrelated defects used to share one class name, and the name
+    described only one of them.
+
+    The 2025 expression corpus put real romanisation in the lemma: 20 cells, 20
+    of them tone-marked. The 2026-08-27 definition wave put DANISH in the lemma:
+    9 cells, 0 tone-marked, reported as `pinyin_in_lemma` on the strength of the
+    parenthesis alone. Anyone triaging that label goes looking for romanisation
+    and finds none.
+    """
+    got = _zh_classes({
+        "1:1": _zh_cell(ZH_PINYIN_LEMMA, HAN_MEANS + FULL_STOP, prov=PROV_NEW),
+        "1:2": _zh_cell(ZH_TONELESS_PINYIN, HAN_MEANS + FULL_STOP,
+                        prov=PROV_NEW),
+        "1:3": _zh_cell(ZH_DANISH_IN_PARENS, HAN_MEANS + FULL_STOP,
+                        prov=PROV_NEW),
+        # no parenthesis, no tone mark, not a symbol: the cross-reference
+        # population, REVIEW then and REVIEW now.
+        "1:4": _zh_cell("\u89c1afgore", HAN_MEANS + FULL_STOP, prov=PROV_NEW),
+    })
+    assert got["1:1"] == ("pinyin_in_lemma", gates.BLOCK)
+    assert got["1:2"] == ("foreign_text_in_lemma", gates.BLOCK)
+    assert got["1:3"] == ("foreign_text_in_lemma", gates.BLOCK)
+    assert got["1:4"] == ("latin_in_han_lemma", gates.REVIEW)
+    # Both defect classes are zero-tolerance, and foreign_text_in_lemma has an
+    # honest baseline of 0: it is unpinned everywhere in gates.json because the
+    # archive has none of it.
+    assert "foreign_text_in_lemma" in gates._BLOCK_CLASSES
+    assert "latin_subject_lemma" in gates._REVIEW_CLASSES
+
+
+def test_g_script_exempts_a_lemma_whose_subject_is_its_latin_symbol():
+    """FIX 3. The seven cells the owner adjudicated innocent, verbatim.
+
+    Same mechanism as greek_subject_lemma: an entry whose subject IS a symbol
+    has to be able to name it in the lemma, or the pipeline cannot translate
+    that entry at all without failing the gate -- at ingest, after the money.
+    """
+    got = _zh_classes(_zh_cells(ZH_SUBJECT_LEMMAS, PROV_NEW))
+    assert len(got) == len(ZH_SUBJECT_LEMMAS) == 7
+    for key, verdict in sorted(got.items()):
+        assert verdict == ("latin_subject_lemma", gates.REVIEW), key
+
+
+def test_g_script_still_blocks_a_parenthesised_danish_headword():
+    """The other two of the nine, which are real defects and stay BLOCK.
+
+    Danish source text inside a shipped Chinese lemma is a
+    DDO-text-in-the-deck problem as well as a script-purity one, so the
+    exemption must not be able to reach it.
+    """
+    got = _zh_classes(_zh_cells(ZH_FOREIGN_LEMMAS, PROV_NEW))
+    assert len(got) == len(ZH_FOREIGN_LEMMAS) == 2
+    for key, verdict in sorted(got.items()):
+        assert verdict == ("foreign_text_in_lemma", gates.BLOCK), key
+
+
+def test_the_latin_subject_exemption_does_not_ask_the_gloss():
+    """The measured reason the exemption is structural.
+
+    "The gloss mentions the same token" is the obvious discriminator and the
+    real data INVERTS it: not one of the seven innocent glosses repeats its own
+    token (the TA glosses quote the Danish `de`, the Q gloss names J and K, the
+    la gloss names C and A), while BOTH real defects repeat theirs -- because
+    the parenthesised Danish word is the family headword the gloss has to
+    explain. A gloss-mention rule would have blocked all seven and excused both.
+    """
+    def gloss_repeats_its_token(lemma, gloss):
+        runs = {run for _, _, run in gates._latin_runs(lemma)}
+        return any(run in gloss for run in runs)
+
+    for lemma, gloss in ZH_SUBJECT_LEMMAS.values():
+        assert not gloss_repeats_its_token(lemma, gloss), lemma
+    for lemma, gloss in ZH_FOREIGN_LEMMAS.values():
+        assert gloss_repeats_its_token(lemma, gloss), lemma
+    # And the verdict does not move when the gloss is replaced wholesale.
+    for key, (lemma, _) in ZH_SUBJECT_LEMMAS.items():
+        got = _zh_classes({key: _zh_cell(lemma, HAN_MEANS + FULL_STOP,
+                                         prov=PROV_NEW)})
+        assert got[key] == ("latin_subject_lemma", gates.REVIEW), key
+
+
+def test_the_subject_exemption_separates_a_symbol_from_a_word():
+    """The two conditions, each shown to be load-bearing on its own.
+
+    A symbol token outside the parentheses earns the exemption; a WORD does not
+    (that is what keeps `undskylde` out, whose lemma is otherwise shaped exactly
+    like the innocent `la` one); and a symbol INSIDE the parentheses does not
+    either (that is what keeps the `lille` shape out, and what stops a Chinese
+    translation with a parenthesised foreign token from being read as an entry
+    about that token).
+    """
+    subj = gates._is_latin_subject_lemma
+    assert subj("TA\uff08\u5bbe\u683c\uff09")
+    assert subj("\u5531\u540dla")
+    assert subj("\u5b57\u6bcd\u00d8")
+    assert not subj("\u53c2\u89c1 undskylde\uff08\u539f\u8c05\uff09")
+    assert not subj("\u5c0f\uff08la\u7684\u590d\u6570\uff09")
+    assert not subj(HAN_PULL)
+    # shape test, stated as such: one letter, <= 3 capitals, or a solfege name.
+    assert gates._is_symbol_token("Q") and gates._is_symbol_token("TA")
+    assert gates._is_symbol_token("sol") and gates._is_symbol_token("La")
+    assert not gates._is_symbol_token("lille")
+    assert not gates._is_symbol_token("undskylde")
+    assert not gates._is_symbol_token("Alto")
+
+
+def test_the_whole_adjudicated_chinese_wave_lands_where_the_owner_put_it():
+    """The acceptance criterion for all three fixes at once: of the 18 BLOCK
+    findings the first real Chinese wave produced, exactly 3 survive."""
+    cells = {}
+    cells.update(_zh_cells(ZH_SUBJECT_LEMMAS, PROV_NEW))
+    cells.update(_zh_cells(ZH_FOREIGN_LEMMAS, PROV_NEW))
+    # the one genuine Traditional leak, and the eight false positives
+    cells["11017121:21026245"] = _zh_cell(
+        TRAD_YAN + "\u516c" + TRAD_ZHU,
+        HAN_MEANS + "\u88ab" + TRAD_YAN + "\u5272" + TRAD_GUO + "\u7684\u516c"
+        + TRAD_ZHU + FULL_STOP, prov=PROV_NEW)
+    for i, ch in enumerate(NOT_TRAD):
+        cells["9:%d" % i] = _zh_cell(HAN_PULL, HAN_MEANS + ch + FULL_STOP,
+                                     prov=PROV_NEW)
+    findings = gates.script_findings(cells, lang="Chinese", kind="definitions",
+                                     pack=packs.load("Chinese"))
+    ok, detail = gates.script_contract(findings, {}, lang="Chinese",
+                                       kind="definitions")
+    assert not ok
+    assert detail["block_tier_findings"] == 3
+    assert detail["block_tier_by_class"] == {"foreign_text_in_lemma": 2,
+                                            "traditional_han": 1}
+    assert detail["review_tier_counts"] == {"latin_subject_lemma": 7}
+    assert detail["baseline_tier_counts"] == {}
+
+
+# --- mutation checks: revert one fix, and one named test above fails ---
+
+def test_mutation_reverting_the_traditional_table_reraises_the_8_false(
+        monkeypatch):
+    """Revert FIX 1 ->
+    test_g_script_traditional_means_a_distinct_simplified_form fails."""
+    monkeypatch.setattr(gates, "_is_traditional", _gb2312_is_traditional)
+    for ch in NOT_TRAD:
+        assert gates._is_traditional(ch), ch
+    cells = {"9:%d" % i: _zh_cell(HAN_PULL, HAN_MEANS + ch + FULL_STOP,
+                                  prov=PROV_NEW)
+             for i, ch in enumerate(NOT_TRAD)}
+    findings = gates.script_findings(cells, lang="Chinese", kind="definitions",
+                                     pack=packs.load("Chinese"))
+    assert len(findings) == 5
+    assert {f["class"] for f in findings} == {"traditional_han"}
+    assert {f["tier"] for f in findings} == {gates.BLOCK}
+
+
+def test_mutation_reverting_the_tone_mark_split_relabels_danish_as_pinyin(
+        monkeypatch):
+    """Revert FIX 2 ->
+    test_g_script_splits_pinyin_from_foreign_text_on_a_tone_mark fails."""
+    def romanised_or_parenthesised(lemma):
+        if ("(" in lemma or "\uff08" in lemma
+                or any(ch in gates._TONE_MARKS for ch in lemma)):
+            return "pinyin_in_lemma"
+        return "latin_in_han_lemma"
+
+    monkeypatch.setattr(gates, "_latin_in_lemma_class",
+                        romanised_or_parenthesised)
+    got = _zh_classes({
+        "1:2": _zh_cell(ZH_TONELESS_PINYIN, HAN_MEANS + FULL_STOP,
+                        prov=PROV_NEW),
+        "1:3": _zh_cell(ZH_DANISH_IN_PARENS, HAN_MEANS + FULL_STOP,
+                        prov=PROV_NEW)})
+    assert got["1:2"] == ("pinyin_in_lemma", gates.BLOCK)
+    assert got["1:3"] == ("pinyin_in_lemma", gates.BLOCK)
+
+
+def test_mutation_dropping_the_subject_exemption_blocks_all_seven(monkeypatch):
+    """Revert FIX 3 ->
+    test_g_script_exempts_a_lemma_whose_subject_is_its_latin_symbol fails."""
+    monkeypatch.setattr(gates, "_is_latin_subject_lemma", lambda lemma: False)
+    got = _zh_classes(_zh_cells(ZH_SUBJECT_LEMMAS, PROV_NEW))
+    assert len(got) == 7
+    for key, verdict in sorted(got.items()):
+        assert verdict == ("foreign_text_in_lemma", gates.BLOCK), key
 
 
 def test_g_script_separates_a_greek_mention_from_a_greek_contamination():
@@ -816,7 +1176,12 @@ def test_the_script_baselines_are_not_dead_data(cfg):
     from ankidkdeck.registry import Registry
     policy = dict(Registry(cfg).gates or {})
     baseline = policy.get("script_baseline") or {}
-    assert baseline["Chinese"]["definitions"]["traditional_han"] == 325
+    # Recalibrated 2026-08-27 under the traditional_variants table: 325 -> 317
+    # for definitions and 22 -> 20 for expressions, because 8 and 2 of the
+    # cells the GB2312 test flagged carried rare SIMPLIFIED characters.
+    # pinyin_in_lemma stayed at 20 -- all 20 archive cells are tone-marked.
+    assert baseline["Chinese"]["definitions"]["traditional_han"] == 317
+    assert baseline["Chinese"]["expressions"]["traditional_han"] == 20
     assert baseline["Chinese"]["expressions"]["pinyin_in_lemma"] == 20
     assert baseline["German"]["definitions"]["greek_latin_internal"] == 1
     assert policy.get("_note_script_gate")

@@ -759,14 +759,38 @@ _NOT_A_SCRIPT_PHRASE = ("arabic digit",)
 _GREEK = ((0x0370, 0x03FF), (0x1F00, 0x1FFF))
 _HAN = ((0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xF900, 0xFAFF))
 
-# Pinyin tone marks. A Han lemma carrying one of these, or a parenthesised
-# Latin run, is a romanisation -- 20 such cells shipped in the 2025 Chinese
-# expression corpus while pos_prompt had said "DO NOT include any pinyin" since
-# 2025 and the definition and expression prompts had never mentioned it.
+# Pinyin tone marks. A Han lemma carrying one of these is a romanisation -- 20
+# such cells shipped in the 2025 Chinese expression corpus while pos_prompt had
+# said "DO NOT include any pinyin" since 2025 and the definition and expression
+# prompts had never mentioned it. The tone mark is the WHOLE discriminator now:
+# the old rule also accepted a bare parenthesis as evidence of romanisation,
+# which is how nine Latin-in-lemma cells of the 2026-08-27 Chinese wave were
+# reported as `pinyin_in_lemma` while carrying no pinyin at all. Measured on the
+# two populations: 20 of 20 archive expression cells have a tone mark, 0 of 9
+# new definition cells do. See _latin_in_lemma_class.
 _TONE_MARKS = frozenset(
     "\u0101\u00e1\u01ce\u00e0\u0113\u00e9\u011b\u00e8\u012b\u00ed"
     "\u01d0\u00ec\u014d\u00f3\u01d2\u00f2\u016b\u00fa\u01d4\u00f9"
     "\u01d6\u01d8\u01da\u01dc\u00fc")
+
+# The Latin tokens that are a SYMBOL rather than a word, so a Han lemma built
+# around one is naming its own subject instead of leaking foreign text. Solfege
+# syllables (both the la/si and the la/ti naming, plus the historical `ut`) and
+# `TA`, the standard Chinese gender-neutral third-person pronoun written in
+# Latin capitals. Single Latin letters and short all-capital runs are admitted
+# by shape in _is_symbol_token rather than listed here.
+_SYMBOL_TOKENS = frozenset(
+    ("do", "re", "mi", "fa", "sol", "so", "la", "si", "ti", "ut", "ta"))
+
+# Longest all-capital Latin run still read as a symbol (a letter name, a
+# playing-card rank, a note name, an acronym) rather than a word. Measured
+# against the real defects it has to keep out: `lille` (5) and `undskylde` (9).
+_SYMBOL_CAPS_MAX = 3
+
+# Paired parentheses, ASCII and fullwidth. Both appear in the corpus: the 2025
+# expression lemmas parenthesise pinyin with ASCII `(` 17 times out of 20, the
+# 2026 definition lemmas use the fullwidth pair.
+_PAREN_PAIRS = (("(", ")"), ("\uff08", "\uff09"))
 
 # BLOCK: zero tolerance on a cell this pipeline wrote. BASELINE: the same class
 # on a cell inherited from 2025, where the count is pinned in
@@ -774,9 +798,10 @@ _TONE_MARKS = frozenset(
 # (the G-SUPPRESS / G-ADMIT discipline). REVIEW: reported, never failed.
 _BLOCK_CLASSES = ("empty_field", "forbidden_script", "greek_in_lemma",
                   "greek_latin_internal", "han_outside_the_target",
-                  "traditional_han", "pinyin_in_lemma")
+                  "traditional_han", "pinyin_in_lemma",
+                  "foreign_text_in_lemma")
 _REVIEW_CLASSES = ("greek_mention", "greek_subject_lemma",
-                   "latin_in_han_lemma")
+                   "latin_in_han_lemma", "latin_subject_lemma")
 SCRIPT_CLASSES = _BLOCK_CLASSES + _REVIEW_CLASSES
 
 BLOCK, BASELINE, REVIEW = "BLOCK", "BASELINE", "REVIEW"
@@ -832,23 +857,175 @@ def _names_a_letter(lemma: str, ch: str) -> bool:
     return bool(rest)
 
 
-def _is_traditional(ch: str) -> bool:
-    """A Han character GB2312 cannot encode.
+TRADITIONAL_VARIANTS_FILE = "traditional_variants.json"
+_TRADITIONAL_VARIANTS = None
 
-    GB2312 covers Simplified only, so this is the cheapest available Simplified
-    test and it needs no character table in the repo. It over-reports: a few
-    rare Simplified characters are also outside GB2312, so the count is an UPPER
-    BOUND -- which is the right direction for a gate. Every one of the ten most
-    frequent hits in the shipped corpus was checked by hand and is a Traditional
-    form, not a rare Simplified one.
+
+def traditional_variants() -> dict:
+    """{Traditional character: its distinct Simplified form(s)}.
+
+    Package data (registry/traditional_variants.json), read once and cached. Not
+    a Registry file and deliberately not overlayable from work/registry/: the
+    overlayable numbers are the BASELINE COUNTS in gates.json, and what
+    "Traditional" MEANS is not a per-run policy knob -- a run that could
+    redefine it could silently unblock a real leak.
     """
-    if not (0x4E00 <= ord(ch) <= 0x9FFF):
-        return False
-    try:
-        ch.encode("gb2312")
-    except (UnicodeEncodeError, LookupError):
+    global _TRADITIONAL_VARIANTS
+    if _TRADITIONAL_VARIANTS is None:
+        ref = resources.files("ankidkdeck").joinpath(
+            "registry", TRADITIONAL_VARIANTS_FILE)
+        with ref.open("r", encoding="utf-8") as fh:
+            _TRADITIONAL_VARIANTS = dict(json.load(fh)["variants"])
+    return _TRADITIONAL_VARIANTS
+
+
+def _is_traditional(ch: str) -> bool:
+    """A Han character that HAS a distinct Simplified form.
+
+    That is the only honest mechanical definition of "Traditional leaked into a
+    Simplified cell": the character has a Simplified form that is a DIFFERENT
+    character, so Simplified text would have used that other character.
+
+    This replaces a GB2312-encodability test, and the replacement was measured
+    on the 2026-08-27 Chinese wave, where the old test raised 9 findings and 8
+    of them were rare SIMPLIFIED characters -- U+9CC0 and U+8137 are not in any
+    Traditional charset at all, U+7947 and U+77AD are retained in Simplified,
+    U+808F is the same character in both scripts. The old test's docstring
+    called that over-reporting "the right direction for a gate", which was the
+    wrong call twice over: a gate whose findings are 89% false gets ignored, and
+    the same test also UNDER-reported -- 54 entries of the table it lacked,
+    U+5F8C among them, are GB2312-encodable and were invisible to it. U+5F8C is
+    one of the most common Traditional characters there is.
+
+    See registry/traditional_variants.json for the source, the derivation rule
+    and an honest statement of coverage.
+    """
+    return ch in traditional_variants()
+
+
+def _latin_runs(text: str) -> list:
+    """Every maximal run of Latin letters in `text`, as (start, end, run)."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        if not _is_latin_letter(text[i]):
+            i += 1
+            continue
+        j = i
+        while j < n and _is_latin_letter(text[j]):
+            j += 1
+        out.append((i, j, text[i:j]))
+        i = j
+    return out
+
+
+def _is_symbol_token(run: str) -> bool:
+    """Is this Latin run a SYMBOL rather than a word?
+
+    Three shapes, and each was measured against the cells that have to pass and
+    the cells that have to fail:
+
+      * one Latin letter, any case -- the letter itself, a playing-card rank, a
+        note name, a grade, a vitamin;
+      * an all-capital run of at most _SYMBOL_CAPS_MAX letters -- `TA`, an
+        acronym;
+      * a solfege syllable, case-insensitive (_SYMBOL_TOKENS).
+
+    `lille` and `undskylde`, the two real foreign-text leaks of the 2026-08-27
+    wave, are none of those. This is a SHAPE test and it cannot be more than
+    that without a Danish dictionary the gate is not allowed to read: a Danish
+    word that is one letter long, or three capitals, would be admitted. The
+    consequence of admitting one is a REVIEW row, never a silent pass.
+    """
+    if len(run) == 1:
         return True
-    return False
+    if run.isupper() and len(run) <= _SYMBOL_CAPS_MAX:
+        return True
+    return run.lower() in _SYMBOL_TOKENS
+
+
+def _parenthesised_spans(text: str) -> list:
+    """The (start, end) half-open spans INSIDE parentheses, either width.
+
+    Unclosed opener: everything after it counts as inside. That is the safe
+    direction -- it can only make the subject exemption harder to earn.
+    """
+    spans = []
+    for op, cl in _PAREN_PAIRS:
+        i = 0
+        while True:
+            a = text.find(op, i)
+            if a < 0:
+                break
+            b = text.find(cl, a + 1)
+            end = len(text) if b < 0 else b
+            spans.append((a + 1, end))
+            i = end + 1
+    return spans
+
+
+def _is_latin_subject_lemma(lemma: str) -> bool:
+    """Is the Latin in this Han lemma the entry's own SUBJECT?
+
+    The sibling of greek_subject_lemma, and built the same way: an entry whose
+    subject IS a character has to be able to name it, or the pipeline cannot
+    translate that entry at all without failing the gate, at ingest, after the
+    money. Seven such cells were adjudicated innocent on the 2026-08-27 Chinese
+    wave -- the neutral pronoun TA, the playing cards Q and J, the solfege
+    syllable la.
+
+    TWO conditions, both required:
+
+      1. every Latin run in the lemma is a symbol token (_is_symbol_token), and
+      2. no Latin run sits inside a parenthesis.
+
+    (2) is what keeps the exemption off the shape the wave's real defects have:
+    a Chinese translation with the Danish headword parenthesised after it,
+    `U+5C0F` + `(lille` + `'s plural)`. The lemma is then a translation that
+    mentions a foreign word, not an entry about a symbol -- and note that
+    "the gloss mentions the same token" is NOT one of the conditions. It was the
+    obvious candidate and the real data inverts it: none of the seven innocent
+    glosses repeats its own token (the TA glosses quote Danish `de`, the Q gloss
+    names J and K), while BOTH real defects do repeat theirs, because the
+    parenthesised Danish word is the family headword the gloss has to explain.
+    Requiring a gloss mention would have blocked all seven and excused both.
+    """
+    runs = _latin_runs(lemma)
+    if not runs:
+        return False
+    if not all(_is_symbol_token(run) for _, _, run in runs):
+        return False
+    spans = _parenthesised_spans(lemma)
+    return not any(a < end and start < b
+                   for start, end, _ in runs for a, b in spans)
+
+
+def _latin_in_lemma_class(lemma: str) -> str:
+    """Which class a Latin-carrying Han lemma belongs to. Four truthful classes
+    where there used to be two, split on discriminators the corpus supplies:
+
+      * `pinyin_in_lemma` -- a pinyin TONE MARK is present. Real romanisation,
+        the 2025 expression defect, 20 cells, all 20 tone-marked.
+      * `latin_subject_lemma` -- the Latin is the entry's subject. REVIEW.
+      * `foreign_text_in_lemma` -- a parenthesised Latin run with no tone mark
+        and no subject claim. The 2026 definition defect: the Danish source word
+        leaking into a shipped Chinese lemma, which is a DDO-text-in-the-deck
+        problem and not only a script-purity one. BLOCK, baseline 0.
+      * `latin_in_han_lemma` -- a bare Latin run, no parenthesis, not a symbol.
+        Exactly the cross-reference population the note in gates.json describes,
+        55 archive definition cells of the form "see <Danish word>". REVIEW, as
+        before.
+
+    The class NAME is load-bearing: whoever triages `pinyin_in_lemma` goes
+    looking for romanisation, and for nine cells of the 2026-08-27 wave there
+    was none to find.
+    """
+    if any(ch in _TONE_MARKS for ch in lemma):
+        return "pinyin_in_lemma"
+    if _is_latin_subject_lemma(lemma):
+        return "latin_subject_lemma"
+    if any(op in lemma for op, _ in _PAREN_PAIRS):
+        return "foreign_text_in_lemma"
+    return "latin_in_han_lemma"
 
 
 def script_profile(pack: dict | None) -> dict:
@@ -972,12 +1149,8 @@ def script_findings(cells: dict, *, lang: str, kind: str, pack=None,
                     elif profile["simplified_required"] and _is_traditional(ch):
                         hit("traditional_han", field, ch)
         if profile["han_allowed"] and not profile["latin_in_lemma_allowed"]:
-            latin = [ch for ch in lemma if _is_latin_letter(ch)]
-            if latin:
-                romanised = ("(" in lemma or "\uff08" in lemma
-                             or any(ch in _TONE_MARKS for ch in lemma))
-                hit("pinyin_in_lemma" if romanised else "latin_in_han_lemma",
-                    "lemma")
+            if any(_is_latin_letter(ch) for ch in lemma):
+                hit(_latin_in_lemma_class(lemma), "lemma")
         for cls, slot in hits.items():
             if cls in _REVIEW_CLASSES:
                 tier = REVIEW
