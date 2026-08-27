@@ -414,8 +414,9 @@ def read_results(path) -> list:
     """The downloaded result file, one JSON object per line.
 
     Blank lines are skipped; a line that does not parse is FATAL rather than
-    skipped, because the reconciliation is positional and a dropped line shifts
-    every row after it onto the wrong request.
+    skipped. The reconciliation joins on the echoed key, so a dropped line no
+    longer shifts its neighbours -- but it silently removes one paid answer, and
+    a wave that quietly loses a row is not a wave that may be written.
     """
     out = []
     with open(path, encoding="utf-8") as f:
@@ -426,8 +427,9 @@ def read_results(path) -> list:
                 out.append(json.loads(line))
             except ValueError as exc:
                 raise FatalError(
-                    "%s line %d is not JSON (%s). The reconciliation is "
-                    "positional, so a line that cannot be read cannot be "
-                    "skipped: every row after it would be attributed to the "
-                    "wrong request." % (path, i, exc)) from exc
+                    "%s line %d is not JSON (%s). A line that cannot be read "
+                    "cannot be skipped: the reconciliation is by key and one "
+                    "result per planned row is a hard check, so dropping it "
+                    "would report a planned row as having no answer."
+                    % (path, i, exc)) from exc
     return out

@@ -2808,7 +2808,7 @@ def transport_guard(cfg: Config) -> None:
     Two branches used to live here and both are GONE, because the things they
     stood in for exist now: `mode = batch` reaches
     ankidkdeck.batch.transport (JSONL writer, job registry, wave splitter,
-    positional reconciliation, retry waves) and `cache_enabled` reaches
+    key-based reconciliation, retry waves) and `cache_enabled` reaches
     ankidkdeck.batch.caches. The rule the branches encoded is kept: a
     configuration that promises a discount the code cannot deliver must refuse
     rather than pay the full rate and file the row as if it had not.

@@ -1,10 +1,10 @@
 """The batch transport: the JSONL row, the keys, the fingerprint, the wave
-splitter, the cache lifecycle, the positional reconciliation and the retry bound.
+splitter, the cache lifecycle, the key-based reconciliation and the retry bound.
 
 EVERY TEST HERE IS OFFLINE. The service is a fake that reads the JSONL this
 package actually wrote and answers from it, so the round trip exercised is the
 real one: build a request through CallContext, serialize it, "upload" it,
-"download" a result file, reconcile it by position and write the cells.
+"download" a result file, reconcile it on the echoed key and write the cells.
 
 The invariants being pinned were measured on a real 32-row batch job (probe wave
 3) and are catalogued in specs/v3-translate-patch-plan.md section 1.6. Where a
@@ -13,6 +13,7 @@ this file.
 """
 
 import json
+import os
 import sys
 import types as pytypes
 
@@ -107,6 +108,11 @@ class FakeService:
         self.caches_updated = []
         self.cache_tokens = DECLARED_CACHE_TOKENS
         self.responder = None
+        # The real service does NOT return the rows in input order: measured
+        # 2026-08-27, it concatenates ~1000-row shards out of order. With this
+        # set, the fake reverses its answer lines -- the smallest permutation
+        # that breaks the position on a job too small to have shards.
+        self.shuffle_output = False
         self.create_raises = None
         # Injected once, then cleared: a crash between "the job is SUBMITTED on
         # the service" and "its results are on our disk" is the window a
@@ -174,9 +180,11 @@ class _Batches:
         rows = [json.loads(x) for x in self.svc.uploads[src].splitlines()
                 if x.strip()]
         out_name = self.svc.next_name("files")
-        self.svc.outputs[out_name] = "".join(
-            json.dumps(self.svc.answer(row, i)) + "\n"
-            for i, row in enumerate(rows))
+        answers = [json.dumps(self.svc.answer(row, i)) + "\n"
+                   for i, row in enumerate(rows)]
+        if self.svc.shuffle_output:
+            answers.reverse()
+        self.svc.outputs[out_name] = "".join(answers)
         name = self.svc.next_name("batches")
         job = FakeJob(name, src, "JOB_STATE_PENDING",
                       None if self.svc.no_dest else FakeDest(out_name),
@@ -648,12 +656,25 @@ def test_a_results_line_that_does_not_parse_is_fatal(cfg, tmp_path):
     path.write_text('{"key": "a"}\nnot json\n', encoding="utf-8")
     with pytest.raises(FatalError) as exc:
         BREG.read_results(path)
-    assert "positional" in str(exc.value)
+    assert "cannot be skipped" in str(exc.value)
 
 
 # ==========================================================================
-# 5.3 -- positional reconciliation
+# 5.3 -- reconciliation BY KEY
+#
+# The output order is NOT the input order. Measured 2026-08-27 on the first real
+# paid wave (Chinese-def-w0-00, 3,644 rows): the service returned four ~1000-row
+# shards, each internally in input order, concatenated in the order
+# [0-999], [3000-3643], [2000-2999], [1000-1999]. Positions 0-999 agreed, so the
+# divergence starts at exactly row 1000 -- invisible to every probe, all of
+# which were <= 32 rows. The fixtures below use that exact shape.
 # ==========================================================================
+
+# The real wave's shard geometry, verbatim: sizes in input order, then the order
+# the service concatenated them in.
+REAL_SHARDS = (1000, 1000, 1000, 644)
+REAL_SHARD_ORDER = (0, 3, 2, 1)
+
 
 def _plan(n_rows=3, kind="definition", n=2):
     return [{"pos": i, "key": "def__German__1__%02d" % i, "kind": kind,
@@ -675,34 +696,204 @@ def _line(key, n=2, finish="STOP", items=None):
                                   "totalTokenCount": 110}}}
 
 
-def test_positional_reconciliation(cfg):
-    """W0-4. N-1 good rows plus one BARE gRPC status with no key at all: the
-    error is attributed by POSITION, because the key echo on an error row is
-    undocumented (it was present in the probe wave, which is not a contract)."""
-    plan = _plan(3)
-    lines = [_line(plan[0]["key"]),
-             {"error": {"code": 7,
-                        "message": "The caller does not have permission"}},
-             _line(plan[2]["key"])]
-    out = BR.reconcile(plan, lines)
-    assert [o.ok for o in out] == [True, False, True]
-    assert out[1].key == plan[1]["key"]          # by position, not by key
-    assert out[1].key_echoed is None
-    assert out[1].error["code"] == 7
-    assert "does not have permission" in out[1].why()
+def _wide_plan(n_rows, kind="definition", n=2):
+    """A plan big enough to cross the ~1000-row shard boundary, unique keys."""
+    return [{"pos": i, "key": "def__Chinese__%d__00" % (11000000 + i),
+             "kind": kind, "n": n, "label": "hus", "cap": 1024,
+             "cells": [{"key": "c%d-%d" % (i, j), "src_sha": "s%d-%d" % (i, j)}
+                       for j in range(n)]}
+            for i in range(n_rows)]
+
+
+def _shard_shuffled(plan, sizes=REAL_SHARDS, order=REAL_SHARD_ORDER):
+    """The result file as the service really produced it: shards permuted.
+
+    Each shard stays internally in input order -- that part of the docs held --
+    and the shards are concatenated in `order`.
+    """
+    bounds, at = [], 0
+    for size in sizes:
+        bounds.append((at, at + size))
+        at += size
+    assert at == len(plan), "fixture shard sizes must cover the plan"
+    lines = []
+    for shard in order:
+        lo, hi = bounds[shard]
+        lines.extend(_line(row["key"]) for row in plan[lo:hi])
+    return lines
+
+
+def test_the_result_file_is_joined_on_the_key_not_on_the_position():
+    """THE REFUTED ASSUMPTION. 3,644 rows in the real wave's shard order.
+
+    The old code did zip(plan, lines). On the real file it REFUSED at row 1000,
+    because every line happened to carry its key and the cross-check fired --
+    that refusal is how the false guarantee was found. Had the key echo been
+    absent it would have written 2,644 of the 3,644 rows onto the wrong senses
+    in silence. The join is now the echoed key and the position is a note.
+    """
+    plan = _wide_plan(sum(REAL_SHARDS))
+    lines = _shard_shuffled(plan)
+    assert len(lines) == 3644
+    # The defect's shape, asserted so the fixture cannot drift into agreeing:
+    # position 999 still lines up, position 1000 does not, and a positional zip
+    # would pair 2,644 rows wrongly -- the count the real file produced.
+    assert lines[999]["key"] == plan[999]["key"]
+    assert lines[1000]["key"] != plan[1000]["key"]
+    assert sum(1 for row, line in zip(plan, lines)
+               if row["key"] != line["key"]) == 2644
+
+    report = {}
+    out = BR.reconcile(plan, lines, report=report)
+
+    # One outcome per PLANNED row, in PLAN order, each carrying its own answer.
+    assert len(out) == len(plan)
+    assert [o.key for o in out] == [r["key"] for r in plan]
+    assert [o.pos for o in out] == [r["pos"] for r in plan]
+    assert all(o.ok for o in out)
+    assert all(o.key_echoed == o.key for o in out)
+    # Every row's answer really came from the shuffled line that echoed its key.
+    assert out[1000].result_pos == 2644
+    assert out[3000].result_pos == 1000
+    # The order cross-check reports the shuffle and does NOT gate on it.
+    assert report["in_input_order"] is False
+    assert report["agreeing_prefix"] == 1000
+    assert report["first_divergence"] == 1000
+    assert report["positions_agreeing"] == 1000
+    assert report["joined_by_key"] == 3644
+    assert report["joined_without_key"] == 0
+    # 3, not 4: shard 0 and shard 3 happen to ascend across their boundary, so
+    # they read as one run. This is the number the real file produced.
+    assert report["ascending_runs"] == 3
+    assert "NOT in input order" in BR.order_note(report)
+
+
+def test_a_probe_scale_batch_that_does_arrive_in_order_still_works():
+    """Regression at probe scale: 32 rows, order preserved, which is what every
+    probe wave measured and why the false guarantee survived to a paid job."""
+    plan = _wide_plan(32)
+    report = {}
+    out = BR.reconcile(plan, [_line(row["key"]) for row in plan], report=report)
+    assert all(o.ok for o in out)
+    assert [o.result_pos for o in out] == list(range(32))
+    assert report["in_input_order"] is True
+    assert report["agreeing_prefix"] == 32
+    assert report["ascending_runs"] == 1
+    assert report["first_divergence"] is None
+    assert "arrived in input order" in BR.order_note(report)
 
 
 def test_a_length_mismatch_is_fatal_and_writes_nothing():
     with pytest.raises(FatalError) as exc:
         BR.reconcile(_plan(3), [_line("a"), _line("b")])
-    assert "POSITIONAL" in str(exc.value)
+    assert "Nothing was written" in str(exc.value)
+    assert "2 line(s) for a job of 3 row(s)" in str(exc.value)
 
 
-def test_a_key_that_disagrees_with_its_position_is_fatal():
-    plan = _plan(2)
+def test_a_duplicate_key_in_the_results_is_fatal():
+    """Two answers for one request. Which one is the answer? Refuse."""
+    plan = _plan(3)
+    lines = [_line(plan[0]["key"]), _line(plan[1]["key"]),
+             _line(plan[1]["key"])]
     with pytest.raises(FatalError) as exc:
-        BR.reconcile(plan, [_line(plan[1]["key"]), _line(plan[0]["key"])])
-    assert "cross-check" in str(exc.value)
+        BR.reconcile(plan, lines)
+    assert "duplicate key" in str(exc.value)
+    assert plan[1]["key"] in str(exc.value)
+    assert "Nothing was written" in str(exc.value)
+
+
+def test_a_key_the_job_never_sent_is_fatal_and_names_what_is_missing():
+    """Extra and missing are one break: with the count equal, a key that is not
+    in the plan means a planned key has no answer."""
+    plan = _plan(3)
+    lines = [_line(plan[0]["key"]), _line("def__German__999999__00"),
+             _line(plan[2]["key"])]
+    with pytest.raises(FatalError) as exc:
+        BR.reconcile(plan, lines)
+    assert "never sent" in str(exc.value)
+    assert "def__German__999999__00" in str(exc.value)
+    assert plan[1]["key"] in str(exc.value)      # the missing one is named
+
+
+def test_a_planned_key_with_no_result_is_fatal():
+    """Missing on its own: the count matches because an unkeyed SUCCESS row took
+    the slot, and an unkeyed success row would write cells on an assumption."""
+    plan = _plan(3)
+    payload = _line(plan[1]["key"])
+    payload.pop("key")
+    with pytest.raises(FatalError) as exc:
+        BR.reconcile(plan, [_line(plan[0]["key"]), payload,
+                            _line(plan[2]["key"])])
+    assert "no key and no error" in str(exc.value)
+    assert "Nothing was written" in str(exc.value)
+
+
+def test_one_keyless_error_row_is_attributable_because_the_slot_is_forced(cfg):
+    """W0-4, re-derived. N-1 keyed rows plus one BARE gRPC status with no key at
+    all: the keyed rows claim their own plan rows and exactly one slot is left,
+    so the attribution is forced rather than assumed."""
+    plan = _plan(3)
+    lines = [_line(plan[0]["key"]),
+             {"error": {"code": 7,
+                        "message": "The caller does not have permission"}},
+             _line(plan[2]["key"])]
+    report = {}
+    out = BR.reconcile(plan, lines, report=report)
+    assert [o.ok for o in out] == [True, False, True]
+    assert out[1].key == plan[1]["key"]
+    assert out[1].key_echoed is None
+    assert out[1].error["code"] == 7
+    assert "does not have permission" in out[1].why()
+    assert report["joined_by_key"] == 2
+    assert report["joined_without_key"] == 1
+
+
+def test_a_keyless_error_row_survives_the_shuffle_too():
+    """The forced slot is forced by the KEY SET, not by the position -- so it
+    still works when the keyed rows arrive in a different order entirely."""
+    plan = _plan(3)
+    lines = [_line(plan[2]["key"]),
+             _line(plan[0]["key"]),
+             {"error": {"code": 7, "message": "no permission"}}]
+    out = BR.reconcile(plan, lines)
+    assert [o.ok for o in out] == [True, False, True]
+    assert out[1].error["code"] == 7
+    assert out[0].result_pos == 1 and out[2].result_pos == 0
+
+
+def test_two_different_keyless_error_rows_are_ambiguous_and_fatal():
+    """Nothing places them: the order is not a contract, so a plausible guess is
+    exactly the mis-attribution the guard exists to prevent."""
+    plan = _plan(4)
+    lines = [_line(plan[0]["key"]),
+             {"error": {"code": 7, "message": "The caller does not have "
+                                              "permission"}},
+             {"error": {"code": 3, "message": "Request contains an invalid "
+                                             "argument."}},
+             _line(plan[3]["key"])]
+    with pytest.raises(FatalError) as exc:
+        BR.reconcile(plan, lines)
+    assert "not identical to one another" in str(exc.value)
+    assert "line(s) 1, 2" in str(exc.value)      # the rows are named
+    assert plan[1]["key"] in str(exc.value)      # so are the candidate slots
+    assert "Nothing was written" in str(exc.value)
+
+
+def test_a_dead_cache_fails_every_row_the_same_way_and_stays_recoverable():
+    """Code 7 on every row (prompt=0, billed $0) is the failure this has to
+    survive: the rows are keyless AND byte-identical, so no assignment can
+    change any outcome and the whole job is attributed and retryable."""
+    plan = _plan(5)
+    dead = {"error": {"code": 7, "message": "The caller does not have "
+                                           "permission"}}
+    report = {}
+    out = BR.reconcile(plan, [dict(dead) for _ in plan], report=report)
+    assert [o.key for o in out] == [r["key"] for r in plan]
+    assert all(o.error["code"] == 7 and not o.ok for o in out)
+    assert report["joined_without_key"] == 5
+    for outcome in out:
+        assert BW.retry_decision(outcome, cap=1024,
+                                 ceiling=8192)["why"] == "cache_missing"
 
 
 def test_the_count_lock_is_checked_on_our_side_of_the_wire():
@@ -979,6 +1170,41 @@ def test_a_batch_wave_writes_the_cells_it_paid_for(wave, cfg, registry,
     # two jobs: one definition (cached), one expression (never cached)
     assert len(report["batch"]["languages"]["German"]["jobs"]) == 2
     assert batch_genai.caches_created and len(batch_genai.caches_deleted) == 1
+
+
+def test_the_cells_land_on_their_own_senses_when_the_output_is_out_of_order(
+        wave, cfg, registry, batch_genai):
+    """END TO END at the real defect. The reconcile tests above prove the join;
+    this one runs the whole wave with the service returning the rows in another
+    order and checks the CELLS -- which is where the damage would have been,
+    because _absorb zips the plan row's cells against the outcome's items. Every
+    gloss names the request it came from, so a shifted attribution is loud."""
+    batch_genai.shuffle_output = True
+
+    def responder(row, pos):
+        array, n = n_of(row)
+        return ok_line(row, batch_genai.cache_tokens,
+                       items=[{"lemma": "L%d" % i,
+                               "gloss": "G-%s-%d" % (row["key"], i)}
+                              for i in range(n)])
+
+    batch_genai.responder = responder
+    S42.run(cfg, registry, lang="German", confirm=True)
+    tables = {
+        "definition": read_json(cfg.json_dir / "translations" / "German"
+                                / "definitions.json"),
+        "expression": read_json(cfg.json_dir / "translations" / "German"
+                                / "expressions.json")}
+    jobs = read_json(cfg.work_dir / "batch" / "jobs.json")["jobs"]
+    checked = 0
+    for job in jobs.values():
+        table = tables[job["kind"]]
+        for row in job["plan"]:
+            for i, cell in enumerate(row["cells"]):
+                assert (table[cell["key"]]["gloss"]
+                        == "G-%s-%d" % (row["key"], i))
+                checked += 1
+    assert checked == 3, "the fixture wave is 2 definitions and 1 expression"
 
 
 def test_the_ledger_rows_of_a_batch_wave_go_through_normalize_usage(wave, cfg,
@@ -2085,3 +2311,73 @@ def test_the_production_writer_is_semantically_identical_to_the_probe_writer(
     assert json.dumps(unsorted, ensure_ascii=False) != ours, \
         "with a different insertion order the unsorted bytes differ"
     assert json.dumps(unsorted, ensure_ascii=False, sort_keys=True) == ours
+
+
+# ==========================================================================
+# The real paid artifact
+#
+# Everything above is synthetic. This one reads the actual 3,644-row result file
+# the first paid wave produced and the actual plan it was submitted from, and is
+# the reason the fix is believed rather than argued. Read-only: reconcile()
+# writes nothing, and neither does this test.
+#
+# It SKIPS when the artifact is not on the box (CI, a fresh clone). Paths are
+# overridable so the evidence can live anywhere:
+#   ANKIDKDECK_PAID_JOBS_JSON  ANKIDKDECK_PAID_RESULTS
+# ==========================================================================
+
+PAID_JOBS_JSON = os.environ.get(
+    "ANKIDKDECK_PAID_JOBS_JSON",
+    os.path.expanduser("~/v3run/work/batch/jobs.json"))
+PAID_RESULTS = os.environ.get(
+    "ANKIDKDECK_PAID_RESULTS",
+    os.path.expanduser(
+        "~/v3run/PAID-RESULTS-BACKUP-Chinese-def-w0-00_results.jsonl"))
+PAID_JOB_ID = "Chinese-def-w0-00"
+
+
+@pytest.mark.skipif(
+    not (os.path.exists(PAID_JOBS_JSON) and os.path.exists(PAID_RESULTS)),
+    reason="the paid Chinese-def-w0-00 artifact is not on this box")
+def test_the_real_paid_result_file_reconciles_completely_on_the_key():
+    """THE MONEY TEST. 3,644 paid rows, out of order, joined with zero residue.
+
+    Measured 2026-08-27 against work/batch/jobs.json and the read-only backup of
+    the downloaded results. The old positional code refused this exact file at
+    row 1000, which is what exposed the false order guarantee; a positional zip
+    of this file pairs 2,644 of its 3,644 rows with the wrong request.
+    """
+    jobs = read_json(PAID_JOBS_JSON)["jobs"]
+    plan = jobs[PAID_JOB_ID]["plan"]
+    lines = BREG.read_results(PAID_RESULTS)
+    assert len(plan) == 3644 and len(lines) == 3644
+
+    report = {}
+    out = BR.reconcile(plan, lines, report=report)
+
+    # Complete join, zero residue: every planned row got its own paid answer.
+    assert len(out) == 3644
+    assert report["joined_by_key"] == 3644
+    assert report["joined_without_key"] == 0
+    assert all(o.key_echoed == o.key for o in out)
+    assert [o.key for o in out] == [row["key"] for row in plan]
+    assert len({o.result_pos for o in out}) == 3644
+    assert sum(1 for row, line in zip(plan, lines)
+               if row["key"] != line["key"]) == 2644, \
+        "the positional zip the old code used pairs 2,644 rows wrongly"
+
+    # The defect, on the real bytes: the file is NOT in input order, and the
+    # first 1000 rows are exactly why no probe could have caught it.
+    assert report["in_input_order"] is False
+    assert report["agreeing_prefix"] == 1000
+    assert report["first_divergence"] == 1000
+    assert report["positions_agreeing"] == 1000
+    assert report["ascending_runs"] == 3
+
+    # What the ingest will do with it: 3,640 rows land, 4 are MAX_TOKENS
+    # truncations for the retry ladder to re-buy at a higher cap. No error rows
+    # at all -- the cache held on every row (cachedContentTokenCount 1139).
+    assert sum(1 for o in out if o.ok) == 3640
+    assert [o.finish_reason for o in out if not o.ok] == ["MAX_TOKENS"] * 4
+    assert not [o for o in out if o.error]
+    assert {o.usage.get("cachedContentTokenCount") for o in out} == {1139}

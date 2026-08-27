@@ -25,8 +25,10 @@ The order of operations, and why each step is where it is:
   4. ONE job in flight. Poll to a terminal state, download IMMEDIATELY (the
      documented retention is self-contradictory: 6 weeks in one place, 48h in
      another), then submit the next.
-  5. ingest by POSITION. Output order is input order; the key echo is a
-     cross-check, because on an error row the key is undocumented.
+  5. ingest by KEY. The output order is NOT the input order past ~1000 rows
+     (measured 2026-08-27 on the first real wave: four ~1000-row shards
+     concatenated out of order), so the echoed key is the attribution and the
+     position is a reported cross-check. See reconcile.py.
   6. retry waves, bounded by MAX_RETRY_WAVES and by a per-cell attempt counter
      that survives the process. Retries stay on batch (owner decision D-06):
      nothing downgrades to standard or flex by itself, because an automatic
@@ -858,14 +860,22 @@ def _ingest_ready(s42, cfg, lang, reg, defs, exprs, tdir, *, usage, prov,
         if job.get("lang") != lang:
             continue
         lines = registry.read_results(job["results_path"])
-        outcomes = reconcile.reconcile(job["plan"], lines)
+        # The join is by key; the order cross-check is recorded and printed but
+        # never gates the write. A shuffled file with an intact bijection is a
+        # correct file -- measured on the first real wave, where the service
+        # returned four ~1000-row shards in a permuted order.
+        order = {}
+        outcomes = reconcile.reconcile(job["plan"], lines, report=order)
+        if not order.get("in_input_order", True):
+            print("  batch: %s %s"
+                  % (job["job_id"], reconcile.order_note(order)))
         written, failures = _absorb(
             s42, cfg, lang, job, outcomes, defs, exprs, tdir, usage=usage,
             prov=prov, prov_expr=prov_expr, contexts=contexts, summary=summary)
         reg.mark_recovered(job["job_id"], {
             "written": written, "failed": len(failures),
             "keys_echoed": sum(1 for o in outcomes if o.key_echoed),
-            "rows": len(outcomes)})
+            "rows": len(outcomes), "order_cross_check": order})
         summary["written"]["definitions"] += written.get("definitions", 0)
         summary["written"]["expressions"] += written.get("expressions", 0)
         if job.get("kind") == "expression" and job.get("canary"):
