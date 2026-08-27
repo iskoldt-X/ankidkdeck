@@ -664,6 +664,60 @@ def unmeasured_thinking_prior(stats: dict | None, kind: str | None = None,
                                        "LOW)")
 
 
+# The per-kind thinking DISTRIBUTION, which is a different question from the
+# per-kind thinking CEILING above. The bill needs a ceiling (what may this cost
+# at worst); G-THINK needs a distribution (does this wave look like the one that
+# was measured). Filed under its own key rather than squeezed into
+# THINKING_AT_LOW_BY_PROMPT_FAMILY for two reasons: that node is the PROBE's
+# record and is reconciled against calls.jsonl by tools/backfill_probe_stats.py,
+# and its schema has no non-zero share -- which is the term that catches "the
+# prompt changed and now everything thinks a little".
+THINKING_BOUND_FIELDS = ("mean", "nonzero_share", "n_observations", "source")
+
+
+def thinking_bound_key(level: str = "LOW") -> str:
+    """The stats.json key the per-kind thinking bounds live under."""
+    return "THINKING_PER_REQUEST_%s_BY_KIND" % level
+
+
+def thinking_bounds_by_kind(stats: dict | None, level: str = "LOW") -> dict:
+    """{kind: {mean, nonzero_share, max, p95, n_observations, source}} or {}.
+
+    What G-THINK adjudicates against, read off disk like every other measured
+    constant -- nothing here has a default, because a default would be a bound
+    nobody measured deciding whether a paid wave was healthy.
+
+    A kind is only returned when the entry carries the four fields that make the
+    bound meaningful AND says where it came from. An entry without `source` is
+    dropped rather than used: an unprovenanced number in the file that
+    adjudicates spending is the state the whole consumption discipline exists to
+    forbid, and silently trusting it is worse than having no bound (no bound
+    means WARN, which is honest).
+    """
+    node = ((stats or {}).get("thinking") or {}).get(thinking_bound_key(level))
+    if not isinstance(node, dict):
+        return {}
+    out: dict = {}
+    for kind, value in node.items():
+        if not isinstance(value, dict):
+            continue
+        if any(value.get(f) is None for f in THINKING_BOUND_FIELDS):
+            continue
+        out[str(kind)] = {
+            "mean": float(value["mean"]),
+            "nonzero_share": float(value["nonzero_share"]),
+            # `max` and `p95` are disclosure plus the one-row headroom term; a
+            # missing max only costs the small-wave allowance, so it is not
+            # grounds to drop the bound.
+            "max": float(value.get("max") or 0.0),
+            "p95": (None if value.get("p95") is None
+                    else float(value["p95"])),
+            "n_observations": int(value["n_observations"]),
+            "source": str(value["source"]),
+        }
+    return out
+
+
 def bill_requests(todo: list, pos_todo: list, lang: str) -> list:
     """One row per REQUEST that would be placed: its size, not its contents.
 

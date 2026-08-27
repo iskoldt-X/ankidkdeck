@@ -6,6 +6,15 @@ reconcile work/probes/stats.json against them.
     python3 tools/backfill_probe_stats.py --probes ~/v3run/work/probes \\
         --declare-prompt-id v4-frozen --write
 
+SECOND MODE -- rebase the THINKING measurement from PRODUCTION (see
+rebase_thinking_mode below). The probe ledger is 62 observations; a paid wave is
+thousands, and it is the only place the tail of the distribution is visible:
+
+    python3 tools/backfill_probe_stats.py --probes ~/v3run/work/probes \\
+        --rebase-thinking-from ~/v3run/work/reports/translate_usage.jsonl \\
+        --rebase-thinking-from ~/v3run/work/batch/Chinese-expr-w0-00_results.jsonl \\
+        --write
+
 Why a tool and not a hand edit. stats.json is the file that authorises spending:
 every request's output cap, the cache floor, the thinking constant and the whole
 bill are read from it, and nothing in the package has a default for any of them.
@@ -66,6 +75,7 @@ import datetime
 import hashlib
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -79,7 +89,16 @@ CONSUMED = {
     "PROMPT_TOKENS_fit.b": "same fit's intercept (system prompt + schema)",
     "PROMPT_TOKENS_system_only": "the cached half of the input, per language",
     "CHARS_PER_TOKEN": "offline prompt sizing (consumption rule 6)",
-    "thinking.THINKING_PER_REQUEST_LOW": "the bill's thinking term and G-THINK",
+    "thinking.THINKING_PER_REQUEST_LOW": "the bill's thinking term",
+    # DELIBERATELY NOT in s42.REQUIRED_STATS_KEYS, and that is a decision rather
+    # than an omission. Making it required would mean no workspace can spend
+    # until a production wave has measured it -- and a production wave is the
+    # only thing that CAN measure it, so the requirement would be circular and
+    # the first paid wave impossible. Absent, G-THINK warns on every kind and
+    # only fails at the MEDIUM band; present, it adjudicates properly.
+    "thinking.THINKING_PER_REQUEST_LOW_BY_KIND":
+        "G-THINK's per-kind mean and non-zero share bounds (optional: rebased "
+        "from a production wave, which cannot exist before the first spend)",
     "wave2.EXPLICIT_CACHE_FLOOR": "the cache constructor's floor",
     "wave2.W2_2_rich.cached": "the forbidden RICH-uncached figure on the bill",
     "budget.MAX_OUTPUT_FORMULA": "the formula the cap is derived from, in words",
@@ -105,6 +124,21 @@ FLOOR_NOTE = (
     "never written back -- derive_stats takes the FIRST match, so nothing "
     "overwrote anything: the wrong value was simply the one on file first, and "
     "floor_classifier went to UNCLASSIFIED with it.")
+
+
+def write_json_atomic(path: Path, payload) -> None:
+    """Same directory, then os.replace. NEVER truncate-then-write on this file.
+
+    stats.json is read by every paid run at spend time, and a rebase can be run
+    while another wave is draining in the same workspace. A plain write_text
+    truncates first, so a reader landing in that window gets a partial file --
+    on the artifact whose absence is a hard refusal, i.e. the failure would be a
+    crashed paid wave rather than a stale number.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1,
+                              sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def p95(values):
@@ -601,6 +635,369 @@ def relabel_refusal(stats: dict, raw: dict, declared: str, rebase: bool):
     }
 
 
+# --------------------------------------------------------------------------
+# SIBLING MODE: rebase the thinking measurement from the PRODUCTION ledger
+# --------------------------------------------------------------------------
+#
+# Why this mode had to exist. The probe ledger measured thinking at n=62, every
+# observation zero, and that zero was written into the artifact as an absolute --
+# which G-THINK then enforced per row. The first real definition wave (3,644 paid
+# requests) has mean 1.941 thought tokens/request, p95 0, max 797 and a 1.21%
+# non-zero tail, every row finishReason=STOP. So the probe number is not WRONG
+# about the centre of the distribution; it is blind to the tail, because 62
+# observations of a 1.2% event are expected to contain none.
+#
+# The reason a rebase could not be done with the mode above: rederive() reads
+# `calls.jsonl`, the probe harness's own ledger, and PRODUCTION NEVER WRITES THAT
+# FILE. A production wave writes reports/translate_usage.jsonl (one flat row per
+# call, with `kind`, `thinking_tokens` and `finish_reason` already derived by the
+# same identity this file uses) and, on the batch path, the raw
+# <job>_results.jsonl straight off the wire. Both shapes are read here, because
+# the expression canary's 20 rows exist ONLY in the second one: they were
+# downloaded but not yet absorbed into a usage ledger, and a measurement that is
+# on disk but unreachable by the tool is a measurement nobody can spend against.
+#
+# What this mode does NOT do: touch thinking.THINKING_PER_REQUEST_LOW. That key
+# is the PROBE's measurement and tools' own reconcile() compares it against
+# calls.jsonl; rewriting it from production would make the probe reconciliation
+# report DISAGREES for ever and set CONSUMPTION_GUARD, i.e. a rebase would block
+# spending. The production numbers get their own key. (They agree where it
+# matters anyway: p95 is 0.0 in both.)
+
+# The two shapes, and the field each one answers with. Stated as a table so a
+# third writer is a visible addition rather than a silent fallthrough.
+PRODUCTION_SHAPES = {
+    "usage_ledger": "flat row: kind, thinking_tokens, finish_reason, job_name",
+    "batch_results": "raw wire row: key, response.usageMetadata (thinking "
+                     "derived by the identity), response.candidates[].finishReason",
+}
+
+
+def kind_from_key(key: str, tags: dict) -> str | None:
+    """`expr__Chinese__11000033__00` -> "expression", via batch.keys.KIND_TAG."""
+    tag = str(key or "").split("__")[0]
+    return tags.get(tag)
+
+
+def lang_from_key(key: str) -> str | None:
+    parts = str(key or "").split("__")
+    return parts[1] if len(parts) > 3 else None
+
+
+def kind_tags() -> dict:
+    """{tag: kind}, inverted from the package so the tool cannot drift from it."""
+    try:
+        from ankidkdeck.batch.keys import KIND_TAG        # noqa: PLC0415
+        return {v: k for k, v in KIND_TAG.items()}
+    except Exception:                                     # noqa: BLE001
+        return {}
+
+
+def load_production_rows(path: Path, tags: dict) -> list:
+    """One normalised observation per PAID call, from either production shape."""
+    out = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if isinstance(row.get("response"), dict):
+                resp = row["response"]
+                usage = resp.get("usageMetadata") or {}
+                cands = resp.get("candidates") or []
+                out.append({
+                    "shape": "batch_results",
+                    "kind": kind_from_key(row.get("key"), tags),
+                    "lang": lang_from_key(row.get("key")),
+                    "thinking": derived_thinking(usage),
+                    "finish_reason": (cands[0] or {}).get("finishReason")
+                    if cands else None,
+                    "job": path.name.replace("_results.jsonl", ""),
+                    "model": resp.get("modelVersion"),
+                    "prompt_id": None, "file": path.name})
+                continue
+            if row.get("kind") is None or row.get("thinking_tokens") is None:
+                # Not a usage row (an error line, a header, another writer's
+                # shape). Skipped rather than counted as a zero: a row with no
+                # thinking field is not an observation of zero thinking.
+                continue
+            out.append({
+                "shape": "usage_ledger",
+                "kind": row.get("kind"),
+                "lang": lang_from_key(row.get("row_key")),
+                "thinking": int(row.get("thinking_tokens") or 0),
+                "finish_reason": row.get("finish_reason"),
+                "job": row.get("job_name") or row.get("mode") or path.name,
+                "model": row.get("model"),
+                "prompt_id": row.get("prompt_id"), "file": path.name})
+    return out
+
+
+def both_tails(values, keep: int = 24) -> list:
+    """A long sorted list, trimmed from the MIDDLE rather than from the end.
+
+    Trimming from the end is what a plain [:24] does, and on this data that
+    silently drops 283, 306, 491 and 797 -- i.e. exactly the tail the whole
+    rebase exists to put on file. The gap is marked with None so a reader cannot
+    mistake the list for complete.
+    """
+    values = sorted(values)
+    if len(values) <= keep:
+        return values
+    half = keep // 2
+    return values[:half] + [None] + values[-half:]
+
+
+def thinking_bounds_from_production(rows: list) -> dict:
+    """{kind: the bound G-THINK reads}, from normalised production observations.
+
+    THE WHOLE DISTRIBUTION, not one number: mean (what the gate compares), p95
+    and max (disclosure plus the small-wave allowance), the NON-ZERO SHARE (the
+    term that catches "the prompt changed and now everything thinks a little",
+    which a mean can absorb), and n. Plus the provenance, without which
+    s42.thinking_bounds_by_kind drops the entry rather than trust it.
+
+    finishReason is carried as a COUNT, not a filter. The 4 MAX_TOKENS rows of
+    the definition wave are real paid requests and belong in the denominator;
+    excluding them would quietly make the measured share of a wave depend on how
+    many of its requests were truncated.
+    """
+    by_kind: dict = {}
+    for row in rows:
+        if not row.get("kind"):
+            continue
+        by_kind.setdefault(row["kind"], []).append(row)
+    out: dict = {}
+    for kind, group in sorted(by_kind.items()):
+        values = [int(r["thinking"]) for r in group]
+        nonzero = [v for v in values if v]
+        finish: dict = {}
+        for row in group:
+            finish[str(row.get("finish_reason"))] = \
+                finish.get(str(row.get("finish_reason")), 0) + 1
+        jobs = sorted({str(r["job"]) for r in group if r.get("job")})
+        out[kind] = {
+            "mean": round(sum(values) / len(values), 6),
+            "p95": p95(values),
+            "max": max(values),
+            "nonzero_rows": len(nonzero),
+            "nonzero_share": round(len(nonzero) / len(values), 6),
+            "n_observations": len(values),
+            "distinct_nonzero_values": both_tails(set(nonzero)),
+            "finish_reasons": dict(sorted(finish.items())),
+            "languages": sorted({str(r["lang"]) for r in group if r.get("lang")}),
+            "models": sorted({str(r["model"]) for r in group if r.get("model")}),
+            "prompt_ids": sorted({str(r["prompt_id"]) for r in group
+                                  if r.get("prompt_id")}),
+            "shapes": sorted({str(r["shape"]) for r in group}),
+            "files": sorted({str(r["file"]) for r in group}),
+            "jobs": jobs,
+            "source": "production_wave %s" % (", ".join(jobs) or "unlabelled"),
+        }
+    return out
+
+
+def family_entries_from_bounds(bounds: dict, level: str, on_file=None) -> dict:
+    """The THINKING_AT_LOW_BY_PROMPT_FAMILY rows a rebase also has to write.
+
+    That node is what the BILL reads (s42.unmeasured_thinking_prior takes the
+    family's MAX as the per-request CEILING for a kind nobody probed), and the
+    expression prior has been the ranking prompt's 275 since it was invented --
+    a number measured on a different prompt entirely. The canary measured the
+    real thing at max 97. Writing here is the documented mechanism by which "the
+    canary replaces the prior": the key is matched on (level, family), and the
+    character count inside it is disclosure.
+
+    GAPS ONLY, and that restraint is the point. A family that already has an
+    entry is left exactly as it is, for two reasons. It is the PROBE's
+    measurement and this node is not this mode's business -- the gate's bound
+    lives under its own key. And the node's consumer takes the MAX per family, so
+    adding the definition wave's 797 next to the probe's 0 would raise a BILL
+    input by 797 tokens/request as a side effect of a GATE rebase, which is
+    exactly the kind of unasked-for coupling the money stack keeps being bitten
+    by. The skipped families are printed, not swallowed.
+
+    Only kinds the LIVE package can size are written: the key format carries the
+    system prompt's character count, and inventing one would put a number in the
+    artifact that no file on disk supports.
+    """
+    try:
+        from ankidkdeck.stages.s42_translate import (   # noqa: PLC0415
+            THINKING_FAMILY_RE, thinking_family_key)
+    except Exception as exc:                            # noqa: BLE001
+        return {"_unavailable": str(exc)}
+    have = set()
+    for key in (on_file or {}):
+        match = THINKING_FAMILY_RE.match(str(key))
+        if match and match.group(1) == level:
+            have.add(match.group(2))
+    out: dict = {}
+    for kind, bound in sorted(bounds.items()):
+        if kind in have:
+            out.setdefault("_skipped", []).append(
+                "%s (an existing %s family entry is already on file; the "
+                "gate's bound lives under THINKING_PER_REQUEST_%s_BY_KIND)"
+                % (kind, kind, level))
+            continue
+        for lang in bound.get("languages") or []:
+            try:
+                key = thinking_family_key(kind, lang, level)
+            except Exception:                           # noqa: BLE001
+                continue
+            out[key] = {"distinct_values": bound["distinct_nonzero_values"]
+                        if bound["max"] else [0],
+                        "max": bound["max"], "mean": bound["mean"],
+                        "n_observations": bound["n_observations"],
+                        "p95": bound["p95"], "source": bound["source"]}
+    return out
+
+
+def rebase_thinking_mode(stats_path: Path, paths: list, level: str,
+                         write: bool) -> int:
+    """The sibling mode's whole run: read production, patch, report.
+
+    IDEMPOTENT by construction: everything derived is sorted and rounded, and
+    `rebased_at` is carried forward when nothing else changed -- so a second run
+    on the same inputs writes nothing and says so, rather than churning the date
+    on the file that authorises spending (the bug the prompt_lineage writer had).
+    """
+    tags = kind_tags()
+    if not tags:
+        print("cannot import ankidkdeck.batch.keys, so a raw batch result "
+              "file's kind cannot be resolved; run from the repo or install the "
+              "package", file=sys.stderr)
+        return 2
+    rows = []
+    for path in paths:
+        if not path.exists():
+            print("missing: %s" % path, file=sys.stderr)
+            return 2
+        found = load_production_rows(path, tags)
+        print("  %-52s %d observation(s)" % (path.name, len(found)))
+        rows += found
+    if not rows:
+        print("no production observations in any input", file=sys.stderr)
+        return 2
+
+    bounds = thinking_bounds_from_production(rows)
+    stats = json.loads(stats_path.read_text(encoding="utf-8"))
+    node_key = "THINKING_PER_REQUEST_%s_BY_KIND" % level
+    old_node = ((stats.get("thinking") or {}).get(node_key)) or {}
+    fam_key = "THINKING_AT_LOW_BY_PROMPT_FAMILY"
+    old_fam = (stats.get("thinking") or {}).get(fam_key) or {}
+    families = family_entries_from_bounds(bounds, level, old_fam)
+
+    print("--- production thinking, per kind (level %s) ---" % level)
+    for kind, bound in sorted(bounds.items()):
+        print("  %-12s n=%-6d mean=%-10s p95=%-6s max=%-5d nonzero=%d (%.4f%%)"
+              % (kind, bound["n_observations"], bound["mean"], bound["p95"],
+                 bound["max"], bound["nonzero_rows"],
+                 bound["nonzero_share"] * 100))
+        print("               finish %s  jobs %s"
+              % (bound["finish_reasons"], ", ".join(bound["jobs"])))
+        was = old_node.get(kind) or {}
+        if was:
+            print("               was: mean=%s nonzero_share=%s n=%s (%s)"
+                  % (was.get("mean"), was.get("nonzero_share"),
+                     was.get("n_observations"), was.get("source")))
+    for note in families.get("_skipped") or []:
+        print("  bill ceiling node NOT touched for %s" % note)
+
+    patch = copy.deepcopy(stats)
+    patch.setdefault("thinking", {})
+    want = {kind: dict(bound, rebased_at=datetime.date.today().isoformat())
+            for kind, bound in bounds.items()}
+    # Carry the old date forward when only the date would change, so re-running
+    # is a no-op on disk.
+    for kind, bound in want.items():
+        was = old_node.get(kind) or {}
+        if was and was.get("rebased_at") \
+                and {k: v for k, v in was.items() if k != "rebased_at"} \
+                == {k: v for k, v in bound.items() if k != "rebased_at"}:
+            bound["rebased_at"] = was["rebased_at"]
+    merged_node = dict(old_node)
+    merged_node.update(want)
+    changes = []
+    if merged_node != old_node:
+        patch["thinking"][node_key] = merged_node
+        changes.append("thinking.%s (%s)" % (node_key, ", ".join(sorted(want))))
+    # MERGED, never replaced: the probe's own family entries stay on file.
+    new_fam = dict(old_fam)
+    for key, value in families.items():
+        if key.startswith("_"):
+            continue
+        new_fam[key] = value
+    if new_fam != old_fam:
+        patch["thinking"][fam_key] = new_fam
+        added = sorted(set(new_fam) - set(old_fam))
+        moved = sorted(k for k in families
+                       if k in old_fam and old_fam[k] != new_fam.get(k))
+        changes.append("thinking.%s (added %s; rebased %s)"
+                       % (fam_key, ", ".join(added) or "none",
+                          ", ".join(moved) or "none"))
+    patch["thinking"]["%s_note" % node_key] = (
+        "The per-kind thinking DISTRIBUTION, from PAID production requests, and "
+        "the only thing G-THINK adjudicates against. It is not "
+        "THINKING_PER_REQUEST_%s: that key is the PROBE's measurement (n=62, "
+        "every observation zero) and is reconciled against calls.jsonl, so it "
+        "is deliberately left alone. The probe is not wrong about the centre of "
+        "the distribution -- p95 is 0.0 in both -- it is blind to the tail, "
+        "because 62 observations of a 1.2%% event are expected to contain none. "
+        "A bound here is a MEAN and a NON-ZERO SHARE, never a per-row ceiling: "
+        "the wave behind the definition entry has a max of 797 thought tokens "
+        "on a row whose finishReason is STOP." % level)
+    if patch["thinking"]["%s_note" % node_key] != \
+            (stats.get("thinking") or {}).get("%s_note" % node_key):
+        changes.append("thinking.%s_note" % node_key)
+
+    print("--- verdict ---")
+    if not changes:
+        print("  nothing to change: the artifact already carries this "
+              "measurement")
+        return 0
+    print("  changes %s:" % ("to write" if write else "that --write would make"))
+    for change in changes:
+        print("    %s" % change)
+    if not write:
+        return 0
+
+    existing = sorted(stats_path.parent.glob("%s.pre-rebase-thinking-*.json"
+                                             % stats_path.stem))
+    if existing:
+        print("  pre-image already on file: %s" % existing[0])
+    else:
+        pre = stats_path.with_name("%s.pre-rebase-thinking-%s.json"
+                                   % (stats_path.stem,
+                                      datetime.date.today().isoformat()))
+        pre.write_text(json.dumps(stats, ensure_ascii=False, indent=1,
+                                  sort_keys=True), encoding="utf-8")
+        print("  pre-image: %s" % pre)
+    prior = list((stats.get("backfilled") or {}).get("changes") or [])
+    cumulative = prior + [c for c in changes if c not in prior]
+    patch["backfilled"] = {
+        "at": datetime.date.today().isoformat(),
+        "by": "tools/backfill_probe_stats.py --rebase-thinking-from",
+        "from": [str(p) for p in paths],
+        "changes": cumulative,
+        "changes_this_run": changes,
+        "why": ("the artifact authorises spending, so every value in it has to "
+                "come from a ledger rather than from a hand -- and the "
+                "PRODUCTION ledger is the only one that has seen the tail of "
+                "the thinking distribution"),
+    }
+    write_json_atomic(stats_path, patch)
+    report = stats_path.with_name("stats_thinking_rebase_report.json")
+    report.write_text(json.dumps(
+        {"at": datetime.date.today().isoformat(), "level": level,
+         "stats": str(stats_path), "from": [str(p) for p in paths],
+         "shapes": PRODUCTION_SHAPES, "bounds": bounds,
+         "family_entries": families, "changes": changes},
+        ensure_ascii=False, indent=1, sort_keys=True), encoding="utf-8")
+    print("  wrote %s and %s" % (stats_path, report))
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--probes", required=True,
@@ -620,6 +1017,20 @@ def main(argv=None) -> int:
                          "authorise a RICH spend. Sets CONSUMPTION_GUARD when "
                          "the raw ledger has not changed, i.e. when no new "
                          "probe wave stands behind the new label.")
+    ap.add_argument("--rebase-thinking-from", metavar="PATH", action="append",
+                    default=[],
+                    help="SIBLING MODE. Rebase the per-kind thinking bounds "
+                         "G-THINK reads from a PRODUCTION artifact instead of "
+                         "the probe ledger: reports/translate_usage.jsonl, "
+                         "reports/review_usage_<lang>.jsonl, or a raw batch "
+                         "<job>_results.jsonl. Repeatable. Needs no "
+                         "calls.jsonl, does not touch the probe constants and "
+                         "does not touch CONSUMPTION_GUARD.")
+    ap.add_argument("--thinking-level", default="LOW",
+                    help="the thinkingLevel the production rows were sent at "
+                         "(default LOW). It names the key the bounds are filed "
+                         "under; rows sent at another level are another "
+                         "measurement.")
     ap.add_argument("--write", action="store_true",
                     help="patch stats.json (a dated pre-image is written next "
                          "to it first) and write the provenance report")
@@ -630,10 +1041,24 @@ def main(argv=None) -> int:
         else probes / "stats.json"
     calls_path = Path(args.calls).expanduser() if args.calls \
         else probes / "calls.jsonl"
-    for path in (stats_path, calls_path):
-        if not path.exists():
-            print("missing: %s" % path, file=sys.stderr)
-            return 2
+    if not stats_path.exists():
+        print("missing: %s" % stats_path, file=sys.stderr)
+        return 2
+
+    # The sibling mode runs alone. Kept separate rather than folded into the
+    # reconciliation because it answers a different question against a different
+    # ledger, and because it must work on a workspace that has no calls.jsonl at
+    # all -- which is every workspace that has only ever run production.
+    if args.rebase_thinking_from:
+        print("--- rebasing thinking from production artifacts ---")
+        return rebase_thinking_mode(
+            stats_path,
+            [Path(p).expanduser() for p in args.rebase_thinking_from],
+            str(args.thinking_level).upper(), args.write)
+
+    if not calls_path.exists():
+        print("missing: %s" % calls_path, file=sys.stderr)
+        return 2
 
     raw = rederive(load_calls(calls_path))
     stats = json.loads(stats_path.read_text(encoding="utf-8"))
@@ -700,9 +1125,17 @@ def main(argv=None) -> int:
             % raw.get("prompt_family_chars"))
         patch["thinking"]["THINKING_PER_REQUEST_LOW_by_probe"] = \
             raw.get("thinking_at_low_by_probe")
-        patch["thinking"]["THINKING_AT_LOW_BY_PROMPT_FAMILY"] = {
-            k: v for k, v in (raw.get("thinking_by_family") or {}).items()
-            if k.startswith("LOW|")}
+        # MERGED over what is already on file, not assigned over it. The sibling
+        # rebase mode writes production-measured families into this same node
+        # (that is how the expression canary replaces the ranking prompt's 275),
+        # and a plain assignment here would silently delete a paid measurement
+        # from the file that authorises spending.
+        family = dict((stats.get("thinking") or {}).get(
+            "THINKING_AT_LOW_BY_PROMPT_FAMILY") or {})
+        family.update({k: v for k, v
+                       in (raw.get("thinking_by_family") or {}).items()
+                       if k.startswith("LOW|")})
+        patch["thinking"]["THINKING_AT_LOW_BY_PROMPT_FAMILY"] = family
         changes.append("thinking.THINKING_PER_REQUEST_LOW_scope + by_probe + "
                        "by_prompt_family")
 
@@ -824,8 +1257,7 @@ def main(argv=None) -> int:
             "why": ("the artifact authorises spending, so every value in it has "
                     "to come from the probe ledger rather than from a hand"),
         }
-        stats_path.write_text(json.dumps(patch, ensure_ascii=False, indent=1,
-                                         sort_keys=True), encoding="utf-8")
+        write_json_atomic(stats_path, patch)
         report = stats_path.with_name("stats_backfill_report.json")
         report.write_text(json.dumps(
             {"at": datetime.date.today().isoformat(),

@@ -667,38 +667,188 @@ def test_g_cache_still_fails_the_original_failure_at_every_real_denominator():
                         "languages and across history")
 
 
-def test_g_think_predicate():
-    """A measured zero passes; a MEDIUM-scale row fails.
+# The measured definition bound, as the production rebase wrote it. Kept next to
+# the tests that consume it so a re-measurement is one edit, and deliberately the
+# SAME numbers as the conftest artifact -- a bound the tests invented would prove
+# only that the arithmetic runs.
+DEFINITION_BOUND = {"mean": 1.939145, "nonzero_share": 0.012061, "max": 797,
+                    "p95": 0.0, "n_observations": 3648,
+                    "source": "production_wave batches/ocdj..., batches/u46g..."}
+EXPRESSION_BOUND = {"mean": 4.85, "nonzero_share": 0.05, "max": 97,
+                    "p95": 4.85, "n_observations": 20,
+                    "source": "production_wave Chinese-expr-w0-00"}
+MEDIUM_BAND = 578.7                 # thinking.THINKING_PER_REQUEST_MEDIUM.mean
 
-    And the finding that made this gate three-way: at the SAME thinkingLevel=LOW
-    the ranking prompt produced 236-275 thought tokens (field present,
-    finishReason STOP) while the definition prompt produced 0 in 62 observations.
-    A gate that failed on any non-zero row would fail every healthy ranking
-    wave -- the same mistake as cached/prompt.
+
+def real_definition_wave():
+    """The Chinese definition wave's own thinking distribution, row for row.
+
+    3,648 paid requests, 44 of them non-zero (60..797 thought tokens), every one
+    finishReason=STOP. Reconstructed from the measured shape rather than copied
+    row by row: what the gate reads is `kind` and `thinking_tokens`, and the
+    numbers below are the wave's real ones.
     """
-    zeros = [usage_row(thinking_tokens=0) for _ in range(5)]
-    ok, detail = gates.thinking_is_at_the_measured_level(zeros, "LOW", 0.0)
-    assert ok is True and detail["distinct_thinking_values"] == [0]
+    tail = [60, 69, 74, 78, 79, 83, 83, 86, 86, 86, 88, 90, 94, 95, 99, 100,
+            106, 111, 113, 116, 117, 118, 129, 136, 136, 139, 143, 159, 166,
+            168, 172, 173, 173, 174, 188, 201, 204, 209, 239, 257, 283, 306,
+            491, 797]
+    rows = [usage_row(label="def-%d" % i, thinking_tokens=0)
+            for i in range(3648 - len(tail))]
+    rows += [usage_row(label="def-nonzero-%d" % i, thinking_tokens=v)
+             for i, v in enumerate(tail)]
+    return rows
 
-    # accidentally MEDIUM on the measured kind
-    medium = zeros + [usage_row(label="oops", thinking_tokens=578)]
-    ok, detail = gates.thinking_is_at_the_measured_level(medium, "LOW", 0.0)
-    assert ok is False
-    assert detail["violations"][0]["thinking_tokens"] == 578
 
-    # the ranking prompt at LOW: recorded, warned about, NOT failed
-    rank = zeros + [usage_row(label="rank", kind="rank", thinking_tokens=275)]
+def test_g_think_does_not_hold_a_measured_kind_to_an_absolute_zero():
+    """THE DEFECT, pinned: a correct wave has to be able to pass this gate.
+
+    Until 2026-08-27 a kind in MEASURED_OUTPUT_KINDS was held to EXACTLY zero
+    thought tokens on EVERY row, because the constant came from 62 probe
+    observations that all happened to be zero and was written down as an
+    absolute. Then the first real definition wave arrived: 3,648 paid requests,
+    mean 1.939 thought tokens/request, p95 0, max 797, 44 rows (1.21%) non-zero,
+    every one of them finishReason=STOP and healthy. All 44 counted as
+    violations, so the gate could not be passed by correct output -- the same
+    disease as G-CACHE's cached/prompt criterion and G-SCRIPT's GB2312 test.
+
+    Revert the semantics to a per-row zero and this test fails on the first
+    non-zero row, which is the whole point of it.
+    """
+    rows = real_definition_wave()
     ok, detail = gates.thinking_is_at_the_measured_level(
-        rank, "LOW", 0.0, strict_kinds=("definition",), alarm_at=578.7)
+        rows, "LOW", {"definition": DEFINITION_BOUND}, MEDIUM_BAND)
+    assert ok is True, detail["violations"]
+    node = detail["by_kind"]["definition"]
+    assert node["requests"] == 3648
+    assert node["nonzero_rows"] == 44
+    # the two things that are actually compared...
+    assert node["mean"] < node["mean_allowed"]
+    assert node["nonzero_share"] < node["nonzero_share_allowed"]
+    # ...and the one that is only reported. 797 is in the detail and not in the
+    # violations, and a max that could fail is the defect coming back.
+    assert node["max_tokens"] == 797
+    assert node["max_row"]["thinking_tokens"] == 797
+    assert detail["violations"] == []
+    assert "reported, never failed" in detail["criterion"]
+
+
+def test_g_think_still_catches_a_wave_that_accidentally_ran_at_medium():
+    """The accident the gate exists for, on the measured MEDIUM distribution.
+
+    thinkingLevel unset means MEDIUM, and MEDIUM was measured at mean 578.7
+    thought tokens/request -- 298x the definition wave's own mean and 58x the
+    signed floor. Caught three separate ways, which is the margin the statistical
+    criterion buys: the MEDIUM band by name, the mean bound, and the non-zero
+    share.
+    """
+    rows = [usage_row(label="m-%d" % i, thinking_tokens=579)
+            for i in range(1000)]
+    ok, detail = gates.thinking_is_at_the_measured_level(
+        rows, "LOW", {"definition": DEFINITION_BOUND}, MEDIUM_BAND)
+    assert ok is False
+    tests = {v["test"] for v in detail["violations"]}
+    assert tests == {"medium_band", "mean_thoughts_per_request",
+                     "nonzero_share"}
+    assert detail["by_kind"]["definition"]["verdict"] == "FAIL"
+
+
+def test_g_think_catches_prompt_creep_that_a_mean_alone_would_absorb():
+    """Why the non-zero SHARE is a separate term and not decoration.
+
+    A prompt regression that makes EVERY request think a little is the shape a
+    mean bound cannot see: 8 tokens/request is inside the 10-token floor, so the
+    mean test passes it. The share test does not -- 100% of rows thinking is not
+    the 1.21% that was measured, whatever the total costs.
+    """
+    rows = [usage_row(label="c-%d" % i, thinking_tokens=8)
+            for i in range(1000)]
+    ok, detail = gates.thinking_is_at_the_measured_level(
+        rows, "LOW", {"definition": DEFINITION_BOUND}, MEDIUM_BAND)
+    assert ok is False
+    node = detail["by_kind"]["definition"]
+    assert node["mean"] <= node["mean_allowed"], "the mean must NOT be what bit"
+    assert [v["test"] for v in detail["violations"]] == ["nonzero_share"]
+
+
+def test_g_think_gives_a_small_wave_one_row_of_measured_headroom():
+    """A retry pass must not fail on the tail that was measured.
+
+    The measured maximum is 797 thought tokens on a healthy STOP row. On a
+    20-request wave one such row is a mean of 39.85, which is four times the
+    floor -- so a bound of max(mean x margin, floor) alone would fail a retry
+    pass for containing exactly what the 3,648-row wave contained. Hence the
+    `measured max / requests` and `1/requests` terms.
+    """
+    rows = [usage_row(label="r-%d" % i, thinking_tokens=0) for i in range(19)]
+    rows.append(usage_row(label="r-tail", thinking_tokens=797))
+    ok, detail = gates.thinking_is_at_the_measured_level(
+        rows, "LOW", {"definition": DEFINITION_BOUND}, MEDIUM_BAND)
+    assert ok is True, detail["violations"]
+    assert detail["by_kind"]["definition"]["single_row_headroom"] is True
+    # TWO such rows is no longer the measured tail
+    rows.append(usage_row(label="r-tail2", thinking_tokens=797))
+    ok, _ = gates.thinking_is_at_the_measured_level(
+        rows, "LOW", {"definition": DEFINITION_BOUND}, MEDIUM_BAND)
+    assert ok is False
+
+
+def test_g_think_warns_on_an_unmeasured_kind_and_fails_it_at_the_medium_band():
+    """The finding that made this gate more than one number, still enforced.
+
+    At the SAME thinkingLevel=LOW the ranking prompt produced 236-275 thought
+    tokens with the field PRESENT and finishReason=STOP, while the definition
+    prompt produced 0 in 62 observations. A constant nobody measured for a kind
+    is not grounds to call that kind's wave broken -- but the MEDIUM band is
+    measured for every kind, so reaching it still fails.
+    """
+    rank = [usage_row(label="rank-%d" % i, kind="rank", thinking_tokens=275)
+            for i in range(4)]
+    ok, detail = gates.thinking_is_at_the_measured_level(
+        rank, "LOW", {"definition": DEFINITION_BOUND}, MEDIUM_BAND)
     assert ok is True
-    assert detail["warnings"][0]["thinking_tokens"] == 275
+    assert detail["by_kind"]["rank"]["verdict"] == "WARN (unmeasured kind)"
+    assert detail["warnings"][0]["kind"] == "rank"
     assert detail["warning_note"]
 
-    # but the same unmeasured kind reaching the MEDIUM band still fails
-    ok, _ = gates.thinking_is_at_the_measured_level(
-        zeros + [usage_row(kind="rank", thinking_tokens=900)], "LOW", 0.0,
-        strict_kinds=("definition",), alarm_at=578.7)
+    loud = [usage_row(kind="rank", thinking_tokens=900) for _ in range(4)]
+    ok, detail = gates.thinking_is_at_the_measured_level(
+        loud, "LOW", {"definition": DEFINITION_BOUND}, MEDIUM_BAND)
     assert ok is False
+    assert detail["violations"][0]["test"] == "medium_band"
+
+
+def test_g_think_judges_each_kind_against_its_own_measurement():
+    """Per KIND, not one pooled number.
+
+    The expression canary measured mean 4.85 / 5% non-zero on 20 paid rows,
+    which is 2.5x the definition mean and 4x its share. Pooling the two would
+    make an expression wave look like a definition regression, and would let a
+    definition wave hide inside the expression allowance.
+    """
+    bounds = {"definition": DEFINITION_BOUND, "expression": EXPRESSION_BOUND}
+    rows = [usage_row(label="d-%d" % i, thinking_tokens=0) for i in range(200)]
+    rows += [usage_row(label="e-%d" % i, kind="expression",
+                       thinking_tokens=97 if i == 0 else 0)
+             for i in range(20)]
+    ok, detail = gates.thinking_is_at_the_measured_level(
+        rows, "LOW", bounds, MEDIUM_BAND)
+    assert ok is True, detail["violations"]
+    assert detail["by_kind"]["expression"]["measured"]["source"] \
+        == EXPRESSION_BOUND["source"]
+    assert detail["by_kind"]["definition"]["measured"]["source"] \
+        == DEFINITION_BOUND["source"]
+
+
+def test_g_think_refuses_when_it_has_nothing_to_adjudicate_against():
+    """No bound and no MEDIUM band is a REFUSAL, not a clean wave.
+
+    Same rule as G-PROMPT with no cache_prompt_shas: a gate that passes on an
+    empty check manufactures the belief that something was checked.
+    """
+    rows = [usage_row(thinking_tokens=0) for _ in range(5)]
+    ok, detail = gates.thinking_is_at_the_measured_level(rows, "LOW", {}, None)
+    assert ok is False
+    assert "nothing to adjudicate" in detail["why"]
 
 
 def test_g_bill_predicate():
@@ -922,6 +1072,66 @@ def test_the_registry_policy_numbers_are_not_dead_data(cfg, probe_stats):
     assert built["G-CACHE"][0] is False         # 0.60 does not clear 0.95
 
 
+def test_the_registry_think_numbers_are_not_dead_data(cfg, probe_stats):
+    """G-THINK's three policy numbers, held to the same standard as the other two.
+
+    They were added with the statistical rewrite, and a margin nobody can change
+    from the file they signed is a margin nobody reviewed -- the same finding
+    that made bill_tolerance_factor and cache_hit_min_share reachable. Each of
+    the three is moved on its own and has to flip a verdict by itself.
+    """
+    bill = {"German": {"prompt_id": "v4-frozen",
+                       "prompt_sha256": {"definition": "d" * 64},
+                       "dollars": {"lean_uncached": 10.0}}}
+
+    def verdict(rows):
+        built = {g.id: g.fn() for g in
+                 gates.post_wave_gates(cfg, bill, rows, lang="German",
+                                       stats=probe_stats)}
+        return built["G-THINK"]
+
+    # 100 rows each thinking 12 tokens: over the signed 10-token floor, and every
+    # row non-zero so the share term is over 0.05 too.
+    crept = [usage_row(label="k%d" % i, prompt_sha256="d" * 64,
+                       thinking_tokens=12) for i in range(100)]
+    ok, detail = verdict(crept)
+    assert ok is False
+    assert detail["mean_margin"] == 3.0
+    assert detail["mean_floor_tokens"] == 10.0
+    assert detail["nonzero_share_floor"] == 0.05
+
+    # a human raises the floor past 12 -- the mean test stops biting...
+    write_json(cfg.registry_local / "gates.json",
+               {"think_mean_floor_tokens": 50.0})
+    ok, detail = verdict(crept)
+    assert detail["mean_floor_tokens"] == 50.0
+    assert [v["test"] for v in detail["violations"]] == ["nonzero_share"]
+
+    # ...and once the share floor is raised too, the same wave passes. Both
+    # numbers had to move, which is the point of having two terms.
+    write_json(cfg.registry_local / "gates.json",
+               {"think_mean_floor_tokens": 50.0,
+                "think_nonzero_share_floor": 1.0})
+    ok, detail = verdict(crept)
+    assert ok is True, detail["violations"]
+
+    # the margin on its own: 8 tokens/request against the measured mean 1.939145.
+    # margin 3 gives 5.82, under the 10-token floor, so raise the floor out of the
+    # way and let the margin decide.
+    eight = [usage_row(label="m%d" % i, prompt_sha256="d" * 64,
+                       thinking_tokens=8) for i in range(100)]
+    write_json(cfg.registry_local / "gates.json",
+               {"think_mean_floor_tokens": 0.0,
+                "think_nonzero_share_floor": 1.0, "think_mean_margin": 3.0})
+    ok, detail = verdict(eight)
+    assert ok is False and detail["mean_margin"] == 3.0
+    write_json(cfg.registry_local / "gates.json",
+               {"think_mean_floor_tokens": 0.0,
+                "think_nonzero_share_floor": 1.0, "think_mean_margin": 10.0})
+    ok, detail = verdict(eight)          # 1.939145 x 10 = 19.4 clears 8
+    assert ok is True and detail["mean_margin"] == 10.0
+
+
 def test_pre_spend_gates_refuse_a_run_nobody_signed_for(cfg, probe_stats):
     """The two gates that stand between --confirm-spend and the first call, on a
     workspace in exactly the state this patch leaves it in: no refreeze stamp,
@@ -968,9 +1178,20 @@ def test_post_wave_gates_adjudicate_a_wave_that_was_paid_for(cfg, probe_stats):
     assert all(ok for ok, _ in results.values()), results
     assert results["G-CACHE"][1]["verdict"] == "n/a"
     # the MEDIUM alarm band was read off the artifact, not hard-coded
-    assert results["G-THINK"][1]["medium_band_alarm_at"] == 578.7
-    assert results["G-THINK"][1]["kinds_held_to_the_measured_zero"] \
-        == ["definition"]
+    think = results["G-THINK"][1]
+    assert think["medium_band_alarm_at"] == 578.7
+    # ...and so is every per-kind bound. WHICH kinds have one is a property of
+    # what has been measured, so it comes off the file -- it is deliberately no
+    # longer MEASURED_OUTPUT_KINDS, which is the set whose OUTPUT fit was
+    # measured and whose reuse here is what held the definition wave to zero.
+    assert think["kinds_with_a_measured_bound"] == ["definition", "expression"]
+    assert think["by_kind"]["definition"]["measured"]["source"] \
+        .startswith("production_wave ")
+    # a two-row wave: the bound is the one-row headroom (measured max 797 / 2),
+    # not the floor, because one row at the measured maximum may never fail a
+    # wave by itself
+    assert think["by_kind"]["definition"]["mean_allowed"] == 797 / 2
+    assert think["by_kind"]["definition"]["single_row_headroom"] is True
 
 
 # --------------------------------------------------------------------------
@@ -1250,7 +1471,14 @@ def test_the_bill_uses_a_p95_and_the_artifact_has_to_carry_one(cfg,
 # --------------------------------------------------------------------------
 
 MEASURED_LITERALS = {35.964, 23.07, 23.917, 1164.2, 1135, 1092, 4564, 4779,
-                     578.7, 1042.0, 1156, 4.314, 4.322, 4.295, 0.985, 0.632}
+                     578.7, 1042.0, 1156, 4.314, 4.322, 4.295, 0.985, 0.632,
+                     # G-THINK's rebased bounds, from the production usage
+                     # ledger: the definition wave's mean, non-zero share and
+                     # maximum, and the expression canary's mean and maximum.
+                     # These are the numbers whose absolute-zero predecessor
+                     # made a correct wave unpassable, so a copy of any of them
+                     # inside gates.py is the defect coming back by hand.
+                     1.939145, 0.012061, 797, 4.85, 97}
 
 
 def test_the_money_stack_hard_codes_no_measured_constant():
@@ -1311,6 +1539,212 @@ def test_the_required_constants_are_one_list():
     for key in required:
         assert key in CONSUMED or key.split(".")[0] in {
             c.split(".")[0] for c in CONSUMED}, key
+
+
+def _load_backfill_tool():
+    import importlib.util
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[1] / "tools" \
+        / "backfill_probe_stats.py"
+    spec = importlib.util.spec_from_file_location("backfill_probe_stats", path)
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    return tool
+
+
+def test_the_thinking_rebase_reads_both_production_shapes(tmp_path):
+    """The reason the dispatched backfill could not work, fixed.
+
+    The probe mode reads `calls.jsonl`, and PRODUCTION NEVER WRITES THAT FILE. A
+    production wave writes reports/translate_usage.jsonl and, on the batch path,
+    the raw <job>_results.jsonl straight off the wire -- and the expression
+    canary's 20 rows exist only in the second shape, downloaded but never
+    absorbed into a usage ledger. Both are read here, or the measurement stays
+    on disk and unreachable.
+    """
+    import json as _json
+    tool = _load_backfill_tool()
+    tags = tool.kind_tags()
+    assert tags["def"] == "definition" and tags["expr"] == "expression"
+
+    ledger = tmp_path / "translate_usage.jsonl"
+    rows = [{"kind": "definition", "thinking_tokens": 0,
+             "finish_reason": "STOP", "job_name": "batches/aaa",
+             "model": "gemini-3.7-flash", "prompt_id": "v4-frozen",
+             "row_key": "def__Chinese__1100%04d__00" % i} for i in range(99)]
+    rows.append(dict(rows[0], thinking_tokens=797,
+                     row_key="def__Chinese__119999__00"))
+    # an error line with no thinking field: skipped, NOT counted as a zero
+    rows.append({"error": "429", "job_name": "batches/aaa"})
+    ledger.write_text("\n".join(_json.dumps(r) for r in rows) + "\n",
+                      encoding="utf-8")
+
+    results = tmp_path / "Chinese-expr-w0-00_results.jsonl"
+    wire = []
+    for i in range(20):
+        thoughts = 97 if i == 0 else 0
+        wire.append({"key": "expr__Chinese__1200%04d__00" % i,
+                     "response": {
+                         "usageMetadata": {"promptTokenCount": 379,
+                                           "candidatesTokenCount": 66,
+                                           "totalTokenCount": 379 + 66
+                                           + thoughts},
+                         "candidates": [{"finishReason": "STOP"}],
+                         "modelVersion": "gemini-3.7-flash"}})
+    results.write_text("\n".join(_json.dumps(r) for r in wire) + "\n",
+                       encoding="utf-8")
+
+    observed = tool.load_production_rows(ledger, tags) \
+        + tool.load_production_rows(results, tags)
+    bounds = tool.thinking_bounds_from_production(observed)
+
+    # the usage-ledger half: 100 rows, one of them the measured 797 tail
+    assert bounds["definition"]["n_observations"] == 100
+    assert bounds["definition"]["max"] == 797
+    assert bounds["definition"]["nonzero_rows"] == 1
+    assert bounds["definition"]["jobs"] == ["batches/aaa"]
+    # the batch-results half: thinking DERIVED from the identity, never read off
+    # thoughtsTokenCount (which the wire omits when it is zero)
+    assert bounds["expression"]["n_observations"] == 20
+    assert bounds["expression"]["mean"] == 4.85
+    assert bounds["expression"]["max"] == 97
+    assert bounds["expression"]["nonzero_share"] == 0.05
+    assert bounds["expression"]["shapes"] == ["batch_results"]
+    # provenance, without which s42.thinking_bounds_by_kind drops the entry
+    for bound in bounds.values():
+        assert bound["source"].startswith("production_wave ")
+
+    # and the bounds are readable by the gate's own reader, round trip
+    from ankidkdeck.stages.s42_translate import thinking_bounds_by_kind
+    artifact = {"thinking": {"THINKING_PER_REQUEST_LOW_BY_KIND": bounds}}
+    read = thinking_bounds_by_kind(artifact, "LOW")
+    assert set(read) == {"definition", "expression"}
+    assert read["expression"]["nonzero_share"] == 0.05
+
+    # AN UNPROVENANCED BOUND IS DROPPED, not trusted. A number in the file that
+    # adjudicates spending and cannot say where it came from is the state the
+    # whole consumption discipline exists to forbid, and no bound is the honest
+    # answer (no bound means WARN).
+    stripped = {k: {f: v for f, v in bound.items() if f != "source"}
+                for k, bound in bounds.items()}
+    assert thinking_bounds_by_kind(
+        {"thinking": {"THINKING_PER_REQUEST_LOW_BY_KIND": stripped}},
+        "LOW") == {}
+
+
+def test_the_thinking_rebase_is_idempotent_and_leaves_the_probe_keys_alone(
+        tmp_path):
+    """Twice is once, and the probe's own constants are not touched.
+
+    Both properties matter on the file that authorises spending. Re-running must
+    not churn it (the prompt_lineage writer had exactly that bug, and it
+    truncated the provenance of earlier backfills). And THINKING_PER_REQUEST_LOW
+    must survive untouched: reconcile() compares it against calls.jsonl, so
+    rewriting it from production would report DISAGREES for ever and set
+    CONSUMPTION_GUARD -- i.e. a rebase would block spending.
+    """
+    import json as _json
+    tool = _load_backfill_tool()
+    stats_path = tmp_path / "stats.json"
+    before = {
+        "model": "gemini-3.7-flash",
+        "thinking": {
+            "THINKING_PER_REQUEST_LOW": {"mean": 0, "p95": 0.0, "max": 0,
+                                         "n_observations": 38},
+            "THINKING_AT_LOW_BY_PROMPT_FAMILY": {
+                "LOW|definition(5123)": {"max": 0, "mean": 0.0,
+                                         "n_observations": 62, "p95": 0.0},
+                "LOW|other(1503)": {"max": 275, "mean": 255.5,
+                                    "n_observations": 2, "p95": 273.05}}}}
+    stats_path.write_text(_json.dumps(before), encoding="utf-8")
+
+    ledger = tmp_path / "translate_usage.jsonl"
+    ledger.write_text("\n".join(_json.dumps(
+        {"kind": "expression", "thinking_tokens": 97 if i == 0 else 0,
+         "finish_reason": "STOP", "job_name": "batches/expr",
+         "model": "gemini-3.7-flash",
+         "row_key": "expr__Chinese__1200%04d__00" % i}) for i in range(20)),
+        encoding="utf-8")
+
+    assert tool.rebase_thinking_mode(stats_path, [ledger], "LOW", True) == 0
+    first = stats_path.read_text(encoding="utf-8")
+    after = _json.loads(first)
+
+    # the PROBE's keys, byte for byte
+    assert after["thinking"]["THINKING_PER_REQUEST_LOW"] \
+        == before["thinking"]["THINKING_PER_REQUEST_LOW"]
+    assert after["thinking"]["THINKING_AT_LOW_BY_PROMPT_FAMILY"][
+        "LOW|definition(5123)"] == {"max": 0, "mean": 0.0,
+                                    "n_observations": 62, "p95": 0.0}
+    # the expression prior moves off the ranking prompt's 275 and onto the
+    # canary's own measurement, which is what the canary was paid for
+    from ankidkdeck.stages.s42_translate import unmeasured_thinking_prior
+    assert unmeasured_thinking_prior(before, "expression")[0] == 275
+    assert unmeasured_thinking_prior(after, "expression")[0] == 97
+    # ...and `pos`, which nobody has measured, stays conservative
+    assert unmeasured_thinking_prior(after, "pos")[0] == 275
+
+    # a pre-image was kept, and a second run changes nothing
+    assert list(tmp_path.glob("stats.pre-rebase-thinking-*.json"))
+    assert tool.rebase_thinking_mode(stats_path, [ledger], "LOW", True) == 0
+    assert stats_path.read_text(encoding="utf-8") == first
+
+
+def test_the_thinking_rebase_does_not_raise_a_bill_input_as_a_side_effect(
+        tmp_path):
+    """A GATE rebase may not quietly move a BILL ceiling.
+
+    THINKING_AT_LOW_BY_PROMPT_FAMILY feeds the bill, and its consumer takes the
+    MAX per family. The definition wave's max is 797, so writing a definition
+    family entry from production would raise a bill input by 797 tokens/request
+    as a side effect of rebasing a gate. Gaps only: a family that already has an
+    entry is left exactly as it is, and the gate's bound lives under its own key.
+    """
+    import json as _json
+    tool = _load_backfill_tool()
+    on_file = {"LOW|definition(5123)": {"max": 0, "n_observations": 62}}
+    bounds = {"definition": {"max": 797, "mean": 1.939145, "p95": 0.0,
+                             "n_observations": 3648,
+                             "distinct_nonzero_values": [60, 797],
+                             "languages": ["Chinese"], "source": "production"},
+              "expression": {"max": 97, "mean": 4.85, "p95": 4.85,
+                             "n_observations": 20,
+                             "distinct_nonzero_values": [97],
+                             "languages": ["Chinese"], "source": "production"}}
+    entries = tool.family_entries_from_bounds(bounds, "LOW", on_file)
+    written = [k for k in entries if not k.startswith("_")]
+    assert all("expression" in k for k in written), written
+    assert any("definition" in note for note in entries["_skipped"])
+    _json.dumps(entries)          # it has to reach the artifact
+
+
+def test_the_rebase_writes_stats_json_atomically(tmp_path):
+    """os.replace, not truncate-then-write.
+
+    A rebase can be run while another wave is draining in the same workspace,
+    and stats.json is read by every paid run at spend time. A reader that lands
+    inside a truncate window gets a partial file -- and a missing or unparseable
+    artifact is a hard refusal, so the failure mode is a crashed paid wave
+    rather than a stale number.
+    """
+    import ast as _ast
+    from pathlib import Path
+    tool = _load_backfill_tool()
+    src = Path(tool.__file__).read_text(encoding="utf-8")
+    tree = _ast.parse(src)
+    calls = [n for n in _ast.walk(tree)
+             if isinstance(n, _ast.Call)
+             and isinstance(n.func, _ast.Attribute)
+             and n.func.attr == "write_text"]
+    targets = {_ast.unparse(n.func.value) for n in calls}
+    assert "stats_path" not in targets, \
+        "stats.json must go through write_json_atomic, not write_text"
+    # and the helper really does rename rather than truncate in place
+    path = tmp_path / "stats.json"
+    path.write_text('{"old": true}', encoding="utf-8")
+    tool.write_json_atomic(path, {"new": True})
+    assert path.read_text(encoding="utf-8").strip().startswith("{")
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_g_prompt_reads_the_quote_from_the_bill_file(cfg, probe_stats):

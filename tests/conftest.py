@@ -257,6 +257,31 @@ MEASURED_CONSTANTS = {
                                      "n_observations": 38},
         "THINKING_PER_REQUEST_MEDIUM": {"mean": 578.7, "p95": 1042.0,
                                         "max": 1156, "n_observations": 13},
+        # WHAT G-THINK ADJUDICATES AGAINST, rebased from the PRODUCTION usage
+        # ledger by tools/backfill_probe_stats.py --rebase-thinking-from. The
+        # probe's 62 LOW observations were all zero, the gate treated that as a
+        # per-row absolute, and the first real definition wave -- 3,648 paid
+        # requests, mean 1.939145, p95 0, max 797, 44 rows (1.21%) non-zero,
+        # every one finishReason=STOP -- could not pass it. Verbatim from
+        # work/probes/stats.json, and it has to be verbatim: a fixture with
+        # invented margins would let a wrong criterion pass.
+        "THINKING_PER_REQUEST_LOW_BY_KIND": {
+            "definition": {
+                "mean": 1.939145, "p95": 0.0, "max": 797,
+                "nonzero_rows": 44, "nonzero_share": 0.012061,
+                "n_observations": 3648,
+                "source": "production_wave batches/ocdjpkwxlz65w8pm4eapouuqmlb"
+                          "rovbwd9h4, batches/u46gmzvoblokstnh5e0q5dd023z6vrri"
+                          "brqs"},
+            # The expression canary: 20 paid rows, one of which thought 97
+            # tokens. This is the measurement the canary was paid for, and it is
+            # what replaced the ranking prompt's 275 as the expression prior.
+            "expression": {
+                "mean": 4.85, "p95": 4.85, "max": 97,
+                "nonzero_rows": 1, "nonzero_share": 0.05,
+                "n_observations": 20,
+                "source": "production_wave Chinese-expr-w0-00"},
+        },
     },
     "budget": {"MAX_OUTPUT_FORMULA": "ceil(a*n + b) * 1.5 with NO thinking term",
                "MIN_SAFE_BUDGET": {"8": 1024}, "UNSET_BUDGET_HANGS": False},

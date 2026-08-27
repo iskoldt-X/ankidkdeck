@@ -118,8 +118,14 @@ G_SCRIPT = "G-SCRIPT"
 #             the invoice is a wish.
 #   G-THINK   thinkingLevel defaults to MEDIUM, measured at mean 578.7 (p95
 #             1,042) thought tokens per request against an n=20 batch's entire
-#             1,115-token cap. Derived thinking must be 0, and a non-zero row is
-#             how "we accidentally ran at MEDIUM" becomes visible.
+#             1,115-token cap, and the derived output cap has no thinking term.
+#             The wave's thinking DISTRIBUTION per kind -- mean tokens/request
+#             and the share of rows that thought at all -- against the measured
+#             one is how "we accidentally ran at MEDIUM" becomes visible. It is
+#             deliberately not a per-row ceiling: a real 3,644-request definition
+#             wave has a 1.2% non-zero tail reaching 797 tokens, all healthy, so
+#             a gate that failed on any non-zero row could not be passed by
+#             correct output. See thinking_is_at_the_measured_level.
 #   G-PROMPT  the constants, the cache and the bill are all properties of ONE
 #             prompt. Rows written with a second prompt are unbilled work.
 #   G-CACHE   the discount is the entire economic case for the explicit cache,
@@ -1499,11 +1505,19 @@ def separator_golden(registry, fixtures_dir=None):
 # WRONG (cached/prompt >= 0.90) can be pinned as wrong by a test forever.
 # --------------------------------------------------------------------------
 
-# Defaults for the two policy numbers. registry/gates.json carries them so they
-# are reviewable next to the deck's other baselines; these are the fallbacks if
-# a caller passes no policy dict at all.
+# Defaults for the policy numbers. registry/gates.json carries them so they are
+# reviewable next to the deck's other baselines; these are the fallbacks if a
+# caller passes no policy dict at all.
 BILL_TOLERANCE_FACTOR = 1.10        # patch plan 2.6: actual <= quoted x 1.10
 CACHE_HIT_MIN_SHARE = 0.95          # patch plan 2.6, second form of G-CACHE
+# G-THINK's three. They are POLICY, not measurements: the measurement is the
+# per-kind mean and non-zero share that thinking_bounds_by_kind reads off
+# stats.json, and these are the margin a human signs around it. Sized so the
+# MEDIUM band (mean 578.7 tokens/request) stays two orders of magnitude away
+# from the floor, which is the accident the gate exists to catch.
+THINK_MEAN_MARGIN = 3.0             # the wave's mean may be 3x the measured mean
+THINK_MEAN_FLOOR = 10.0             # ...and never less than this many tokens/req
+THINK_NONZERO_SHARE_FLOOR = 0.05    # non-zero share bound, never tighter than 5%
 
 # The refreeze signature. A human writes it once, at the release freeze, after
 # the 22 guid_seed reselections and the three alias merges. Never written by
@@ -1690,70 +1704,180 @@ def bill_within_ceiling(quoted_usd, actual_usd,
     return ok, detail
 
 
-def thinking_is_at_the_measured_level(rows, level: str = "LOW",
-                                      allowance: float = 0.0,
-                                      strict_kinds=("definition",),
-                                      alarm_at=None):
-    """G-THINK. Derived thinking per request, against what was measured.
-
-    At LOW the allowance is 0 and it is a MEASURED 0 -- 62 observations on the
-    definition prompt in the raw probe ledger, the thoughtsTokenCount field
-    absent every time, cross-checked against a MEDIUM arm where it was present.
-    A non-zero row there means the request did not go out at LOW, which is the
-    accident worth catching: unset means MEDIUM, MEDIUM was measured at mean
-    578.7 (p95 1,042) thought tokens per request, and the derived output cap has
-    no thinking term.
-
-    BUT THE MEASURED ZERO IS SCOPED TO THAT PROMPT, NOT TO THE LEVEL. In the
-    same ledger, at the same thinkingLevel=LOW, the homograph-ranking prompt
-    produced 236 and 275 thought tokens with the field PRESENT and
-    finishReason=STOP. So a gate that fails on ANY non-zero row would fail
-    every healthy ranking wave -- the same shape of mistake as the
-    cached/prompt criterion that G-CACHE had to abandon. Hence:
-
-      strict_kinds  the kinds whose LOW cost was measured (the definition wave,
-                    which is also the only kind whose OUTPUT was measured). A
-                    non-zero row here FAILS.
-      alarm_at      the MEDIUM band, read off the probe artifact. Any kind whose
-                    thinking reaches it FAILS -- that is "we are accidentally
-                    running at MEDIUM", whatever the request was.
-      otherwise     a non-zero row on an unmeasured kind is a WARNING carried in
-                    the detail: it is real, it is on file, and it is not
-                    grounds to call a wave broken on the strength of a constant
-                    nobody measured for it.
-    """
-    strict = set(strict_kinds or ())
-    violations, warnings = [], []
+def _thinking_by_kind(rows) -> dict:
+    """Per-kind aggregate of one wave's derived thinking. No criterion here."""
+    out: dict = {}
     for row in rows:
+        kind = str(row.get("kind") or "")
         value = float(row.get("thinking_tokens") or 0)
-        if value <= allowance:
-            continue
-        item = {"label": row.get("label"), "kind": row.get("kind"),
-                "thinking_tokens": row.get("thinking_tokens"),
-                "finish_reason": row.get("finish_reason")}
-        if (row.get("kind") or "") in strict:
-            violations.append(dict(item, why="measured 0 for this kind"))
-        elif alarm_at is not None and value >= float(alarm_at):
-            violations.append(dict(item, why="at or above the MEDIUM band (%s)"
-                                             % alarm_at))
-        else:
-            warnings.append(item)
+        node = out.setdefault(kind, {"requests": 0, "thinking_tokens_total": 0.0,
+                                     "nonzero_rows": 0, "max_tokens": 0.0,
+                                     "max_row": None})
+        node["requests"] += 1
+        node["thinking_tokens_total"] += value
+        if value > 0:
+            node["nonzero_rows"] += 1
+        if value > node["max_tokens"]:
+            node["max_tokens"] = value
+            node["max_row"] = {"label": row.get("label"),
+                               "thinking_tokens": row.get("thinking_tokens"),
+                               "finish_reason": row.get("finish_reason")}
+    for node in out.values():
+        n = node["requests"]
+        node["mean"] = round(node["thinking_tokens_total"] / n, 4) if n else 0.0
+        node["nonzero_share"] = round(node["nonzero_rows"] / n, 6) if n else 0.0
+        node["thinking_tokens_total"] = int(node["thinking_tokens_total"])
+        node["max_tokens"] = int(node["max_tokens"])
+    return out
+
+
+def thinking_is_at_the_measured_level(rows, level: str = "LOW", bounds=None,
+                                      alarm_at=None,
+                                      margin: float = THINK_MEAN_MARGIN,
+                                      mean_floor: float = THINK_MEAN_FLOOR,
+                                      share_floor: float =
+                                      THINK_NONZERO_SHARE_FLOOR):
+    """G-THINK. A wave's thinking DISTRIBUTION against the measured one, per kind.
+
+    WHAT THIS GATE IS FOR, unchanged: thinkingLevel defaults to MEDIUM, MEDIUM
+    was measured at mean 578.7 (p95 1,042) thought tokens per request, and the
+    derived output cap has no thinking term. "We accidentally ran at MEDIUM", or
+    a prompt regression that provokes thinking, has to be visible here.
+
+    WHAT IT USED TO DO, AND WHY THAT WAS WRONG. A kind in MEASURED_OUTPUT_KINDS
+    was held to EXACTLY zero on EVERY row, because the measured constant came
+    from 62 probe observations that all happened to be zero and was written down
+    as an absolute. Then a real definition wave arrived: 3,644 paid requests,
+    mean 1.941 thought tokens/request, p95 0, max 797, 44 rows (1.21%) non-zero,
+    every one of them finishReason=STOP and healthy. All 44 were counted as
+    violations, so a CORRECT wave could not pass -- the same disease as the
+    cached/prompt criterion G-CACHE had to abandon and the GB2312 test G-SCRIPT
+    had to abandon. A constant measured at n=62 is a statement about a
+    distribution's centre, never a per-row ceiling.
+
+    THE CRITERION IS NOW STATISTICAL AND PER KIND:
+
+      mean            the wave's MEAN thoughts/request for the kind, against
+                      max(measured_mean x margin, mean_floor, measured_max / n).
+                      The third term is what keeps a SMALL wave honest: one row
+                      at the highest value ever measured is the tail that was
+                      measured, not evidence of a regression, so it can never
+                      fail a wave by itself.
+      nonzero_share   the share of rows that thought at all, against
+                      max(measured_share x margin, share_floor, 1/n) -- the same
+                      one-row headroom, for the same reason. This is the term
+                      that catches "the prompt changed and now everything
+                      thinks a little", which a mean can absorb.
+      max             REPORT ONLY. Never a failure. The measured maximum is 797
+                      on a healthy wave; any per-row ceiling near that number is
+                      the defect this rewrite removed.
+      alarm_at        the MEDIUM band (mean tokens/request), read off the
+                      artifact. A kind whose MEAN reaches it FAILS whatever its
+                      own bound says -- that is the accident, stated in its own
+                      words rather than inferred from a margin.
+
+    A kind with no measured bound is WARNED about, not failed, unless it reaches
+    the MEDIUM band: it is real, it is on file, and a constant nobody measured
+    for that kind is not grounds to call a wave broken.
+
+    KNOWN BLIND SPOT, stated here rather than papered over: on a wave of one or
+    two requests the one-row headroom is the whole bound, so a single MEDIUM-
+    sized request inside a retry pass is indistinguishable from the measured LOW
+    tail (797 tokens were observed at LOW). It is reported as
+    `single_row_headroom` per kind. Closing it would need a per-row ceiling, and
+    a per-row ceiling on a heavy-tailed distribution is what was just removed.
+    """
+    bounds = dict(bounds or {})
+    by_kind = _thinking_by_kind(rows)
+    violations, warnings = [], []
+    if not bounds and alarm_at is None:
+        # Refuse rather than pass on an empty check: with no measured bound and
+        # no MEDIUM band there is no criterion, and "nothing to compare against"
+        # is not a clean wave.
+        return False, {
+            "requests": len(rows), "thinking_level": level,
+            "by_kind": by_kind, "violations": [], "warnings": [],
+            "why": ("no measured thinking bound for any kind and no MEDIUM band "
+                    "on the artifact, so this gate has nothing to adjudicate "
+                    "against. Rebase the thinking constants before reading a "
+                    "verdict out of it.")}
+    for kind, node in sorted(by_kind.items()):
+        n = node["requests"]
+        bound = bounds.get(kind)
+        node["measured"] = bound
+        node["single_row_headroom"] = True
+        failed = []
+        if alarm_at is not None and node["mean"] >= float(alarm_at):
+            failed.append({
+                "kind": kind, "test": "medium_band",
+                "observed_mean": node["mean"], "allowed": float(alarm_at),
+                "requests": n,
+                "why": ("mean thoughts/request is at or above the measured "
+                        "MEDIUM band (%s): this wave did not run at %s"
+                        % (alarm_at, level))})
+        if bound:
+            m_mean = float(bound.get("mean") or 0.0)
+            m_max = float(bound.get("max") or 0.0)
+            m_share = float(bound.get("nonzero_share") or 0.0)
+            mean_allowed = round(max(m_mean * margin, float(mean_floor),
+                                     m_max / n if n else 0.0), 4)
+            share_allowed = round(max(m_share * margin, float(share_floor),
+                                      1.0 / n if n else 0.0), 6)
+            node["mean_allowed"] = mean_allowed
+            node["nonzero_share_allowed"] = share_allowed
+            node["single_row_headroom"] = bool(
+                n and (m_max / n >= max(m_mean * margin, float(mean_floor))))
+            if node["mean"] > mean_allowed:
+                failed.append({
+                    "kind": kind, "test": "mean_thoughts_per_request",
+                    "observed_mean": node["mean"], "allowed": mean_allowed,
+                    "requests": n, "measured_from": bound.get("source"),
+                    "why": ("mean thoughts/request is above "
+                            "max(measured mean %s x %s, floor %s, measured max "
+                            "%s / %d requests)"
+                            % (m_mean, margin, mean_floor, m_max, n))})
+            if node["nonzero_share"] > share_allowed:
+                failed.append({
+                    "kind": kind, "test": "nonzero_share",
+                    "observed_share": node["nonzero_share"],
+                    "allowed": share_allowed, "requests": n,
+                    "nonzero_rows": node["nonzero_rows"],
+                    "measured_from": bound.get("source"),
+                    "why": ("more rows thought than the measured distribution "
+                            "supports: max(measured share %s x %s, floor %s, "
+                            "1/%d)" % (m_share, margin, share_floor, n))})
+        elif node["nonzero_rows"]:
+            warnings.append({
+                "kind": kind, "requests": n,
+                "nonzero_rows": node["nonzero_rows"],
+                "mean": node["mean"], "max_tokens": node["max_tokens"],
+                "why": "no measured thinking bound for this kind"})
+        node["verdict"] = ("FAIL" if failed else
+                           ("PASS" if bound else "WARN (unmeasured kind)"))
+        violations += failed
     values = sorted({int(r.get("thinking_tokens") or 0) for r in rows})
-    detail = {"requests": len(rows), "thinking_level": level,
-              "allowance_per_request": allowance,
-              "kinds_held_to_the_measured_zero": sorted(strict),
-              "medium_band_alarm_at": alarm_at,
-              "distinct_thinking_values": values[:20],
-              "violations": violations[:10],
-              "warnings": warnings[:10],
-              "warning_note": ("non-zero thinking on a kind nobody measured at "
-                              "this level: recorded, not failed. LOW was "
-                              "measured 0 on the definition prompt and 236-275 "
-                              "on the ranking prompt.") if warnings else None}
+    detail = {
+        "requests": len(rows), "thinking_level": level,
+        "criterion": ("per-kind MEAN thoughts/request and NON-ZERO SHARE "
+                      "against the measured distribution; the per-row maximum "
+                      "is reported, never failed"),
+        "mean_margin": margin, "mean_floor_tokens": mean_floor,
+        "nonzero_share_floor": share_floor,
+        "medium_band_alarm_at": alarm_at,
+        "kinds_with_a_measured_bound": sorted(bounds),
+        "by_kind": by_kind,
+        "distinct_thinking_values": values[:20],
+        "violations": violations[:10],
+        "warnings": warnings[:10],
+        "warning_note": ("non-zero thinking on a kind nobody measured: "
+                         "recorded, not failed. At LOW the definition prompt "
+                         "was measured at mean 1.941 tokens/request and the "
+                         "ranking prompt at 236-275.") if warnings else None}
     if violations:
-        detail["why"] = ("thinkingLevel is pinned to LOW and these requests "
-                         "thought anyway. Thinking is billed at the OUTPUT "
-                         "rate and shares maxOutputTokens with the answer.")
+        detail["why"] = ("this wave's thinking distribution is outside the "
+                         "measured one. Thinking is billed at the OUTPUT rate "
+                         "and shares maxOutputTokens with the answer, so the "
+                         "level or the prompt has changed under the bill.")
     return not violations, detail
 
 
@@ -2119,18 +2243,19 @@ def post_wave_gates(cfg, bill: dict, rows, *, lang: str = "",
     actual = rows_usd_priced(rows, default_model=cfg.gemini_model,
                              default_mode=cfg.mode)
     level = getattr(cfg, "thinking_level", "LOW")
-    allowance = 0.0
     alarm_at = None
-    # MEASURED_OUTPUT_KINDS is the same set for the same reason: the definition
-    # wave is the one whose behaviour was probed, so it is the one a measured
-    # constant may be enforced against.
+    think_bounds: dict = {}
+    # G-THINK's bounds are PER KIND and come off the artifact. MEASURED_OUTPUT_KINDS
+    # is deliberately NOT consulted any more: it is the set whose OUTPUT fit was
+    # measured, and reusing it as "the kinds held to a thinking constant" is how
+    # the definition wave came to be held to an absolute zero. Which kinds have a
+    # thinking bound is a property of what has been measured, so it is answered by
+    # the file, not by a tuple in the code.
     from .stages.s42_translate import (CACHEABLE_KINDS,  # noqa: PLC0415
-                                       MEASURED_OUTPUT_KINDS,
+                                       thinking_bounds_by_kind,
                                        thinking_per_request)
-    strict_kinds = tuple(MEASURED_OUTPUT_KINDS)
     if stats:
-        if level != "LOW":
-            allowance = float(thinking_per_request(stats, level, "p95") or 0.0)
+        think_bounds = thinking_bounds_by_kind(stats, level)
         # The band that means "this ran at MEDIUM". Read off the artifact, never
         # hard-coded: without the measurement there is no band and unmeasured
         # kinds are only warned about.
@@ -2143,16 +2268,22 @@ def post_wave_gates(cfg, bill: dict, rows, *, lang: str = "",
                         else None) or cfg.prompt_id
     tol = _policy(policy, "bill_tolerance_factor", BILL_TOLERANCE_FACTOR)
     share = _policy(policy, "cache_hit_min_share", CACHE_HIT_MIN_SHARE)
+    think_margin = _policy(policy, "think_mean_margin", THINK_MEAN_MARGIN)
+    think_floor = _policy(policy, "think_mean_floor_tokens", THINK_MEAN_FLOOR)
+    think_share = _policy(policy, "think_nonzero_share_floor",
+                          THINK_NONZERO_SHARE_FLOOR)
     extra = {"lang": lang} if lang else {}
     return [
         Gate(G_BILL, "the wave cost no more than the quote plus the tolerance",
              lambda: bill_within_ceiling(quoted if quotable else None,
                                          actual["usd"], tol),
              stage=stage, extra=extra),
-        Gate(G_THINK, "derived thinking per request is the measured value for "
-                      "the configured level",
+        Gate(G_THINK, "the wave's thinking distribution per kind is the "
+                      "measured one, within the signed margin",
              lambda: thinking_is_at_the_measured_level(
-                 rows, level, allowance, strict_kinds, alarm_at),
+                 rows, level, think_bounds, alarm_at,
+                 margin=think_margin, mean_floor=think_floor,
+                 share_floor=think_share),
              stage=stage, extra=extra),
         Gate(G_PROMPT, "every row carries the prompt id and sha the bill quoted",
              lambda: one_prompt_per_wave(rows, shas, quoted_prompt_id,
