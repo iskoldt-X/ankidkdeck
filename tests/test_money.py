@@ -70,15 +70,26 @@ def test_a_rate_card_is_a_fact_about_a_page_on_a_day():
     flex = rate_card(MODEL, "flex", on_date=IN_2026)
     assert batch["input_usd_per_mtok"] == std["input_usd_per_mtok"] / 2
     assert batch["output_usd_per_mtok"] == std["output_usd_per_mtok"] / 2
-    # flex is a service tier on the standard surface, priced like batch --
-    # penny for penny, which is what the pricing page shows.
-    assert {k: flex[k] for k in ("input_usd_per_mtok", "output_usd_per_mtok",
-                                 "cached_input_usd_per_mtok")} == \
-        {k: batch[k] for k in ("input_usd_per_mtok", "output_usd_per_mtok",
-                               "cached_input_usd_per_mtok")}
-    # The conservative reading of the one unsettled rate, and it says so.
+    # flex is a service tier on the standard surface, priced like batch on the
+    # two lines the pricing page states for it -- penny for penny.
+    assert {k: flex[k] for k in ("input_usd_per_mtok", "output_usd_per_mtok")} \
+        == {k: batch[k] for k in ("input_usd_per_mtok", "output_usd_per_mtok")}
+    # CACHED INPUT IS ASSERTED SEPARATELY FROM THAT PARITY, because the two are
+    # true for different reasons and must not be assumed to move together. All
+    # three modes sit at the conservative 0.075 today: standard because that IS
+    # the standard caching rate, batch because the page (0.0375) and the batch
+    # guide (0.075) disagree and only the invoice's per-project cached-input
+    # line can settle it, flex because it runs on the standard surface where the
+    # guide's sentence is uncontested. A month-total dashboard comparison was
+    # tried on 2026-08-30 and does not discriminate -- it puts the HIGHER rate
+    # closer -- so the over-quoting posture stands.
     assert batch["cached_input_usd_per_mtok"] == 0.075
+    assert flex["cached_input_usd_per_mtok"] == 0.075
+    assert std["cached_input_usd_per_mtok"] == 0.075
+    # ...and the card carries the open question, including the half of it that
+    # IS settled (the batch discount is applied despite serviceTier STANDARD).
     assert "0.0375" in batch["cached_input_unsettled"]
+    assert "serviceTier STANDARD" in batch["cached_input_unsettled"]
     assert CACHED_INPUT_OPEN_QUESTION == batch["cached_input_unsettled"]
 
 
@@ -124,13 +135,21 @@ def test_money_arithmetic():
     # the sum. Getting this backwards is the single easiest way to misbill.
     assert money["uncached_input_tokens"] == 1350 - 1135
     assert money["cached_input_tokens"] == 1135
+    # `abs` alongside `rel` because the ledger rounds to nine decimals on
+    # purpose (usd_for_tokens, ndigits=9), and a rate whose product lands on a
+    # tenth decimal then has it rounded away. Half a nano-dollar is 4e-6
+    # RELATIVE on a figure this small, so a rel-only tolerance tests the
+    # rounding rather than the formula. One nano-dollar absolute is the
+    # resolution the ledger itself claims. (Kept rate-agnostic on purpose: it
+    # bites whenever the cached-input line moves, which is a live question.)
     expected_in = (215 * rates["input_usd_per_mtok"]
                    + 1135 * rates["cached_input_usd_per_mtok"]) / 1e6
-    assert money["input_usd"] == pytest.approx(expected_in, rel=1e-9)
+    assert money["input_usd"] == pytest.approx(expected_in, rel=1e-9, abs=1e-9)
     assert money["output_usd"] == pytest.approx(
-        300 * rates["output_usd_per_mtok"] / 1e6, rel=1e-9)
+        300 * rates["output_usd_per_mtok"] / 1e6, rel=1e-9, abs=1e-9)
     assert money["usd"] == pytest.approx(money["input_usd"]
-                                         + money["output_usd"], rel=1e-9)
+                                         + money["output_usd"],
+                                         rel=1e-9, abs=1e-9)
     assert money["identity_ok"] is True
 
     # thinking is billed as OUTPUT, never as input.
@@ -139,9 +158,12 @@ def test_money_arithmetic():
     assert thinking["usd"] - plain["usd"] == pytest.approx(
         500 * rates["output_usd_per_mtok"] / 1e6, rel=1e-9)
 
-    # the same row on the 2027 card costs exactly twice as much
+    # the same row on the 2027 card costs exactly twice as much. Two nano-
+    # dollars absolute because BOTH sides are rounded independently: doubling a
+    # figure already rounded to nine decimals can miss the rounded double by up
+    # to 1.5e-9.
     later = billing.row_dollars(row, rate_card(MODEL, "batch", on_date=IN_2027))
-    assert later["usd"] == pytest.approx(money["usd"] * 2, rel=1e-9)
+    assert later["usd"] == pytest.approx(money["usd"] * 2, rel=1e-9, abs=2e-9)
 
     # a row whose counts do not add up is not silently priced
     broken = usage_row()

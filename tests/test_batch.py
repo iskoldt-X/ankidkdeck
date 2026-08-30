@@ -2381,3 +2381,795 @@ def test_the_real_paid_result_file_reconciles_completely_on_the_key():
     assert [o.finish_reason for o in out if not o.ok] == ["MAX_TOKENS"] * 4
     assert not [o for o in out if o.error]
     assert {o.usage.get("cachedContentTokenCount") for o in out} == {1139}
+
+
+# ==========================================================================
+# tools/prompt_thinking_ab.py --mode batch
+# ==========================================================================
+#
+# The A/B moved to the batch surface because the interactive one 503-storms
+# (83.9% of requests during the storm measured in the Chinese month), and an A/B
+# whose two arms meet a storm at different rates measures the weather. These
+# tests drive the tool against the SAME fake service the transport's own tests
+# use, so what is exercised is the real round trip: build the request through
+# CallContext, serialize it, "upload" it, "download" a result file, join it on
+# the echoed key.
+
+def _ab_tool():
+    """tools/prompt_thinking_ab.py, imported by path.
+
+    It is a script rather than a package module and there is no other importer,
+    so the import is done here rather than by putting tools/ on sys.path for the
+    whole suite.
+    """
+    import importlib.util
+    from pathlib import Path
+    path = (Path(__file__).resolve().parent.parent / "tools"
+            / "prompt_thinking_ab.py")
+    spec = importlib.util.spec_from_file_location("prompt_thinking_ab", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _backfill_tool():
+    """tools/backfill_probe_stats.py, imported by path.
+
+    Imported so the calls.jsonl rows the batch arm writes are checked against
+    the READER that consumes them, not against a copy of its rules.
+    """
+    import importlib.util
+    from pathlib import Path
+    path = (Path(__file__).resolve().parent.parent / "tools"
+            / "backfill_probe_stats.py")
+    spec = importlib.util.spec_from_file_location("backfill_probe_stats", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _ab_workspace(cfg, n_entries=3, n_senses=3):
+    """Entries the A/B's own picker will accept: 2-8 senses, all with text."""
+    rows = [_entry(entry_id="1102172%d" % i, n_senses=n_senses, n_exprs=1)
+            for i in range(n_entries)]
+    _workspace(cfg, rows)
+    return rows
+
+
+def _ab_setup(cfg, tool, lang="German", n_entries=3):
+    from ankidkdeck import prompts
+    _ab_workspace(cfg, n_entries=n_entries)
+    _batch_cfg(cfg, cache=True)
+    prompts.reset()
+    prompts.activate(cfg, prompt_id=tool.ARMS["lean"][0])
+    batches = tool.pick_entries(cfg, lang, n_entries)
+    assert batches, "the A/B picker found no entry with 2-8 senses"
+    return batches, cfg.work_dir / "probes" / "calls.jsonl"
+
+
+def _no_sleep(_seconds):
+    return None
+
+
+def test_the_ab_batch_run_is_one_job_per_arm_with_that_arms_prompt_cached(
+        cfg, registry, batch_genai, batch_stats):
+    """The end-to-end run: two jobs, two caches, two system prompts, and every
+    downstream artifact in the shape the interactive arm produced."""
+    from ankidkdeck import prompts
+    tool = _ab_tool()
+    batches, ledger = _ab_setup(cfg, tool)
+
+    results, report = tool.run_batch_ab(cfg, "German", ["lean", "rich"],
+                                        batches, ledger, client=batch_genai,
+                                        sleep=_no_sleep)
+
+    # ---- one job per arm, and the arms are told apart by the wave tag that
+    # transport._resume_in_flight and registry.wave_fingerprint both read. The
+    # tag also carries the CELL SET's digest, so it is derived here rather than
+    # spelled out -- a hard-coded tag would pin this fixture's digest.
+    todo = tool.todo_rows_for(cfg, "German", batches)
+    sel = tool.ab_selection_id(todo)
+    lean_tag = tool.ab_wave_tag("German", "lean", sel)
+    rich_tag = tool.ab_wave_tag("German", "rich", sel)
+    assert lean_tag == "AB-German-lean-%s" % sel and len(sel) == 8
+    reg = BREG.JobRegistry(cfg, file=tool.AB_REGISTRY_FILE)
+    jobs = reg.jobs()
+    assert len(jobs) == 2
+    assert {j["lang"] for j in jobs.values()} == {lean_tag, rich_tag}
+    assert sorted(jobs) == sorted("%s-def-w0-00" % t
+                                  for t in (lean_tag, rich_tag))
+    assert all(j["state"] == BREG.RECOVERED for j in jobs.values())
+    # two distinct fingerprints: the cache name and the row keys both differ
+    assert len({j["fingerprint"] for j in jobs.values()}) == 2
+
+    # ---- each arm's own system prompt went INTO that arm's own cache
+    assert len(batch_genai.caches_created) == 2
+    systems = [c["config"].kwargs["system_instruction"]
+               for c in batch_genai.caches_created]
+    assert len(set(systems)) == 2
+    lean_text = prompts.build_definition_prompt("German",
+                                                prompt_id="v4-frozen")
+    rich_text = prompts.build_definition_prompt("German",
+                                                prompt_id="rich-core-1")
+    assert systems == [lean_text, rich_text]
+    assert len(rich_text) > len(lean_text)
+    # ...and both caches were deleted once their job was terminal and downloaded
+    assert len(batch_genai.caches_deleted) == 2
+
+    # ---- the request bodies are the batch shape, cache at the TOP LEVEL
+    uploaded = [json.loads(x)
+                for blob in batch_genai.uploads.values()
+                for x in blob.splitlines() if x.strip()]
+    assert len(uploaded) == 2 * len(batches)
+    for row in uploaded:
+        req = row["request"]
+        assert req["cachedContent"].startswith("cachedContents/")
+        assert "systemInstruction" not in req          # hard 400 if both
+        gen = req["generationConfig"]
+        assert gen["thinkingConfig"] == {"thinkingLevel": "LOW"}
+        assert gen["responseSchema"]["properties"]["definitions"]["minItems"] \
+            == gen["responseSchema"]["properties"]["definitions"]["maxItems"]
+        assert "temperature" not in gen
+        assert "serviceTier" not in json.dumps(row)
+    # each arm referenced its OWN cache, never the other's
+    assert len({row["request"]["cachedContent"] for row in uploaded}) == 2
+
+    # ---- calls.jsonl, in the schema backfill_probe_stats actually reads
+    rows = [json.loads(x) for x in ledger.read_text(encoding="utf-8")
+            .splitlines() if x.strip()]
+    assert len(rows) == 2 * len(batches)
+    assert {r["arm"] for r in rows} == {"lean", "rich"}
+    derived = _backfill_tool().rederive(rows)
+    assert derived["calls_with_usage"] == len(rows)
+    assert len(derived["prompt_families"]) == 2      # one per arm's prompt
+
+    # ---- the usage ledger says BATCH, because that is what it was
+    usage_rows = [json.loads(x) for x in
+                  (cfg.report_dir / "prompt_ab_usage.jsonl")
+                  .read_text(encoding="utf-8").splitlines() if x.strip()]
+    assert usage_rows and all(r["mode"] == "batch" for r in usage_rows)
+    assert all(r["cached_tokens"] == DECLARED_CACHE_TOKENS for r in usage_rows)
+    # cached == declared, per row: the criterion the cache check applies
+    for check in report["cache_check"].values():
+        assert check["rows"] == check["cached_equals_declared"] > 0
+        assert check["declared"] == DECLARED_CACHE_TOKENS
+
+    # ---- the pre-spend block ran BEFORE any job or cache existed
+    # PER ARM, with that arm's own prompt active -- see the R6-exemption test.
+    assert sorted(report["pre_spend_gates"]) == ["lean", "rich"]
+    assert sorted(report["consumption_rules"]) == ["lean", "rich"]
+    for arm_rows in report["pre_spend_gates"].values():
+        assert {row["id"] for row in arm_rows} == {"G-SCOPE-FROZEN", "G-BUDGET"}
+        assert all(row["ok"] for row in arm_rows)
+    for arm_rows in report["consumption_rules"].values():
+        assert all(r["ok"] for r in arm_rows if r["blocking"])
+    # quoted per ARM, because forecast() sums over these keys and the A/B places
+    # the same cells once per arm
+    assert sorted(report["bill"]) == sorted([lean_tag, rich_tag])
+    assert report["surface"] == "batch"
+
+    # ---- the criteria and the blind pairs are computed identically
+    pack = prompts.packs.load("German", cfg)
+    out = tool.verdict(results, "German", pack, cfg.work_dir / "review")
+    assert set(out["criteria"]) == {"a_thinking_median", "b_script_violations",
+                                    "c_pos_shape", "d_blind_test",
+                                    "e_constant_invalidated"}
+    assert out["criteria"]["a_thinking_median"]["ok"] is True
+    assert out["criteria"]["b_script_violations"]["ok"] is True
+    assert out["criteria"]["c_pos_shape"]["ok"] is True
+    assert set(out["by_arm"]) == {"lean", "rich"}
+    pairs = read_json(cfg.work_dir / "review" / "prompt_ab_blind_pairs.json")
+    key = read_json(cfg.work_dir / "review" / "prompt_ab_blind_key.json")
+    assert pairs and all(set(q) == {"key", "A", "B"} for q in pairs)
+    assert set(key["answers"].values()) <= {"lean", "rich"}
+
+
+def test_a_production_translate_resume_never_adopts_an_ab_job(
+        cfg, registry, batch_genai, batch_stats):
+    """Production isolation, and WHICH layer actually does it.
+
+    Two layers, and this pins them in the order they are load-bearing, because
+    an earlier version of the shipped comment had them the other way round:
+
+      the MECHANISM is the wave tag. transport._resume_in_flight and
+      _ingest_ready select on EXACT equality of the `lang` field, and an A/B job
+      carries "AB-German-lean-<sel>" there rather than "German" -- so adoption
+      cannot happen even out of a SHARED registry, which is asserted directly
+      below by handing the production resume the A/B's own registry object.
+      DEFENCE IN DEPTH is the separate file, which covers everything the
+      registry does WITHOUT filtering by lang (find_by_fingerprint, next_job_id,
+      summary, cache_prompt_shas) and keeps jobs.json readable by a human.
+    """
+    tool = _ab_tool()
+    batches, ledger = _ab_setup(cfg, tool)
+    # Kill the drain after the submit, so an AB job is left SUBMITTED -- the
+    # exact state a production resume would find and adopt.
+    batch_genai.download_raises = RuntimeError("connection reset")
+    with pytest.raises(Exception):
+        tool.run_batch_ab(cfg, "German", ["lean"], batches, ledger,
+                          client=batch_genai, sleep=_no_sleep)
+
+    todo = tool.todo_rows_for(cfg, "German", batches)
+    lean_tag = tool.ab_wave_tag("German", "lean", tool.ab_selection_id(todo))
+    ab_reg = BREG.JobRegistry(cfg, file=tool.AB_REGISTRY_FILE)
+    assert [j["job_id"] for j in ab_reg.in_flight()] == \
+        ["%s-def-w0-00" % lean_tag]
+
+    # ---- THE MECHANISM: even asked to resume "German" out of the A/B's OWN
+    # registry -- the worst case, a shared file -- the production scan adopts
+    # nothing, because no A/B job's `lang` field is ever a language.
+    assert BT._resume_in_flight(cfg, ab_reg, batch_genai, "German",
+                                summary={"jobs": []}, sleep=_no_sleep) == []
+    assert [j["job_id"] for j in ab_reg.in_flight()] == \
+        ["%s-def-w0-00" % lean_tag]
+
+    # ---- DEFENCE IN DEPTH: the production registry is a different file and
+    # does not even see the record
+    prod = BREG.JobRegistry(cfg)
+    assert prod.path != ab_reg.path
+    assert prod.jobs() == {} and prod.in_flight() == []
+    summary = {"jobs": []}
+    assert BT._resume_in_flight(cfg, prod, batch_genai, "German",
+                                summary=summary, sleep=_no_sleep) == []
+    # ...and the AB job is untouched: still in flight, still ours
+    assert BREG.JobRegistry(cfg, file=tool.AB_REGISTRY_FILE).in_flight()
+
+    # ---- and the other direction: a production job is invisible to the A/B
+    prod.plan("German-def-w0-00", fingerprint="prod-fp", lang="German",
+              kind="definition", model=cfg.gemini_model, prompt_id="v4-frozen",
+              cache_name=None, declared_cache_tokens=None,
+              cache_prompt_sha256=None, jsonl_path="x.jsonl", plan=[],
+              enqueued_tokens=0, wave=0)
+    prod.mark_submitted("German-def-w0-00", "batches/prod")
+    fresh_ab = BREG.JobRegistry(cfg, file=tool.AB_REGISTRY_FILE)
+    assert "German-def-w0-00" not in fresh_ab.jobs()
+    assert [j["job_id"] for j in fresh_ab.in_flight()] == \
+        ["%s-def-w0-00" % lean_tag]
+
+
+def test_the_ab_batch_run_writes_nothing_into_the_translation_tables(
+        cfg, registry, batch_genai, batch_stats):
+    """The A/B is a measurement, not a wave: its answers are compared, never
+    shipped. The production ingest writes json/translations/<lang>/, and this
+    path must not go near it."""
+    tool = _ab_tool()
+    batches, ledger = _ab_setup(cfg, tool)
+    tdir = cfg.json_dir / "translations" / "German"
+    assert not tdir.exists()
+    tool.run_batch_ab(cfg, "German", ["lean", "rich"], batches, ledger,
+                      client=batch_genai, sleep=_no_sleep)
+    assert not (tdir / "definitions.json").exists()
+    assert not (tdir / "expressions.json").exists()
+    # nothing at all under json/translations, for any language
+    root = cfg.json_dir / "translations"
+    assert not root.exists() or not list(root.rglob("*.json"))
+
+
+def test_an_interrupted_ab_drain_is_resumed_and_never_creates_a_second_job(
+        cfg, registry, batch_genai, batch_stats):
+    """batches.create is NOT idempotent -- the same job submitted twice is
+    accepted twice, runs twice and is billed twice. A drain that dies between
+    the submit and the download is a normal event on a wait of up to 50 hours,
+    so the re-run has to finish the job that exists."""
+    tool = _ab_tool()
+    batches, ledger = _ab_setup(cfg, tool)
+    batch_genai.download_raises = RuntimeError("connection reset")
+    with pytest.raises(Exception):
+        tool.run_batch_ab(cfg, "German", ["lean"], batches, ledger,
+                          client=batch_genai, sleep=_no_sleep)
+    created_after_crash = len(batch_genai.jobs)
+    caches_after_crash = len(batch_genai.caches_created)
+    assert created_after_crash == 1
+
+    # the SAME command again
+    results, _ = tool.run_batch_ab(cfg, "German", ["lean"], batches, ledger,
+                                   client=batch_genai, sleep=_no_sleep)
+    assert len(batch_genai.jobs) == created_after_crash      # no second create
+    assert len(batch_genai.caches_created) == caches_after_crash
+    assert results["lean"]["calls"] == len(batches)
+    reg = BREG.JobRegistry(cfg, file=tool.AB_REGISTRY_FILE)
+    assert [j["state"] for j in reg.jobs().values()] == [BREG.RECOVERED]
+
+    # and a THIRD run ingests nothing again: RECOVERED is the guard, because the
+    # ledger cannot dedupe a row a second process wrote
+    rows_before = len(ledger.read_text(encoding="utf-8").splitlines())
+    again, _ = tool.run_batch_ab(cfg, "German", ["lean"], batches, ledger,
+                                 client=batch_genai, sleep=_no_sleep)
+    assert again["lean"]["resumed"] is True
+    assert len(batch_genai.jobs) == created_after_crash
+    assert len(ledger.read_text(encoding="utf-8").splitlines()) == rows_before
+
+
+def test_a_shuffled_ab_result_file_still_joins_on_the_key(
+        cfg, registry, batch_genai, batch_stats):
+    """60 rows will not shard, but the guard stays: the real service was
+    measured concatenating ~1000-row shards out of order, and the A/B's join is
+    the same reconcile() with the same bijection hard guard."""
+    tool = _ab_tool()
+    batches, ledger = _ab_setup(cfg, tool)
+    batch_genai.shuffle_output = True
+    results, report = tool.run_batch_ab(cfg, "German", ["lean"], batches,
+                                        ledger, client=batch_genai,
+                                        sleep=_no_sleep)
+    assert list(report["order_cross_check"]) == \
+        ["AB-German-lean-%s"
+         % tool.ab_selection_id(tool.todo_rows_for(cfg, "German", batches))]
+    order = list(report["order_cross_check"].values())[0]
+    assert order["in_input_order"] is False
+    assert order["joined_by_key"] == order["rows"] == len(batches)
+    assert order["joined_without_key"] == 0
+    # every cell still came back, attributed to its own key
+    assert results["lean"]["calls"] == len(batches)
+    keys_sent = {r["key"] for b in batches for r in b["rows"]}
+    assert {p["key"] for p in results["lean"]["produced"]} == keys_sent
+
+
+def test_the_ab_default_surface_is_still_the_interactive_one(
+        cfg, registry, fake_genai, no_sleep, probe_stats, capsys):
+    """--mode batch is an ADDITION. The interactive arm is unchanged: one
+    synchronous call per entry per arm, through _translate_definition_batch, and
+    its ledger rows say standard because _generate is the standard surface."""
+    from ankidkdeck import prompts
+    tool = _ab_tool()
+    _ab_workspace(cfg, n_entries=2)
+    prompts.reset()
+    prompts.activate(cfg, prompt_id=tool.ARMS["lean"][0])
+    batches = tool.pick_entries(cfg, "German", 2)
+
+    @fake_genai.respond
+    def _answer(call):
+        props = call["config"].kwargs["response_schema"]["properties"]
+        n = props["definitions"]["minItems"]
+        return {"headword": "hus",
+                "definitions": [{"lemma": "L%d" % i, "gloss": "G%d" % i}
+                                for i in range(n)]}
+
+    # plan() with no `mode` argument still describes the interactive surface
+    tool.plan(cfg, "German", batches, ["lean", "rich"])
+    assert "surface             interactive" in capsys.readouterr().out
+
+    ledger = cfg.work_dir / "probes" / "calls.jsonl"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    usage = S42.UsageLog(path=cfg.report_dir / "prompt_ab_usage.jsonl")
+    got = tool.run_arm(cfg, "German", "lean", batches, ledger, usage)
+    assert got["calls"] == len(batches) == len(fake_genai.calls)
+    assert all(r["mode"] == "standard" for r in usage.rows)
+    # no batch machinery was touched at all
+    assert not (cfg.work_dir / "batch" / tool.AB_REGISTRY_FILE).exists()
+    assert not (cfg.work_dir / "batch" / "jobs.json").exists()
+
+
+def test_the_ab_batch_gates_refuse_before_a_cache_or_a_job_exists(
+        cfg, registry, batch_genai, batch_stats):
+    """G-BUDGET is only worth having where it can still refuse something nobody
+    has paid for. The cache is a billable object and batches.create is not
+    idempotent, so the gate block runs in front of BOTH."""
+    tool = _ab_tool()
+    batches, ledger = _ab_setup(cfg, tool)
+    cfg.spend_cap_usd = 0.0001
+    with pytest.raises(FatalError) as exc:
+        tool.run_batch_ab(cfg, "German", ["lean", "rich"], batches, ledger,
+                          client=batch_genai, sleep=_no_sleep)
+    assert "G-BUDGET" in str(exc.value)
+    assert batch_genai.caches_created == []
+    assert batch_genai.jobs == {}
+    assert batch_genai.uploads == {}
+    assert not (cfg.work_dir / "batch" / tool.AB_REGISTRY_FILE).exists()
+    assert not ledger.exists()
+
+
+def test_the_ab_cli_defaults_to_interactive_and_accepts_mode_batch(
+        cfg, registry, batch_genai, batch_stats, monkeypatch, capsys):
+    """The flag itself: default interactive, `batch` accepted, and neither plan
+    path sends anything."""
+    import ankidkdeck.config as _config
+    tool = _ab_tool()
+    _ab_setup(cfg, tool)
+    monkeypatch.setattr(_config, "load_config", lambda *a, **kw: cfg)
+
+    assert tool.main(["--lang", "German", "--entries", "3"]) == 0
+    out = capsys.readouterr().out
+    assert "surface             interactive" in out
+    assert "nothing has been sent" in out.lower() or "plan (nothing has been " \
+                                                     "sent)" in out
+
+    assert tool.main(["--lang", "German", "--entries", "3",
+                      "--mode", "batch"]) == 0
+    out = capsys.readouterr().out
+    assert "surface             batch" in out
+    assert tool.AB_REGISTRY_FILE in out
+    # a plan is a plan on both surfaces: no job, no cache, no upload
+    assert batch_genai.jobs == {} and batch_genai.caches_created == []
+
+
+# --------------------------------------------------------------------------
+# fix round 1: the scenarios the first round's tests never constructed
+# --------------------------------------------------------------------------
+
+def _ab_varied_workspace(cfg, tool, lang="German"):
+    """Entries with DIFFERENT sense counts, so the probe ledger the A/B writes
+    has more than one point on the x-axis of backfill's two fits."""
+    from ankidkdeck import prompts
+    rows = [_entry(entry_id="1102172%d" % i, n_senses=n, n_exprs=1)
+            for i, n in enumerate((2, 3, 4))]
+    _workspace(cfg, rows)
+    _batch_cfg(cfg, cache=True)
+    prompts.reset()
+    prompts.activate(cfg, prompt_id=tool.ARMS["lean"][0])
+    batches = tool.pick_entries(cfg, lang, 3)
+    assert len({len(b["rows"]) for b in batches}) > 1
+    return batches, cfg.work_dir / "probes" / "calls.jsonl"
+
+
+def test_a_stale_resubmittable_failure_never_makes_a_finished_arm_pay_again(
+        cfg, registry, batch_genai, batch_stats):
+    """BLOCKER 1. ab_job_of used to return the FIRST record for an arm, and
+    reg.jobs() iterates in INSERTION order.
+
+    The state it takes is ordinary: a job hits the documented 48h expiry
+    (EXPIRED is terminal and is recorded resubmittable, correctly -- nothing was
+    billed), the operator re-runs, the arm succeeds as `-a2` and its cache is
+    deleted at end of wave. From then on the arm's records are
+    [FAILED, RECOVERED] and every later run matched the FAILED one, minted a
+    fresh cache (new name -> new wave_fingerprint -> dedup defeated), opened
+    `-a3` and PAID FOR THE ARM AGAIN -- reporting resumed=False, so nothing said
+    it had already been measured.
+    """
+    tool = _ab_tool()
+    batches, ledger = _ab_setup(cfg, tool)
+
+    # 1. the service says the job produced nothing (EXPIRED, no result file)
+    batch_genai.terminal_state = "JOB_STATE_EXPIRED"
+    batch_genai.no_dest = True
+    with pytest.raises(FatalError):
+        tool.run_batch_ab(cfg, "German", ["lean"], batches, ledger,
+                          client=batch_genai, sleep=_no_sleep)
+    reg = BREG.JobRegistry(cfg, file=tool.AB_REGISTRY_FILE)
+    first = list(reg.jobs().values())
+    assert [j["state"] for j in first] == [BREG.FAILED]
+    assert first[0]["resubmittable"] is True
+
+    # 2. the correct re-run: a second job, which succeeds
+    batch_genai.terminal_state = "JOB_STATE_SUCCEEDED"
+    batch_genai.no_dest = False
+    tool.run_batch_ab(cfg, "German", ["lean"], batches, ledger,
+                      client=batch_genai, sleep=_no_sleep)
+    reg = BREG.JobRegistry(cfg, file=tool.AB_REGISTRY_FILE)
+    states = {j["job_id"]: j["state"] for j in reg.jobs().values()}
+    assert sorted(states.values()) == [BREG.FAILED, BREG.RECOVERED]
+    jobs_after_2 = len(batch_genai.jobs)
+    caches_after_2 = len(batch_genai.caches_created)
+    rows_after_2 = len(ledger.read_text(encoding="utf-8").splitlines())
+
+    # 3. THE BUG: the same command a third time. It must adopt the RECOVERED
+    #    record, not the FAILED one that sits in front of it.
+    results, _ = tool.run_batch_ab(cfg, "German", ["lean"], batches, ledger,
+                                   client=batch_genai, sleep=_no_sleep)
+    assert results["lean"]["resumed"] is True             # truthfully reported
+    assert len(batch_genai.jobs) == jobs_after_2          # no third job
+    assert len(batch_genai.caches_created) == caches_after_2   # no new cache
+    assert len(ledger.read_text(encoding="utf-8").splitlines()) == rows_after_2
+    assert len(BREG.JobRegistry(cfg,
+                                file=tool.AB_REGISTRY_FILE).jobs()) == 2
+    # ...and the lookup is where the whole thing turns. This is the exact
+    # difference between the two implementations, asserted directly: iteration
+    # order still puts the stale FAILED record first, and ab_job_of must not
+    # take it.
+    reg = BREG.JobRegistry(cfg, file=tool.AB_REGISTRY_FILE)
+    tag = tool.ab_wave_tag(
+        "German", "lean",
+        tool.ab_selection_id(tool.todo_rows_for(cfg, "German", batches)))
+    first_match = next(j for j in reg.jobs().values() if j["lang"] == tag)
+    assert first_match["state"] == BREG.FAILED          # what it used to return
+    assert tool.ab_job_of(reg, tag)["state"] == BREG.RECOVERED
+
+
+def test_a_different_entry_selection_never_adopts_the_previous_measurement(
+        cfg, registry, batch_genai, batch_stats):
+    """BLOCKER 2. The wave tag used to be lang+arm and nothing else, so a re-run
+    with a different --entries adopted the old job's stored outcome while
+    report["cells"] was computed from the NEW selection: prompt_ab_verdict.json
+    then stated an n it did not have, and the LEAN-vs-RICH decision was read off
+    the wrong sample."""
+    tool = _ab_tool()
+    _ab_setup(cfg, tool)
+    ledger = cfg.work_dir / "probes" / "calls.jsonl"
+    three = tool.pick_entries(cfg, "German", 3)
+    two = tool.pick_entries(cfg, "German", 2)
+    assert len(three) == 3 and len(two) == 2
+
+    first, rep1 = tool.run_batch_ab(cfg, "German", ["lean"], three, ledger,
+                                    client=batch_genai, sleep=_no_sleep)
+    assert first["lean"]["calls"] == 3 and rep1["requests_per_arm"] == 3
+
+    # a DIFFERENT selection: must place its own job, not serve the old outcome
+    second, rep2 = tool.run_batch_ab(cfg, "German", ["lean"], two, ledger,
+                                     client=batch_genai, sleep=_no_sleep)
+    assert second["lean"]["resumed"] is False
+    assert second["lean"]["calls"] == 2
+    # the report's n and the adopted outcome's n agree, which is the property
+    assert rep2["requests_per_arm"] == len(second["lean"]["thoughts"]) == 2
+    assert len(batch_genai.jobs) == 2
+    assert second["lean"]["job_id"] != first["lean"]["job_id"]
+    assert len(BREG.JobRegistry(cfg,
+                                file=tool.AB_REGISTRY_FILE).jobs()) == 2
+
+    # ...and the SAME selection still adopts, which is what makes a re-run cheap
+    again, rep3 = tool.run_batch_ab(cfg, "German", ["lean"], two, ledger,
+                                    client=batch_genai, sleep=_no_sleep)
+    assert again["lean"]["resumed"] is True
+    assert again["lean"]["calls"] == rep3["requests_per_arm"] == 2
+    assert len(batch_genai.jobs) == 2
+
+
+def test_the_rich_arm_is_adjudicated_by_its_own_named_r6_exemption(
+        cfg, registry, batch_genai, batch_stats):
+    """BLOCKER 3. The N-09 rules used to be evaluated once, with whatever pack
+    was active -- always LEAN, because main() activates it first -- and the RICH
+    arm then spent behind a green verdict the gate had never formed an opinion
+    on. R6 measures drift against the size the constants were taken on, and the
+    rich prompt drifts far past the 10% tolerance, so it would refuse every rich
+    arm for ever: the A/B has to be exempt, but BY NAME and on the record."""
+    from ankidkdeck import billing, prompts
+    tool = _ab_tool()
+    batches, ledger = _ab_setup(cfg, tool)
+
+    _, report = tool.run_batch_ab(cfg, "German", ["lean", "rich"], batches,
+                                  ledger, client=batch_genai, sleep=_no_sleep)
+    for arm in ("lean", "rich"):
+        rules = {r["rule"]: r for r in report["consumption_rules"][arm]}
+        assert "R6-prompt-size" not in rules          # replaced, not skipped
+        row = rules[tool.AB_R6_EXEMPTION]
+        assert row["ok"] is True and row["blocking"] is True
+        assert row["spec_rule"] == "6"
+        assert row["detail"]["replaces"] == "R6-prompt-size"
+        assert row["detail"]["arm"] == arm
+        assert row["detail"]["declared_sha256"] == row["detail"]["live_sha256"]
+    # the two arms really were adjudicated on DIFFERENT prompts
+    lean_row = {r["rule"]: r for r in
+                report["consumption_rules"]["lean"]}[tool.AB_R6_EXEMPTION]
+    rich_row = {r["rule"]: r for r in
+                report["consumption_rules"]["rich"]}[tool.AB_R6_EXEMPTION]
+    assert rich_row["detail"]["live_chars"] > lean_row["detail"]["live_chars"]
+    assert lean_row["detail"]["live_sha256"] != rich_row["detail"]["live_sha256"]
+
+    # ...and the exemption is load-bearing: the SHIPPED R6, asked about the rich
+    # prompt, refuses it. That is the refusal the A/B exists to make obsolete.
+    prompts.reset()
+    prompts.activate(cfg, prompt_id="rich-core-1")
+    stats = read_json(cfg.probe_stats_path)
+    texts = {kind: S42.system_prompt(kind, "German")
+             for kind in ("definition", "expression")}
+    shipped = {r["rule"]: r
+               for r in billing.consumption_rules(cfg, stats, prompts=texts)}
+    assert shipped["R6-prompt-size"]["ok"] is False
+    drift = [p for p in shipped["R6-prompt-size"]["detail"]["prompts"]
+             if p["kind"] == "definition"][0]
+    assert drift["drift"] > 1.0        # measured about 159%
+
+
+def test_the_r6_exemption_still_refuses_a_prompt_the_arm_did_not_declare(
+        cfg, registry, batch_genai, batch_stats):
+    """The exemption is a swap, not a hole: R6's size band is replaced by an
+    IDENTITY check, and a live prompt that is not the arm's declared prompt is
+    still a blocking refusal."""
+    from ankidkdeck import prompts
+    tool = _ab_tool()
+    _ab_setup(cfg, tool)
+    stats = read_json(cfg.probe_stats_path)
+
+    # the arm's own prompt active: passes
+    prompts.reset()
+    prompts.activate(cfg, prompt_id="rich-core-1")
+    rows = tool.ab_consumption_rules(cfg, "German", "rich", stats)
+    assert {r["rule"] for r in rows} >= {tool.AB_R6_EXEMPTION}
+
+    # the WRONG pack active for this arm: refuses, naming the exemption
+    prompts.reset()
+    prompts.activate(cfg, prompt_id="v4-frozen")
+    with pytest.raises(FatalError) as exc:
+        tool.ab_consumption_rules(cfg, "German", "rich", stats)
+    assert tool.AB_R6_EXEMPTION in str(exc.value)
+
+
+def test_the_interactive_ab_path_now_refuses_when_g_budget_would(
+        cfg, registry, fake_genai, no_sleep, probe_stats):
+    """BLOCKER 3, third part. The interactive arms used to run behind no
+    pre-spend gate at all -- up to 100 paid requests with no G-BUDGET, no
+    G-SCOPE-FROZEN and no N-09 rule."""
+    from ankidkdeck import prompts
+    tool = _ab_tool()
+    _ab_workspace(cfg, n_entries=2)
+    prompts.reset()
+    prompts.activate(cfg, prompt_id=tool.ARMS["lean"][0])
+    batches = tool.pick_entries(cfg, "German", 2)
+    ledger = cfg.work_dir / "probes" / "calls.jsonl"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    cfg.spend_cap_usd = 0.0001
+
+    with pytest.raises(FatalError) as exc:
+        tool.run_interactive_ab(cfg, "German", ["lean", "rich"], batches,
+                                ledger)
+    assert "G-BUDGET" in str(exc.value)
+    assert fake_genai.calls == []              # refused before the first call
+
+
+def test_the_interactive_ab_path_quotes_the_surface_it_runs_on(
+        cfg, registry, fake_genai, no_sleep, probe_stats):
+    """AB_INTERACTIVE_MODE on the RANK_MODE / REVIEW_MODE template: one constant
+    drives the ledger label, the rate card AND the request ceiling. Quoting off
+    cfg.mode would price a synchronous arm at batch rates during a batch month
+    and quote it the batch ceiling of 4 for a path that takes the interactive
+    count-lock x transport ladder of 25 -- the review() defect, one file over."""
+    from ankidkdeck import prompts
+    tool = _ab_tool()
+    _ab_workspace(cfg, n_entries=2)
+    prompts.reset()
+    prompts.activate(cfg, prompt_id=tool.ARMS["lean"][0])
+    batches = tool.pick_entries(cfg, "German", 2)
+    ledger = cfg.work_dir / "probes" / "calls.jsonl"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+
+    @fake_genai.respond
+    def _answer(call):
+        props = call["config"].kwargs["response_schema"]["properties"]
+        n = props["definitions"]["minItems"]
+        return {"headword": "hus",
+                "definitions": [{"lemma": "L%d" % i, "gloss": "G%d" % i}
+                                for i in range(n)]}
+
+    # the operator's config says batch; the interactive arms do not run there
+    cfg.mode = "batch"
+    cfg.cache_enabled = True
+    results, report = tool.run_interactive_ab(cfg, "German", ["lean"], batches,
+                                              ledger)
+    assert tool.AB_INTERACTIVE_MODE == "standard"
+    assert report["surface"] == "standard"
+    assert report["config_overrides"]["mode"] == {"was": "batch",
+                                                  "now": "standard"}
+    assert report["config_overrides"]["cache_enabled"] == {"was": True,
+                                                           "now": False}
+    row = list(report["bill"].values())[0]
+    assert row["surface"] == "standard"
+    assert row["dollars"]["rate_card_source"].endswith(", standard)")
+    # the INTERACTIVE ladder (25x), not the batch ceiling of 4
+    assert row["requests_max_transport"] == "standard"
+    assert "INCLUDES transport retries" in row["requests_max_basis"]
+    # and the rows really were placed and labelled standard
+    assert results["lean"]["calls"] == len(batches)
+    usage = [json.loads(x) for x in
+             (cfg.report_dir / "prompt_ab_usage.jsonl")
+             .read_text(encoding="utf-8").splitlines() if x.strip()]
+    assert usage and all(r["mode"] == "standard" for r in usage)
+
+
+def test_an_ab_run_leaves_the_production_gates_report_untouched(
+        cfg, registry, batch_genai, batch_stats):
+    """S1. s42._pre_spend goes through gates.run_gates, which persists into
+    cfg.report_dir/gates_report.json and merges by (id, stage, extra) with "a
+    later run of the SAME scope wins" -- and pre_spend_gates emits
+    G-SCOPE-FROZEN and G-BUDGET at stage 42, the very rows a production stage-42
+    run emits. One A/B run turned a red report green. A measurement tool must
+    not participate in the release artifact."""
+    tool = _ab_tool()
+    batches, ledger = _ab_setup(cfg, tool)
+    report_path = cfg.report_dir / "gates_report.json"
+    write_json(report_path, {"results": [
+        {"id": "G-BUDGET", "description": "d", "stage": "42", "extra": {},
+         "ok": False, "detail": {"why": "the production wave is over budget"}},
+        {"id": "G-SCOPE-FROZEN", "description": "d", "stage": "42",
+         "extra": {}, "ok": False, "detail": {"why": "no refreeze stamp"}}]})
+    before = report_path.read_bytes()
+
+    tool.run_batch_ab(cfg, "German", ["lean", "rich"], batches, ledger,
+                      client=batch_genai, sleep=_no_sleep)
+
+    assert report_path.read_bytes() == before
+    assert [r["ok"] for r in read_json(report_path)["results"]] == [False,
+                                                                   False]
+    # the A/B's own verdict is still on disk, in its OWN file
+    own = read_json(cfg.report_dir / "prompt_ab_gates.json")
+    assert {r["id"] for r in own["results"]} == {"G-SCOPE-FROZEN", "G-BUDGET"}
+    assert all(r["ok"] for r in own["results"])
+    assert all(r["stage"] == "42-prompt-ab" for r in own["results"])
+
+
+def test_a_crash_inside_the_ab_ingest_does_not_duplicate_a_single_row(
+        cfg, registry, batch_genai, batch_stats, monkeypatch):
+    """S2. The DOWNLOADED -> RECOVERED guard closes the whole-file case and
+    cannot close this one: the state only advances after the LAST row, so a
+    crash after row 1 of 3 left the job DOWNLOADED and the next run re-ingested
+    everything. billing.usage_row_uid dedupes on (ts, seq), which a second
+    process cannot reproduce, so the duplicates counted as real spend and
+    over-weighted one arm in the artifact backfill re-derives constants from."""
+    tool = _ab_tool()
+    batches, ledger = _ab_setup(cfg, tool)
+    usage_path = cfg.report_dir / "prompt_ab_usage.jsonl"
+
+    real_append = S42.append_jsonl
+    state = {"n": 0}
+
+    def _explode(path, row):
+        # Only the PROBE ledger is counted: UsageLog.record goes through this
+        # same function, and the crash has to land BETWEEN the two files so the
+        # re-run sees a genuinely torn ingest.
+        if str(path) == str(ledger):
+            state["n"] += 1
+            if state["n"] == 2:             # mid-ingest, after row 1 landed
+                raise RuntimeError("disk went away")
+        return real_append(path, row)
+
+    monkeypatch.setattr(S42, "append_jsonl", _explode)
+    with pytest.raises(RuntimeError):
+        tool.run_batch_ab(cfg, "German", ["lean"], batches, ledger,
+                          client=batch_genai, sleep=_no_sleep)
+    monkeypatch.setattr(S42, "append_jsonl", real_append)
+
+    reg = BREG.JobRegistry(cfg, file=tool.AB_REGISTRY_FILE)
+    assert [j["state"] for j in reg.jobs().values()] == [BREG.DOWNLOADED]
+    probe_rows = [x for x in ledger.read_text(encoding="utf-8").splitlines()
+                  if x.strip()]
+    usage_rows = [x for x in usage_path.read_text(encoding="utf-8").splitlines()
+                  if x.strip()]
+    assert len(probe_rows) == 1 and len(usage_rows) == 2   # torn mid-ingest
+
+    # the re-run completes it and appends NOTHING twice
+    results, _ = tool.run_batch_ab(cfg, "German", ["lean"], batches, ledger,
+                                   client=batch_genai, sleep=_no_sleep)
+    assert results["lean"]["calls"] == len(batches)
+    assert results["lean"]["rows_already_written"] == 2
+    probe_rows = [json.loads(x) for x in
+                  ledger.read_text(encoding="utf-8").splitlines() if x.strip()]
+    usage_rows = [json.loads(x) for x in
+                  usage_path.read_text(encoding="utf-8").splitlines()
+                  if x.strip()]
+    assert len(probe_rows) == len(usage_rows) == len(batches)
+    uids = [r["ab_row_uid"] for r in probe_rows]
+    assert len(set(uids)) == len(uids)                 # no duplicate identity
+    assert set(uids) == {r["ab_row_uid"] for r in usage_rows}
+    assert len(batch_genai.jobs) == 1                  # and no second spend
+
+
+def test_the_ab_probe_rows_can_actually_feed_the_backfill_fits(
+        cfg, registry, batch_genai, batch_stats):
+    """S6. backfill_probe_stats reads the batch size as fp.get("n") -- the key
+    the wave-1 probe harness wrote. The A/B wrote only "n_expected", so every
+    A/B row, on BOTH surfaces, was silently skipped for EXPECTED_OUTPUT,
+    PROMPT_TOKENS_fit and prompt_sha256_per_n. Criterion (e) is exactly
+    `--declare-prompt-id rich-core-1 --rebase-measurement`, so the rich arm's
+    own fits could never have been re-derived from the ledger the A/B writes."""
+    tool = _ab_tool()
+    batches, ledger = _ab_varied_workspace(cfg, tool)
+    tool.run_batch_ab(cfg, "German", ["lean"], batches, ledger,
+                      client=batch_genai, sleep=_no_sleep)
+
+    rows = [json.loads(x) for x in ledger.read_text(encoding="utf-8")
+            .splitlines() if x.strip()]
+    assert len(rows) == len(batches)
+    assert all(r["request_fingerprint"]["n"]
+               == r["request_fingerprint"]["n_expected"] for r in rows)
+    derived = _backfill_tool().rederive(rows)
+    # THE PROPERTY: the fits are computed, not skipped
+    assert derived["EXPECTED_OUTPUT"] is not None
+    assert derived["PROMPT_TOKENS_fit"] is not None
+    assert derived["EXPECTED_OUTPUT"]["points"] == len(batches)
+    assert derived["PROMPT_TOKENS_fit"]["points"] == len(batches)
+
+
+def test_no_cache_is_created_when_the_wave_split_refuses_the_run(
+        cfg, registry, batch_genai, batch_stats, monkeypatch):
+    """S3. A CachedContent is a billable object with a multi-hour TTL, and the
+    one-job-per-arm refusal is a NEW one production does not have, reachable by
+    an ordinary --entries mistake. Every refusal that can still fire has to fire
+    before caches.create."""
+    tool = _ab_tool()
+    batches, ledger = _ab_setup(cfg, tool)
+    # a token target so small that every entry needs its own job
+    monkeypatch.setattr(BW, "job_token_target", lambda *a, **kw: 1)
+
+    with pytest.raises(FatalError) as exc:
+        tool.run_batch_ab(cfg, "German", ["lean"], batches, ledger,
+                          client=batch_genai, sleep=_no_sleep)
+    assert "one job per arm" in str(exc.value)
+    assert batch_genai.caches_created == []      # nothing billable was made
+    assert batch_genai.jobs == {} and batch_genai.uploads == {}

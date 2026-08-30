@@ -1086,6 +1086,108 @@ def test_the_review_pass_quotes_itself_so_the_budget_gate_has_a_number(
     assert all(row["ok"] for row in report["pre_spend_gates"])
 
 
+# ------------------------------------- the surface a review row is labelled on
+
+def test_a_review_row_names_the_surface_it_actually_ran_on(cfg, registry,
+                                                           translator):
+    """MEASURED PRODUCTION DEFECT. review() copied cfg.mode onto every usage row
+    and into its own quote. During a batch month cfg.mode is "batch", but review
+    has no batch path: it goes ctx.call -> _generate, the synchronous surface.
+    billing prices a row by ITS OWN mode field, so those calls were booked at
+    half price -- the ledger under-booked a real synchronous call by about 2x.
+
+    Stage 50's RANK_MODE is the sanctioned template and REVIEW_MODE follows it:
+    ONE constant for both the rate and the label, so they cannot disagree.
+    """
+    _workspace(cfg)
+    # The configuration that produced the defect: the run is a batch run.
+    cfg.mode = "batch"
+    write_json(cfg.review_dir / "review_flags_German.json",
+               [{"key": "11021722:21000001", "reasons": ["wrong gloss"]}])
+    report = S42.review(cfg, registry, lang="German",
+                        keys=["11021722:21000001"], confirm=True)
+    assert report["redone"]["definitions"] == 1
+    assert S42.REVIEW_MODE == "standard"
+
+    # (1) the LABEL on every row that reached disk
+    rows = read_json(cfg.report_dir / "review_usage_German.json")
+    assert rows and all(r["mode"] == "standard" for r in rows)
+
+    # (2) the RATE the quote was built from, from the same constant
+    bill = report["bill"]["German"]
+    assert bill["dollars"]["rate_card_source"].endswith(", standard)")
+    # ...and the request ceiling too: review CAN take the interactive
+    # count-lock x transport ladder, which the batch ceiling of 4 does not cover
+    assert bill["requests_max_transport"] == "standard"
+    assert "INCLUDES transport retries" in bill["requests_max_basis"]
+
+    # (3) the LEDGER prices them at the standard rate, which is what the defect
+    # was about. Same row at the batch label costs half.
+    from ankidkdeck import billing
+    from ankidkdeck.prices import rate_card
+    std = rate_card(cfg.gemini_model, "standard")
+    batch = rate_card(cfg.gemini_model, "batch")
+    booked = billing.row_dollars(rows[0], std)["usd"]
+    under = billing.row_dollars(rows[0], batch)["usd"]
+    assert booked == pytest.approx(under * 2, rel=1e-6)
+
+
+def test_a_batch_transport_row_still_books_batch(cfg):
+    """The other half of the same property: correcting the review label must not
+    turn the real batch rows into standard ones. The batch transport builds its
+    rows through the same normalize_usage and keeps mode="batch"."""
+    from ankidkdeck import billing
+    from ankidkdeck.prices import rate_card
+    usage = {"promptTokenCount": 2000, "cachedContentTokenCount": 1135,
+             "candidatesTokenCount": 300, "totalTokenCount": 2300}
+    batch_row = S42.normalize_usage(usage, model=cfg.gemini_model,
+                                    label="hus substantiv", kind="definition",
+                                    mode="batch")
+    std_row = S42.normalize_usage(usage, model=cfg.gemini_model,
+                                  label="hus substantiv", kind="definition",
+                                  mode="standard")
+    assert batch_row["mode"] == "batch" and std_row["mode"] == "standard"
+    # rows_usd_priced reads the rate off EACH ROW'S OWN mode (billing.py:
+    # `mode = row.get("mode") or default_mode`), which is the mechanism the
+    # review defect rode in on. Identical tokens, two labels, two prices.
+    priced_batch = billing.rows_usd_priced([batch_row])
+    priced_std = billing.rows_usd_priced([std_row])
+    assert priced_batch["rows_priced"] == 1 and priced_std["rows_priced"] == 1
+    assert priced_batch["usd"] < priced_std["usd"]
+    # NOT a flat 2x, and that is the point. Batch halves the uncached-input and
+    # output lines (0.375 vs 0.75, 1.875 vs 3.75) while the CACHED-input line is
+    # the same conservative 0.075 on both cards, because the page-vs-guide
+    # disagreement about batch cached input is open and only the invoice's
+    # per-project cached-input line can close it. Asserting a flat factor here
+    # would quietly encode one side of that open question, so each side is
+    # checked against its own card instead.
+    assert priced_batch["usd"] == pytest.approx(
+        billing.row_dollars(batch_row,
+                            rate_card(cfg.gemini_model, "batch"))["usd"],
+        rel=1e-6, abs=1e-6)
+    assert priced_std["usd"] == pytest.approx(
+        billing.row_dollars(std_row,
+                            rate_card(cfg.gemini_model, "standard"))["usd"],
+        rel=1e-6, abs=1e-6)
+
+
+def test_generate_refuses_to_stamp_a_row_batch(cfg):
+    """_generate IS the synchronous surface, so mode="batch" reaching it is a
+    programming error, not a configuration. Refusing is cheaper than the
+    alternative: a plausible ledger row at the wrong rate, which is exactly the
+    defect REVIEW_MODE was written for and which nothing else would catch."""
+    req = S42.LlmRequest(kind="definition", label="hus substantiv", user="{}",
+                         schema=None, n_expected=1, max_output_tokens=64,
+                         thinking_level="LOW")
+    with pytest.raises(FatalError) as exc:
+        S42._generate(None, cfg.gemini_model, req, mode="batch")
+    assert "synchronous surface" in str(exc.value)
+    assert "REVIEW_MODE" in str(exc.value)
+    # flex is NOT refused: it is this surface plus serviceTier=flex, and it is
+    # genuinely priced at the flex rate.
+    assert set(S42.SYNCHRONOUS_MODES) == {"standard", "flex"}
+
+
 def test_g_budget_sums_the_languages_before_the_first_call(cfg, registry,
                                                            translator):
     """The bill's own ceiling check is PER LANGUAGE ($4.09 against $10 on the real

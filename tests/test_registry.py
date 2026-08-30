@@ -28,7 +28,11 @@ def test_defaults_are_the_measured_ones(registry):
     assert "førsteled" in registry.demoted_pos_keys
     gates = registry.gates
     assert gates["note_count_range"] == [2800, 3100]
-    assert gates["empty_rate_baseline_pct"]["Collocations"] == pytest.approx(33.86)
+    # 39.20, not the v2.1 33.86: commit 504afa6 re-baselined G-RATE onto the v3
+    # release's own measurement (registry/gates.json carries the full
+    # rationale) and did not touch this file, so the literal was left stale.
+    assert gates["empty_rate_baseline_pct"]["Collocations"] == \
+        pytest.approx(39.20)
 
 
 def test_freeze_adds_new_families_and_writes_the_overlay(
@@ -187,7 +191,9 @@ def test_a_nested_overlay_dict_is_merged_not_replaced(cfg):
     reg = Registry(cfg)
     base = reg.gates["empty_rate_baseline_pct"]
     assert base["Content"] == 5.0
-    assert base["Collocations"] == pytest.approx(33.86)   # NOT dropped
+    # NOT dropped. 39.20 since the commit-504afa6 G-RATE re-baseline; what this
+    # test is about is the merge, not the value.
+    assert base["Collocations"] == pytest.approx(39.20)
     assert len(base) == 5
 
 

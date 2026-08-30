@@ -974,24 +974,31 @@ def dollar_figures(tokens: dict, rates=None, ceiling_usd=None) -> dict:
     return out
 
 
-def rate_card_for(cfg: Config) -> tuple:
+def rate_card_for(cfg: Config, mode: str | None = None) -> tuple:
     """(rates, note) from the money stack's optional prices module.
 
     This stage does not own prices and must not invent them, so the import is
     soft: `from ..prices import rate_card` when it exists, a stated absence when
     it does not.
+
+    `mode` defaults to cfg.mode, which is right for a wave that runs on the
+    transport the human configured. It is an ARGUMENT because one caller is a
+    path that always runs on the synchronous surface whatever cfg.mode says:
+    review() quotes REVIEW_MODE, so its quote and its ledger rows name the same
+    surface. See REVIEW_MODE for why that mattered.
     """
+    surface = mode or cfg.mode
     try:                                     # the money stack, when it lands
         from ..prices import rate_card
     except Exception as exc:                 # noqa: BLE001 - optional module
         return None, "no rate card module yet (%s: %s)" % (type(exc).__name__,
                                                            exc)
     try:
-        rates = rate_card(cfg.gemini_model, cfg.mode)
+        rates = rate_card(cfg.gemini_model, surface)
     except Exception as exc:                 # noqa: BLE001 - their code
         return None, "prices.rate_card raised %s: %s" % (type(exc).__name__, exc)
     if isinstance(rates, dict):
-        return rates, "prices.rate_card(%s, %s)" % (cfg.gemini_model, cfg.mode)
+        return rates, "prices.rate_card(%s, %s)" % (cfg.gemini_model, surface)
     return None, ("prices.rate_card returned %s, not a mapping of "
                   "input_usd_per_mtok / cached_input_usd_per_mtok / "
                   "output_usd_per_mtok" % type(rates).__name__)
@@ -2048,10 +2055,25 @@ def _finish_reason(resp) -> str:
     return str(getattr(fr, "name", fr))
 
 
+# The transports that exist on the SYNCHRONOUS surface, which is what
+# _generate IS. "batch" is not one of them: the batch transport serialises
+# requests into JSONL and never enters this function (request_ceiling's
+# docstring and batch/waves.py both state it, and no call site contradicts
+# them). "flex" IS on this surface -- it is the synchronous surface plus
+# serviceTier=flex -- and it is genuinely priced at the flex rate, so it stays.
+SYNCHRONOUS_MODES = ("standard", "flex")
+
+
 def _generate(pool: KeyPool, model: str, req: LlmRequest, *,
               usage: UsageLog | None = None, prompt_id: str = "",
               mode: str = "standard") -> Completion:
     """One schema-locked call. Returns a Completion, never a bare dict.
+
+    `mode` LABELS THE SURFACE on every usage row this call writes, and billing
+    prices a row by that field, so it must be the surface the call is really
+    placed on and not whatever transport the run was configured with. It is
+    checked against SYNCHRONOUS_MODES below; see REVIEW_MODE for the production
+    defect that check exists to make impossible.
 
     Four properties this function now has and did not have:
 
@@ -2083,6 +2105,16 @@ def _generate(pool: KeyPool, model: str, req: LlmRequest, *,
         raise FatalError(
             "%s: systemInstruction XOR cachedContent. Sending both is a hard "
             "400; the system prompt has to move INTO the cache." % req.label)
+    if mode not in SYNCHRONOUS_MODES:
+        raise FatalError(
+            "%s: _generate was handed mode = %r, but this function IS the "
+            "synchronous surface and the only transports on it are %s. A row "
+            "stamped %r here would be priced off that label by billing, so the "
+            "ledger would book a real synchronous call at the wrong rate. Pass "
+            "the surface the call is actually placed on (stage 50's RANK_MODE "
+            "and stage 42's REVIEW_MODE are the two constants that do this), "
+            "not the transport the run was configured with."
+            % (req.label, mode, ", ".join(SYNCHRONOUS_MODES), mode))
 
     from google.genai import types
 
@@ -2634,6 +2666,30 @@ def _correction_instruction(flags: list, lang: str) -> str:
     return text
 
 
+# The surface the review pass places its calls on, and the ONE place it is
+# named. Stage 50's RANK_MODE is the template: an explicit constant used for
+# BOTH the rate and the ledger row's label, so the two cannot drift apart.
+#
+# THE DEFECT THIS FIXES, measured in production. review() used to pass cfg.mode
+# to CallContext, to rate_card_for and to bill_row. But review has no batch
+# path: it goes ctx.call -> _generate, which IS the synchronous surface (the
+# batch transport never enters _generate -- see request_ceiling's docstring and
+# batch/waves.py). So a review run under `--mode batch`, which is the normal
+# configuration during a batch month, wrote mode="batch" on every usage row.
+# billing prices a row by ITS OWN mode field (billing.py:261 and :414,
+# `mode = row.get("mode") or default_mode` feeding rate_card), so those calls
+# were booked at half price: the ledger UNDER-BOOKED them by about 2x.
+#
+# The same cfg.mode also reached bill_row, so the quote a human read before
+# --confirm-spend used the BATCH request ceiling (4x) for a wave that can
+# actually take the interactive count-lock x transport ladder (25x).
+#
+# Historical ledger rows are NOT rewritten: the usage ledger is append-only.
+# Pre-fix review rows under-state month 2026-08 by about $0.002, which is
+# already recorded for invoice reconciliation.
+REVIEW_MODE = "standard"
+
+
 def review(cfg: Config, registry=None, lang: str | None = None,
            keys: list | None = None, confirm: bool = False,
            include_unused: bool = False, usage_sink=None) -> dict:
@@ -2698,20 +2754,39 @@ def review(cfg: Config, registry=None, lang: str | None = None,
     # the cells it will actually redo) and then adjudicated by G-BUDGET and
     # G-SCOPE-FROZEN. Redoing cells inside a scope that is about to be refrozen
     # is the same "paying twice" this program refuses on the translate path.
-    rates, rates_note = rate_card_for(cfg)
+    # REVIEW_MODE, not cfg.mode, on all three: the rate this is quoted at, the
+    # request ceiling it is quoted with, and the label its ledger rows carry
+    # have to be the one surface it actually runs on.
+    rates, rates_note = rate_card_for(cfg, mode=REVIEW_MODE)
     tokens = bill_tokens(rows, [], lang, stats)
-    bill = {lang: dict(bill_row(rows, [], cfg.mode), tokens=tokens,
+    bill = {lang: dict(bill_row(rows, [], REVIEW_MODE), tokens=tokens,
                        dollars=dict(dollar_figures(tokens, rates,
                                                    cfg.spend_cap_usd),
                                     rate_card_source=rates_note))}
     report["bill"] = bill
-    report["pre_spend_gates"] = _pre_spend(cfg, bill, families)
+    # ...and the SCENARIO has to be the one review will actually be billed on,
+    # which was the fourth thing cfg decided wrongly here.
+    # billing.expected_scenario returns "cache_works" whenever cfg.cache_enabled
+    # is true, and the production batch-month config is exactly mode=batch +
+    # cache_enabled=true (transport_guard permits it). But review's CallContext
+    # below carries NO cache_name, so CallContext.request sends the system
+    # instruction inline and every request pays the UNCACHED input rate.
+    # G-BUDGET was adjudicating review against a column that prices the whole
+    # system half at cached_input_usd_per_mtok (0.075) while the run is billed
+    # at input_usd_per_mtok (0.75): about a 10x under-quote on the input half.
+    #
+    # A COPY of the config, not a mutation. `cache_enabled` is the only field
+    # expected_scenario reads, the copy is used for nothing but this
+    # adjudication, and a flip-and-restore around the call would leave the wrong
+    # value behind on any exception.
+    report["pre_spend_gates"] = _pre_spend(
+        dataclasses.replace(cfg, cache_enabled=False), bill, families)
     fit = output_fit(stats=stats)
     pool = _pool_from_env(cfg)
     usage = UsageLog(sink=usage_sink,
                      path=cfg.report_dir / ("review_usage_%s.jsonl" % lang))
     ctx = CallContext(cfg=cfg, pool=pool, fit=fit, lang=lang, usage=usage,
-                      prompt_id=cfg.prompt_id, mode=cfg.mode,
+                      prompt_id=cfg.prompt_id, mode=REVIEW_MODE,
                       violations_path=cfg.review_dir
                       / ("count_lock_violations_%s.json" % lang))
     eff = prompts.effective_prompt_id(lang)

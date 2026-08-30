@@ -13,13 +13,16 @@ make this module worth having as its own file:
      January 1, 2027."), and it never calls the lower one promotional. A bill
      quoted for a wave that runs in January must use the January card, so the
      card is a function of the date and not a constant.
-  3. ONE CONSERVATIVE UNKNOWN, NAMED. The cached-input rate is the one number
-     the sources disagree on: the pricing page's batch row says $0.0375/M and
-     the batch guide says "you pay the standard context caching rates", i.e.
-     $0.075/M. Only the invoice can settle it. Until it does, this module
-     returns the HIGHER figure and says so in `cached_input_unsettled`, because
-     the direction of a pricing error matters: over-quoting refuses a wave that
-     would have fit, under-quoting spends money nobody accepted.
+  3. ONE CONSERVATIVE UNKNOWN, NAMED, AND STILL OPEN. The BATCH cached-input
+     rate is the one number the sources disagree on: the pricing page's batch
+     row says $0.0375/M and the batch guide says "you pay the standard context
+     caching rates", i.e. $0.075/M. Only the INVOICE can settle it. Until it
+     does, this module returns the HIGHER figure and says so in
+     `cached_input_unsettled`, because the direction of a pricing error matters:
+     over-quoting refuses a wave that would have fit, under-quoting spends money
+     nobody accepted. A month-total comparison against a dashboard cannot close
+     it and was tried -- see CACHED_INPUT_OPEN_QUESTION for the arithmetic and
+     for the half of the question that IS settled.
 
 The dollar arithmetic is NOT here. This module answers "what does a token
 cost"; billing.py answers "what does this wave cost", once, in one place.
@@ -80,12 +83,25 @@ _CARDS = {
                     # Half price on both sides of the wire. The cached-input
                     # figure is the CONSERVATIVE one of the two the sources give
                     # (see the module docstring): the page's batch row says
-                    # 0.0375, the batch guide says standard caching rates.
+                    # 0.0375, the batch guide says standard caching rates. The
+                    # page's figure is the better documentary claim and may well
+                    # be right -- but only the invoice's per-project
+                    # cached-input line item can settle it, and until it does
+                    # this line over-quotes rather than under-quotes. See
+                    # CACHED_INPUT_OPEN_QUESTION.
                     "batch": {"input": 0.375, "output": 1.875,
                               "cached_input": 0.075},
-                    # Measured penny-for-penny identical to batch on the page.
-                    # flex is a service tier on the standard surface, not a
-                    # separate price list.
+                    # Input and output are penny-for-penny identical to batch on
+                    # the page. CACHED INPUT IS THE SAME CONSERVATIVE FIGURE FOR
+                    # A DIFFERENT REASON, and the two must not be assumed to
+                    # move together: flex is a service tier on the STANDARD
+                    # surface, not a separate price list, and the batch guide's
+                    # "standard context caching rates" is uncontested for that
+                    # surface. Whatever the invoice says about BATCH cached
+                    # input says nothing about flex. It is a forecast-only
+                    # number in any case: s42.transport_guard refuses
+                    # cache_enabled on every mode except batch, so no flex
+                    # request ever bills a cached input token.
                     "flex": {"input": 0.375, "output": 1.875,
                              "cached_input": 0.075},
                 },
@@ -114,11 +130,44 @@ _CARDS = {
 # readings are on the record, the difference is under $0.02 per language at the
 # measured volume, and only the invoice can close it. Recorded here so the bill
 # carries the ambiguity instead of a reader having to remember it.
-CACHED_INPUT_OPEN_QUESTION = ("$0.0375/M (pricing page, batch row) vs $0.075/M "
-                              "(batch guide: \"the standard context caching "
-                              "rates\"). Quoting the higher one until the "
-                              "invoice settles it; see stats.json "
-                              "W4_RECONCILIATION for the numbers to compare.")
+#
+# WHAT SETTLES IT, AND WHAT DOES NOT. The only instrument that can decide this
+# is the invoice's PER-PROJECT CACHED-INPUT LINE ITEM, compared against
+# sum(cachedContentTokenCount). That is the procedure this project
+# pre-registered in work/probes/stats.json W4_RECONCILIATION, and it is still
+# the procedure. A month-TOTAL comparison against the AI Studio dashboard was
+# tried on 2026-08-30 and CANNOT discriminate, for two independent reasons:
+#
+#   the direction came out backwards. Re-priced with this package's own billing
+#   code, the 2026-08 ledger totals $2.845 at $0.075/M and $2.689 at $0.0375/M
+#   against a dashboard month-to-date of $3.04 -- gaps of -$0.195 and -$0.351.
+#   The HIGHER rate is the CLOSER one, by $0.156, which is to within rounding
+#   the rate delta itself (4,155,072 cached batch tokens x $0.0375/M = $0.156):
+#   the delta had been mistaken for a residual.
+#   the comparison is underdetermined anyway. reports/*usage*.jsonl is not the
+#   complete record of the project's August spend -- the wave-1/wave-2 probe
+#   calls live only in work/probes/calls.jsonl and were never ingested. That
+#   term is uncertain between ~$0.33 (contemporaneous report) and ~$0.80
+#   (re-priced), which is larger than the $0.156 signal under test.
+#
+# THE OTHER HALF OF THE QUESTION IS SETTLED, and the same dashboard reading is
+# what settles it. Batch responses come back reporting serviceTier STANDARD,
+# which looked like evidence that the batch discount was not being applied at
+# all. Priced undiscounted this ledger would total about $5.68 against a
+# dashboard of $3.04, so the discount plainly IS applied and the reported tier
+# is a label on the response rather than a statement about the bill. Do not
+# "fix" a batch bill to standard rates on the strength of that field.
+CACHED_INPUT_OPEN_QUESTION = (
+    "$0.0375/M (pricing page, batch row -- the better documentary claim) vs "
+    "$0.075/M (batch guide: \"the standard context caching rates\"). Quoting "
+    "the higher one until the INVOICE's per-project cached-input line settles "
+    "it; see stats.json W4_RECONCILIATION for the pre-registered comparison. A "
+    "month-total check against the AI Studio dashboard was tried on 2026-08-30 "
+    "and does not discriminate (the ledger is $2.845 at 0.075 and $2.689 at "
+    "0.0375 against $3.04, so the higher rate is the closer one, and an "
+    "un-ingested probe wave leaves a gap larger than the delta). SETTLED by "
+    "that same reading: the batch discount IS applied even though responses "
+    "report serviceTier STANDARD -- undiscounted the month would be ~$5.68.")
 
 
 def priced_models() -> tuple:

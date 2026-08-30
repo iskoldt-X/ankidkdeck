@@ -104,14 +104,37 @@ class JobRegistry:
     Append-mostly and rewritten atomically. Small (one record per job, a few
     hundred bytes plus the plan) and read on every invocation, so a crash leaves
     a readable file rather than a half-written one.
+
+    `file` OVERRIDES THE FILENAME, for a non-production wave that must not share
+    this workspace's job bookkeeping -- the prompt A/B in
+    tools/prompt_thinking_ab.py is the one that exists. Everything else about
+    the state machine is identical.
+
+    WHAT THIS DOES AND DOES NOT PROTECT, stated precisely because an earlier
+    version of this comment had it backwards and a reader who believed it could
+    have deleted the real mechanism as redundant. Adoption by a production
+    resume is NOT what a separate file prevents: transport._resume_in_flight and
+    _ingest_ready both select on EXACT equality of the `lang` field, and the
+    A/B's jobs carry a WAVE TAG there ("AB-German-lean-<sel>") rather than a
+    language, so a translate for "German" cannot match one even out of a shared
+    file. That is the mechanism, it lives in
+    tools/prompt_thinking_ab.py:ab_wave_tag, and two independent reviewers
+    confirmed it by experiment.
+
+    What a separate file does protect is everything this registry does WITHOUT
+    filtering by `lang`: find_by_fingerprint, next_job_id's slot allocation,
+    summary() and cache_prompt_shas() (the last read by the transport at two
+    call sites). It also keeps a human reading work/batch/jobs.json from seeing
+    A/B rows, and it keeps the isolation standing if the tag scheme ever
+    changes. Worth having -- just not the load-bearing half.
     """
 
     FILE = "jobs.json"
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, file: str | None = None):
         self.cfg = cfg
         self.dir = cfg.work_dir / "batch"
-        self.path = self.dir / self.FILE
+        self.path = self.dir / (file or self.FILE)
         self.data = read_json(self.path, default={"jobs": {}, "schema": 1})
         self.data.setdefault("jobs", {})
 
