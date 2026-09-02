@@ -507,6 +507,30 @@ def test_the_expression_prompt_keeps_the_two_frozen_things():
             assert "DO NOT USE RUSSIAN" in prompts.build_expression_prompt(lang)
 
 
+def test_the_russian_target_is_not_told_to_avoid_russian():
+    """Rule 2 named a language, so for one target it forbade what rule 1
+    requires: "the primary language MUST be Russian" followed by "DO NOT USE
+    RUSSIAN under any circumstances". The exemption is that one target and
+    nothing else -- the clause is institutional memory for every other language,
+    and the four shipped languages' bytes are pinned by FROZEN_EXPR_SHA256.
+    """
+    for pid in ("v4-frozen", "rich-core-1"):
+        text = prompts.build_expression_prompt("Russian", prompt_id=pid)
+        assert "DO NOT USE RUSSIAN" not in text
+        # rule 1 still names the target, and rule 2 still forbids the others
+        assert 'The primary language for both "lemma" and "gloss" MUST be ' \
+               "**Russian**" in text
+        assert "You must avoid all other languages." in text
+        # and the rest of the block is untouched
+        assert "AS A LAST RESORT" in text
+    # the exemption is keyed on the language, not on the presence of a pack
+    # (Russian has none), so a packless language that is not Russian keeps it
+    for lang in ("German", "Tagalog"):
+        other = prompts.build_expression_prompt(lang)
+        assert "DO NOT USE RUSSIAN" in other
+        assert "You must avoid all other languages." in other
+
+
 def test_no_prompt_carries_a_per_batch_instruction():
     """Corrections go in the USER message. A correction PREPENDED to the system
     prompt changes the cached prefix, forfeiting the discount on precisely the
@@ -1688,3 +1712,63 @@ def test_a_han_script_language_with_no_pack_does_not_block_every_cell():
         {"1:1": {"lemma": CYRILLIC * 3, "gloss": "x",
                  "provenance": "gemini:x@2026"}},
         lang="Tagalog", kind="definitions", pack={})] == ["forbidden_script"]
+
+
+def test_a_cyrillic_target_with_no_pack_does_not_block_every_cell():
+    """The same defect as the Han one above, on the block table's FIRST entry.
+
+    Cyrillic is `_SCRIPT_BLOCKS[0]`, and with no pack `named` is empty, so
+    `forbidden_scripts` was all eleven blocks and a Russian wave was a
+    BLOCK-tier `forbidden_script` on every cell, at ingest, after the money.
+    The judgement now comes from the target language as well as from the pack;
+    what it does NOT come from is the pack's absence.
+    """
+    profile = gates.script_profile(None, lang="Russian")
+    assert not profile["has_pack"]
+    assert profile["scripts_the_language_uses"] == ("cyrillic",)
+    # the pack said nothing, and the key that reports the pack still says so
+    assert profile["scripts_the_pack_names"] == ()
+    forbidden = {name for name, _, _ in profile["forbidden_scripts"]}
+    assert "cyrillic" not in forbidden
+    assert {"arabic", "hangul", "hiragana", "katakana", "hebrew",
+            "devanagari", "thai"} <= forbidden
+    # a miss in this lookup is silent and total, so the name is normalised for
+    # whitespace as well as case: a config value with a stray space would
+    # otherwise re-block every cell of the target's own script
+    for spelling in ("russian", " Russian", "Russian\n", "  RUSSIAN  "):
+        assert gates.script_profile(None, lang=spelling) \
+            ["scripts_the_language_uses"] == ("cyrillic",), spelling
+
+    cells = {"1:1": {"lemma": CYRILLIC * 3,
+                     "gloss": CYRILLIC * 6 + " " + CYRILLIC * 4 + ".",
+                     "provenance": "gemini:x@2026"}}
+    assert gates.script_findings(cells, lang="Russian", kind="definitions",
+                                 pack={}) == []
+    # exactly one language word: the same cells in any other target are still
+    # contamination, which is what the existing Tagalog test asserts
+    assert [f["class"] for f in gates.script_findings(
+        cells, lang="Tagalog", kind="definitions", pack={})] \
+        == ["forbidden_script"]
+    # ...and a Russian target is told nothing about the OTHER blocks
+    assert [f["class"] for f in gates.script_findings(
+        {"1:1": {"lemma": "\u0627\u0644\u0639",
+                 "gloss": CYRILLIC * 4 + ".",
+                 "provenance": "gemini:x@2026"}},
+        lang="Russian", kind="definitions", pack={})] == ["forbidden_script"]
+
+
+def test_the_language_exemption_does_not_change_the_pack_derived_profile():
+    """`pack` stays positional and `lang` stays optional, so every existing
+    caller is unaffected: the four shipped packs still forbid all eleven blocks
+    with no language argument at all, and a language nobody listed is still
+    told nothing about its own letters."""
+    assert len(gates.script_profile(None)["forbidden_scripts"]) == 11
+    for lang in LANGS:
+        profile = gates.script_profile(packs.load(lang), lang)
+        assert profile["scripts_the_language_uses"] == ()
+        assert len(profile["forbidden_scripts"]) == 11
+    # Bulgarian is Cyrillic-script and deliberately absent: this table is a
+    # claim about a target being enabled, not a script-to-language mapping
+    assert "cyrillic" in {name for name, _, _ in
+                          gates.script_profile(None, lang="Bulgarian")
+                          ["forbidden_scripts"]}

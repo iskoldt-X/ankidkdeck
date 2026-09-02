@@ -15,6 +15,19 @@ thousands, and it is the only place the tail of the distribution is visible:
         --rebase-thinking-from ~/v3run/work/batch/Chinese-expr-w0-00_results.jsonl \\
         --write
 
+THIRD MODE -- DECLARE a PROMPT_TOKENS_system_only entry (see
+declare_system_tokens_mode below). That constant is the one consumption-critical
+number the ledger cannot recompute, and both readers refuse a language that has
+no entry, so a new target language is blocked on a measurement the owner may
+decide not to buy. Declaring it is worse than measuring it and better than
+either a hand edit or a hard-coded default, because it lands in the change log
+with a basis and the words "declared, not measured":
+
+    python3 tools/backfill_probe_stats.py --probes ~/v3run/work/probes \\
+        --declare-system-tokens Russian=1135 \\
+        --declaration-basis "same LEAN core; the language name is the only \\
+substitution, and Chinese/German/Spanish all measure 1135" --write
+
 Why a tool and not a hand edit. stats.json is the file that authorises spending:
 every request's output cap, the cache floor, the thinking constant and the whole
 bill are read from it, and nothing in the package has a default for any of them.
@@ -58,6 +71,18 @@ stale):
                                 paid call). It had ONE reader for a while --
                                 doctor -- while this docstring claimed two, i.e.
                                 the switch designed to stop a spend could not.
+  PROMPT_TOKENS_system_only     one language's system-prompt token count, and
+    .<lang>                     ONLY for a language that has none. The ledger
+                                cannot recompute this key, so the third mode
+                                takes it from a human instead: requires
+                                --declare-system-tokens LANG=N plus a
+                                --declaration-basis, refuses a language that
+                                already has a value whether it was measured or
+                                declared, and records language, value, basis,
+                                date and the words "declared, not measured" in
+                                `backfilled.changes`. It writes no other key:
+                                nothing consumes a declaration record, so there
+                                is no gate that can refuse to spend on one.
 
 What it will NOT write: any constant the raw ledger cannot support, and any key
 nothing consumes. SCHEMA_TOKENS is the example of the second kind -- the patch
@@ -998,6 +1023,150 @@ def rebase_thinking_mode(stats_path: Path, paths: list, level: str,
     return 0
 
 
+DECLARED_NOT_MEASURED = "declared, not measured"
+
+
+def parse_declarations(items: list):
+    """`LANG=N` pairs off the command line, or (None, why) if one is malformed.
+
+    The language name is taken VERBATIM. s42_translate.system_prompt_tokens
+    reads stats["PROMPT_TOKENS_system_only"][lang] by exact key, with the lang
+    coming straight off the run config, so folding case here would either miss
+    that lookup or invent a spelling nobody asked for.
+    """
+    out = {}
+    for item in items:
+        lang, sep, value = str(item).partition("=")
+        lang = lang.strip()
+        if not sep or not lang:
+            return None, "not LANG=N: %r" % item
+        try:
+            n = int(str(value).strip())
+        except ValueError:
+            return None, "token count is not an integer: %r" % item
+        if n <= 0:
+            return None, "a system prompt cannot be %d tokens: %r" % (n, item)
+        if lang in out:
+            return None, "%r declared twice in one run" % lang
+        out[lang] = n
+    return out, ""
+
+
+def declare_system_tokens_mode(stats_path: Path, declared: dict, basis: str,
+                               write: bool) -> int:
+    """The third mode's whole run: refuse, patch, report.
+
+    PROMPT_TOKENS_system_only is the one consumption-critical constant the
+    reconciliation above can only report as PRESENT or MISSING -- it is not
+    recomputable from calls.jsonl, because the ledger records the fitted TOTAL
+    prompt, not the system half on its own. Two readers refuse without it: the
+    wave splitter, which subtracts the system half to size the uncached payload,
+    and the bill. So a target language nobody has probed cannot run at all,
+    which turns "one language word in the config" into "buy a measurement
+    first".
+
+    A declaration is the third option, after "buy the probe" and "do not run
+    the language", and it is deliberately the weakest thing that may put a
+    number into this file:
+
+      * it may only FILL A GAP. A language that already has a value is refused,
+        whatever the value is and whoever wrote it, because the whole point of
+        this file is that a measured number cannot be talked over by a stated
+        one. Correcting a wrong entry is a delete plus a re-measure, by hand and
+        on purpose.
+      * it must carry a --declaration-basis, in the human's own words, and the
+        change log entry says "declared, not measured" in as many words. A
+        reader of stats.json who cannot tell a measurement from an assertion has
+        the same problem as a reader of a hand-edited file.
+      * it writes no structured node of its own, only the value plus the change
+        log entry. This tool does not write keys nothing consumes, and nothing
+        consumes a declaration record today; a gate that refuses to spend on a
+        declared constant would be the thing that justifies one.
+
+    Runs alone, and needs no calls.jsonl: a declaration is by definition not
+    derived from the ledger, and the workspace of a brand-new target language is
+    exactly the one least likely to have a probe ledger in it.
+    """
+    stats = json.loads(stats_path.read_text(encoding="utf-8"))
+    on_file = dict(stats.get("PROMPT_TOKENS_system_only") or {})
+    logged = " ".join(str(c) for c in
+                      (stats.get("backfilled") or {}).get("changes") or [])
+    # Before anything is printed as a plan, the same way --declare-prompt-id
+    # refuses: a refusal must not read like a footnote to a success.
+    for lang in sorted(declared):
+        clash = sorted(k for k in on_file if k.lower() == lang.lower())
+        if not clash:
+            continue
+        key = clash[0]
+        print("REFUSED: %s already has a value, and a declaration may never "
+              "overwrite one." % lang, file=sys.stderr)
+        print("  on file      %r = %s" % (key, on_file[key]), file=sys.stderr)
+        print("  declared     %s" % declared[lang], file=sys.stderr)
+        print("  that value   %s"
+              % ("was itself declared by this tool, so re-running adds nothing"
+                 if ("%s = %s" % (key, on_file[key])) in logged
+                 else "is a measurement as far as this file is concerned"),
+              file=sys.stderr)
+        print("  to change it remove the entry by hand and re-measure",
+              file=sys.stderr)
+        return 3
+
+    print("--- declaring PROMPT_TOKENS_system_only ---")
+    print("  on file: %s"
+          % json.dumps(on_file, ensure_ascii=False, sort_keys=True))
+    patch = copy.deepcopy(stats)
+    node = dict(on_file)
+    changes = []
+    today = datetime.date.today().isoformat()
+    for lang in sorted(declared):
+        node[lang] = int(declared[lang])
+        changes.append("PROMPT_TOKENS_system_only.%s = %d (%s; %s; basis: %s)"
+                       % (lang, int(declared[lang]), DECLARED_NOT_MEASURED,
+                          today, basis))
+    patch["PROMPT_TOKENS_system_only"] = node
+
+    print("--- verdict ---")
+    print("  changes %s:" % ("to write" if write else "that --write would make"))
+    for change in changes:
+        print("    %s" % change)
+    if not write:
+        return 0
+
+    existing = sorted(stats_path.parent.glob("%s.pre-declare-system-tokens-*"
+                                             ".json" % stats_path.stem))
+    if existing:
+        print("  pre-image already on file: %s" % existing[0])
+    else:
+        pre = stats_path.with_name("%s.pre-declare-system-tokens-%s.json"
+                                   % (stats_path.stem, today))
+        pre.write_text(json.dumps(stats, ensure_ascii=False, indent=1,
+                                  sort_keys=True), encoding="utf-8")
+        print("  pre-image: %s" % pre)
+    prior = list((stats.get("backfilled") or {}).get("changes") or [])
+    cumulative = prior + [c for c in changes if c not in prior]
+    patch["backfilled"] = {
+        "at": today,
+        "by": "tools/backfill_probe_stats.py --declare-system-tokens",
+        "from": DECLARED_NOT_MEASURED,
+        "basis": basis,
+        "changes": cumulative,
+        "changes_this_run": changes,
+        "why": ("the artifact authorises spending, so a value that came from a "
+                "hand rather than a ledger has to say so in the artifact "
+                "itself, next to the value and in the change log"),
+    }
+    write_json_atomic(stats_path, patch)
+    report = stats_path.with_name("stats_declare_system_tokens_report.json")
+    report.write_text(json.dumps(
+        {"at": today, "stats": str(stats_path), "basis": basis,
+         "provenance": DECLARED_NOT_MEASURED,
+         "declared": {k: int(v) for k, v in declared.items()},
+         "was_on_file": on_file, "changes": changes},
+        ensure_ascii=False, indent=1, sort_keys=True), encoding="utf-8")
+    print("  wrote %s and %s" % (stats_path, report))
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--probes", required=True,
@@ -1031,10 +1200,48 @@ def main(argv=None) -> int:
                          "(default LOW). It names the key the bounds are filed "
                          "under; rows sent at another level are another "
                          "measurement.")
+    ap.add_argument("--declare-system-tokens", metavar="LANG=N",
+                    action="append", default=[],
+                    help="THIRD MODE. Record PROMPT_TOKENS_system_only for a "
+                         "language nobody has probed. Repeatable. Fills a gap "
+                         "only: a language that already has a value is "
+                         "refused, because a declaration may not overwrite a "
+                         "measurement. Requires --declaration-basis.")
+    ap.add_argument("--declaration-basis", metavar="TEXT",
+                    help="why the declared number is believed, in the "
+                         "declarer's own words. Required by "
+                         "--declare-system-tokens and written into the change "
+                         "log beside it.")
     ap.add_argument("--write", action="store_true",
                     help="patch stats.json (a dated pre-image is written next "
                          "to it first) and write the provenance report")
     args = ap.parse_args(argv)
+    declared, why = parse_declarations(args.declare_system_tokens)
+    if why:
+        ap.error("--declare-system-tokens: %s" % why)
+    if declared and not (args.declaration_basis or "").strip():
+        ap.error("--declare-system-tokens requires --declaration-basis: a "
+                 "number in this file with no stated provenance is the state "
+                 "the consumption rules exist to forbid")
+    if args.declaration_basis is not None and not declared:
+        # Symmetric with the check above. Without it a basis on its own fell
+        # through into the reconciliation and exited 0, so a mistyped
+        # --declare-system-tokens looked like a successful declaration.
+        ap.error("--declaration-basis is only meaningful with "
+                 "--declare-system-tokens: on its own it states the "
+                 "provenance of nothing")
+    # Each mode writes its own pre-image, so running two in one invocation
+    # would leave the second one's pre-image already carrying the first one's
+    # patch. Refused rather than ordered, because a mode that runs second and
+    # silently does nothing is worse than either. --thinking-level is NOT here:
+    # it has a real default, so its presence says nothing about intent.
+    other = [flag for flag, given in
+             (("--rebase-thinking-from", args.rebase_thinking_from),
+              ("--declare-prompt-id", args.declare_prompt_id),
+              ("--rebase-measurement", args.rebase_measurement)) if given]
+    if declared and other:
+        ap.error("--declare-system-tokens and %s are separate modes; run them "
+                 "one at a time" % ", ".join(other))
 
     probes = Path(args.probes).expanduser()
     stats_path = Path(args.stats).expanduser() if args.stats \
@@ -1055,6 +1262,10 @@ def main(argv=None) -> int:
             stats_path,
             [Path(p).expanduser() for p in args.rebase_thinking_from],
             str(args.thinking_level).upper(), args.write)
+
+    if declared:
+        return declare_system_tokens_mode(
+            stats_path, declared, args.declaration_basis.strip(), args.write)
 
     if not calls_path.exists():
         print("missing: %s" % calls_path, file=sys.stderr)

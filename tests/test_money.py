@@ -1769,6 +1769,175 @@ def test_the_rebase_writes_stats_json_atomically(tmp_path):
     assert not list(tmp_path.glob("*.tmp"))
 
 
+def _stats_with_system_tokens(tmp_path, node, changes=()):
+    import json as _json
+    path = tmp_path / "stats.json"
+    path.write_text(_json.dumps({"PROMPT_TOKENS_system_only": dict(node),
+                                 "backfilled": {"changes": list(changes)}}),
+                    encoding="utf-8")
+    return path
+
+
+def test_a_declared_system_prompt_token_count_says_so_in_the_artifact(tmp_path):
+    """PROMPT_TOKENS_system_only is the one consumption-critical constant the
+    ledger cannot recompute, and both readers refuse a language that has no
+    entry -- so a new target language is blocked on a measurement nobody has to
+    buy. Declaring it is allowed; declaring it SILENTLY is not, which is the
+    whole difference between this and the hand edit it replaces.
+    """
+    import json as _json
+    tool = _load_backfill_tool()
+    basis = ("same LEAN core, the language name is the only substitution; "
+             "Chinese, German and Spanish all measure 1135")
+    path = _stats_with_system_tokens(
+        tmp_path, {"Chinese": 1135, "English": 1092},
+        changes=["wave2.floor_error_verbatim + floor_classifier"])
+    before = path.read_text(encoding="utf-8")
+
+    # a dry run states the plan and touches nothing
+    assert tool.declare_system_tokens_mode(
+        path, {"Russian": 1135}, basis, False) == 0
+    assert path.read_text(encoding="utf-8") == before
+    assert not list(tmp_path.glob("*.pre-declare-system-tokens-*.json"))
+
+    assert tool.declare_system_tokens_mode(
+        path, {"Russian": 1135}, basis, True) == 0
+    got = _json.loads(path.read_text(encoding="utf-8"))
+    assert got["PROMPT_TOKENS_system_only"] == {"Chinese": 1135,
+                                                "English": 1092,
+                                                "Russian": 1135}
+    # the entry a reader of the artifact has to be able to find
+    entry = next(c for c in got["backfilled"]["changes"] if "Russian" in c)
+    assert "PROMPT_TOKENS_system_only.Russian = 1135" in entry
+    assert "declared, not measured" in entry
+    assert basis in entry
+    import datetime as _dt
+    assert _dt.date.today().isoformat() in entry
+    # cumulative, exactly as the other two modes are: the earlier backfill's
+    # provenance is still on file
+    assert "wave2.floor_error_verbatim + floor_classifier" \
+        in got["backfilled"]["changes"]
+    assert got["backfilled"]["changes_this_run"] == [entry]
+    # and the value is readable by the thing that refuses without it
+    from ankidkdeck.stages.s42_translate import system_prompt_tokens
+    assert system_prompt_tokens(got, "Russian") == 1135
+    assert list(tmp_path.glob("stats.pre-declare-system-tokens-*.json"))
+
+
+def test_a_declaration_cannot_overwrite_a_value_already_on_file(tmp_path):
+    """The asymmetry that makes a declaration safe to have at all. A measured
+    number in the file that authorises spending may not be talked over by a
+    stated one, and the tool cannot tell which of the two it is looking at --
+    so it refuses either way, and correcting an entry is a delete plus a
+    re-measure, by hand and on purpose.
+    """
+    import json as _json
+    tool = _load_backfill_tool()
+    path = _stats_with_system_tokens(tmp_path, {"Chinese": 1135})
+    before = path.read_text(encoding="utf-8")
+    assert tool.declare_system_tokens_mode(
+        path, {"Chinese": 999}, "a better guess", True) == 3
+    assert path.read_text(encoding="utf-8") == before
+    # including when the declared number AGREES: a re-run is not an excuse to
+    # rewrite the artifact and re-date its change log
+    assert tool.declare_system_tokens_mode(
+        path, {"Chinese": 1135}, "same number", True) == 3
+    # and case is not a way around it -- system_prompt_tokens reads the key
+    # exactly, so "chinese" would be a second, invisible entry
+    assert tool.declare_system_tokens_mode(
+        path, {"chinese": 1135}, "lower case", True) == 3
+    assert _json.loads(path.read_text(encoding="utf-8")) \
+        ["PROMPT_TOKENS_system_only"] == {"Chinese": 1135}
+
+
+def test_the_declaration_flag_refuses_a_number_with_no_basis(tmp_path, capsys):
+    """--declaration-basis is not optional, and a malformed LANG=N is an
+    argument error rather than a silently skipped declaration.
+
+    Every case here asserts on the MESSAGE, not just on the exit code. Reviewer
+    B ran this test against a `git archive` of the commit before the flag
+    existed and it passed: argparse also exits 2 for an unknown option, so an
+    exit-code-only assertion is green on a tree where the whole feature is
+    missing.
+    """
+    import pytest as _pytest
+    tool = _load_backfill_tool()
+    path = _stats_with_system_tokens(tmp_path, {"Chinese": 1135})
+
+    def refused(argv, *expect):
+        with _pytest.raises(SystemExit) as caught:
+            tool.main(argv)
+        assert caught.value.code == 2
+        err = capsys.readouterr().err
+        assert "unrecognized arguments" not in err, err
+        for fragment in expect:
+            assert fragment in err, (fragment, err)
+
+    argv = ["--probes", str(tmp_path), "--declare-system-tokens", "Russian=1135"]
+    for extra in ([], ["--declaration-basis", "   "]):
+        refused(argv + extra,
+                "--declare-system-tokens requires --declaration-basis")
+    # ...and a basis on its own states the provenance of nothing, rather than
+    # falling through into the reconciliation and exiting 0
+    refused(["--probes", str(tmp_path), "--declaration-basis", "why"],
+            "--declaration-basis is only meaningful with "
+            "--declare-system-tokens")
+    for bad, expect in (("Russian", "not LANG=N: 'Russian'"),
+                        ("Russian=x", "token count is not an integer"),
+                        ("Russian=0", "cannot be 0 tokens"),
+                        ("=1135", "not LANG=N: '=1135'")):
+        refused(["--probes", str(tmp_path), "--declare-system-tokens", bad,
+                 "--declaration-basis", "why"],
+                "--declare-system-tokens: ", expect)
+    # the modes may not be combined: each writes its own pre-image, so the
+    # second one's would already carry the first one's patch -- and a mode that
+    # runs second and silently does nothing is worse than a refusal
+    for combo in (["--rebase-thinking-from", str(tmp_path / "usage.jsonl")],
+                  ["--declare-prompt-id", "v4-frozen"],
+                  ["--rebase-measurement"]):
+        refused(["--probes", str(tmp_path), "--declare-system-tokens",
+                 "Russian=1135", "--declaration-basis", "why"] + combo,
+                "%s are separate modes" % combo[0])
+    assert path.read_text(encoding="utf-8").count("Russian") == 0
+
+
+def test_the_declaration_mode_needs_no_probe_ledger(tmp_path):
+    """It runs on the workspace of a brand-new target language, which is the
+    one least likely to have a calls.jsonl in it -- and a declaration is by
+    definition not derived from the ledger anyway. The reconciliation mode
+    still refuses without one."""
+    import json as _json
+    tool = _load_backfill_tool()
+    path = _stats_with_system_tokens(tmp_path, {"Chinese": 1135})
+    assert not list(tmp_path.glob("calls.jsonl"))
+    assert tool.main(["--probes", str(tmp_path), "--declare-system-tokens",
+                      "Russian=1135", "--declaration-basis", "waived",
+                      "--write"]) == 0
+    assert _json.loads(path.read_text(encoding="utf-8")) \
+        ["PROMPT_TOKENS_system_only"]["Russian"] == 1135
+    assert tool.main(["--probes", str(tmp_path)]) == 2
+
+
+def test_no_system_prompt_token_count_is_hard_coded_in_the_package(tmp_path):
+    """The declaration lives in the ARTIFACT, never in src/. A default in the
+    package would make every language runnable at a number nobody stated, which
+    is the failure the two readers' hard refusal exists to cause instead."""
+    from pathlib import Path
+    src = Path(__file__).resolve().parents[1] / "src" / "ankidkdeck"
+    for path in sorted(src.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if "PROMPT_TOKENS_system_only" not in line:
+                continue
+            assert "1135" not in line and "1092" not in line, \
+                "%s: %s" % (path, line.strip())
+    # and the reader really has no fallback
+    from ankidkdeck.stages.s42_translate import system_prompt_tokens
+    assert system_prompt_tokens({}, "Russian") is None
+    assert system_prompt_tokens(
+        {"PROMPT_TOKENS_system_only": {"Chinese": 1135}}, "Russian") is None
+
+
 def test_g_prompt_reads_the_quote_from_the_bill_file(cfg, probe_stats):
     """report["bill"][lang] does not carry prompt_id or prompt_sha256; the bill
     FILE does, and that file is what the human read. Reading the quote from

@@ -762,6 +762,16 @@ _SCRIPT_NAMED_BY = {
 # check that catches it.
 _NOT_A_SCRIPT_PHRASE = ("arabic digit",)
 
+# The script a TARGET LANGUAGE writes in, for a language no pack describes yet.
+# Cyrillic is the first entry of _SCRIPT_BLOCKS, so without this a pack-less
+# Russian run flags every cell as a BLOCK-tier forbidden_script at ingest, with
+# the money already spent -- the same defect `han_allowed` had for a Han-script
+# target. One language word, nothing inferred: the other Cyrillic-script
+# languages are out of scope until someone adds them here or ships them a pack,
+# because this table is a claim about a target this project is enabling, not a
+# script-to-language mapping.
+_SCRIPTS_BY_LANGUAGE = {"russian": ("cyrillic",)}
+
 _GREEK = ((0x0370, 0x03FF), (0x1F00, 0x1FFF))
 _HAN = ((0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xF900, 0xFAFF))
 
@@ -1034,7 +1044,7 @@ def _latin_in_lemma_class(lemma: str) -> str:
     return "latin_in_han_lemma"
 
 
-def script_profile(pack: dict | None) -> dict:
+def script_profile(pack: dict | None, lang: str | None = None) -> dict:
     """Which language-specific checks apply, read off the PACK.
 
     `allowed_scripts` and `lemma_allowed_set` are the same two pack fields the
@@ -1060,6 +1070,11 @@ def script_profile(pack: dict | None) -> dict:
         one, `han_allowed` was False and every Han character in the cell became
         a BLOCK-tier finding -- so a Han-script target language with no pack
         failed every cell of its first wave, at ingest, after the money.
+
+    `lang` is the SECOND source of permission, after the pack, and it exists
+    because the pack's absence cannot excuse the target's own script: see
+    _SCRIPTS_BY_LANGUAGE. What it permits is reported under its own key, because
+    `scripts_the_pack_names` stays a statement about the pack.
     """
     pack = pack or {}
     allowed = str(pack.get("allowed_scripts") or "").lower()
@@ -1071,8 +1086,12 @@ def script_profile(pack: dict | None) -> dict:
         haystack = haystack.replace(phrase, " ")
     named = {name for name, words in _SCRIPT_NAMED_BY.items()
              if any(w in haystack for w in words)}
+    # .strip() because a miss here is silent and total: a language name that
+    # arrives with a stray space re-blocks every cell of the target's own
+    # script, at ingest, which is the whole failure this lookup exists to stop.
+    by_lang = _SCRIPTS_BY_LANGUAGE.get(str(lang or "").strip().lower(), ())
     forbidden = tuple((name, a, b) for name, a, b in _SCRIPT_BLOCKS
-                      if name not in named)
+                      if name not in named and name not in by_lang)
     return {
         "has_pack": bool(pack),
         "han_allowed": han_allowed,
@@ -1082,6 +1101,7 @@ def script_profile(pack: dict | None) -> dict:
         "simplified_required": han_allowed,
         "forbidden_scripts": forbidden,
         "scripts_the_pack_names": tuple(sorted(named)),
+        "scripts_the_language_uses": tuple(sorted(by_lang)),
     }
 
 
@@ -1092,7 +1112,7 @@ def script_findings(cells: dict, *, lang: str, kind: str, pack=None,
     Reads only `lemma`, `gloss` and `provenance`. It never reads the Danish
     source text, so it cannot put DDO material into a report artifact.
     """
-    profile = script_profile(pack)
+    profile = script_profile(pack, lang)
     blocks = profile["forbidden_scripts"]
     out = []
     for key in sorted(cells):

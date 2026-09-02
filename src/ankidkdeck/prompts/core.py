@@ -103,6 +103,11 @@ def expression_core(lang: str) -> str:
     """06's generator prompt, frozen. The Russian clause exists because of a
     real contamination incident; do not remove it.
 
+    It is dropped for one target only, Russian itself, because there the clause
+    names the target language and rule 2 would forbid what rule 1 requires. No
+    other language is exempt, and the four shipped languages' bytes are pinned
+    by sha256 in tests/test_prompts.py.
+
     `n_items` is gone from the last line and the correction instruction is gone
     from the signature, for the same reason as in the definition core: the
     system prompt is the cached prefix, so nothing per-batch may live in it.
@@ -124,10 +129,13 @@ Return pure JSON matching the schema. The `fixed_expressions` array MUST have ex
 """
     critical_rules = ""
     if lang.lower() != "english":
+        avoid = "You must avoid all other languages."
+        if lang.lower() != "russian":
+            avoid += " **DO NOT USE RUSSIAN under any circumstances.**"
         critical_rules = f"""
 **CRITICAL RULES: These are non-negotiable.**
 1.  The primary language for both "lemma" and "gloss" MUST be **{lang}**.
-2.  You must avoid all other languages. **DO NOT USE RUSSIAN under any circumstances.**
+2.  {avoid}
 3.  **AS A LAST RESORT, ONLY IF** a concept is truly untranslatable into {lang}, you are permitted to use a concise English word or phrase in the `gloss`. This should be extremely rare. Never use English in the `lemma`.
 """
     return f"{critical_rules.strip()}\n\n{system_prompt_base.strip()}"

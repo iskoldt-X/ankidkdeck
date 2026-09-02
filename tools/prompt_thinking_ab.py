@@ -140,7 +140,7 @@ def pos_shape_violations(lang, produced, pack):
     """
     from ankidkdeck import gates                       # noqa: PLC0415
 
-    profile = gates.script_profile(pack)
+    profile = gates.script_profile(pack, lang)
     bad = []
     for row in produced:
         lemma = (row.get("lemma") or "").strip()
