@@ -241,6 +241,23 @@ def row_label(row: dict) -> str:
     return "%s[%s]" % (row.get("id"), inner)
 
 
+# The key a gate body sets in its detail to say "this verdict is ok=True because
+# there was NOTHING TO CHECK". `ok` stays a bool -- `failed` is a list of ids the
+# release checklist and the tests read, and a third verdict value would break
+# every one of them -- so the distinction lives in the detail and the PRINTED
+# view is what has to carry it. A human who reads a not-applicable row as a
+# verified pass is exactly the reader this project cannot afford.
+NOT_APPLICABLE = "not_applicable"
+
+
+def row_is_not_applicable(row: dict) -> bool:
+    """Did this row pass because nothing was checked, rather than because a
+    check passed? One reading, shared by the report writer and `gates`."""
+    detail = row.get("detail")
+    return bool(row.get("ok")) and isinstance(detail, dict) \
+        and bool(detail.get(NOT_APPLICABLE))
+
+
 def failure_message(results: list[dict]) -> str:
     """The FatalError text for a set of gate results, or "" when they all pass.
 
@@ -308,6 +325,13 @@ def _write_report(cfg, results: list[dict]) -> None:
     # failure is not reported as if German had failed too.
     out["failed"] = sorted({r["id"] for r in out["results"] if not r["ok"]})
     out["failed_rows"] = [row_label(r) for r in out["results"] if not r["ok"]]
+    # The THIRD verdict, derived the same way the other four lists are. `ok`
+    # stays a bool so `failed` keeps its meaning, which means a row that passed
+    # because there was nothing to check is otherwise the one distinction a
+    # reader has to walk `results` to find. Derived from rows already present,
+    # so it does not threaten this file's byte-stability across a repeated run.
+    out["gate_rows_not_applicable"] = [
+        row_label(r) for r in out["results"] if row_is_not_applicable(r)]
     out["n_gates"] = len(out["results"])
     # RAN vs NEVER-RUN. `n_gates` counts ROWS ON FILE, which is not the same
     # question as "which gates have a verdict on this workspace" -- the report
@@ -772,6 +796,12 @@ _NOT_A_SCRIPT_PHRASE = ("arabic digit",)
 # script-to-language mapping.
 _SCRIPTS_BY_LANGUAGE = {"russian": ("cyrillic",)}
 
+# _SCRIPT_BLOCKS is a table of NON-LATIN blocks, so a _SCRIPTS_BY_LANGUAGE entry
+# naming one of them is a target whose own letters are not Latin letters. That is
+# the test the Latin-in-lemma family is switched on by, and it is derived rather
+# than restated so a block added above cannot be forgotten here.
+_NON_LATIN_SCRIPT_NAMES = frozenset(name for name, _, _ in _SCRIPT_BLOCKS)
+
 _GREEK = ((0x0370, 0x03FF), (0x1F00, 0x1FFF))
 _HAN = ((0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xF900, 0xFAFF))
 
@@ -815,9 +845,10 @@ _PAREN_PAIRS = (("(", ")"), ("\uff08", "\uff09"))
 _BLOCK_CLASSES = ("empty_field", "forbidden_script", "greek_in_lemma",
                   "greek_latin_internal", "han_outside_the_target",
                   "traditional_han", "pinyin_in_lemma",
-                  "foreign_text_in_lemma")
+                  "foreign_text_in_lemma", "script_weld_in_lemma")
 _REVIEW_CLASSES = ("greek_mention", "greek_subject_lemma",
-                   "latin_in_han_lemma", "latin_subject_lemma")
+                   "latin_in_han_lemma", "latin_in_lemma",
+                   "latin_subject_lemma", "script_weld_in_gloss")
 SCRIPT_CLASSES = _BLOCK_CLASSES + _REVIEW_CLASSES
 
 BLOCK, BASELINE, REVIEW = "BLOCK", "BASELINE", "REVIEW"
@@ -1015,9 +1046,110 @@ def _is_latin_subject_lemma(lemma: str) -> bool:
                    for start, end, _ in runs for a, b in spans)
 
 
+def _script_groups(token: str, target_scripts) -> list:
+    """One alphanumeric token as a list of (script, characters) groups, where
+    `script` is "latin", "target", or None for anything else.
+
+    A DIGIT belongs to the group beside it -- to the Latin group when a Latin
+    letter is its nearest alphabetic neighbour on either side, otherwise to the
+    target-script group. Without that, a digit terminated the run and `MP3` +
+    a Cyrillic ending scored as two separate tokens while `SMS` + the same
+    ending scored as one, so two spellings of one word shape got two verdicts.
+    """
+    kinds = []
+    for ch in token:
+        if _is_latin_letter(ch):
+            kinds.append("latin")
+        elif ch.isdigit():
+            kinds.append(None)
+        elif _script_of(ch) in target_scripts:
+            kinds.append("target")
+        else:
+            kinds.append("other")
+    for i, kind in enumerate(kinds):
+        if kind is not None:
+            continue
+        left = next((k for k in reversed(kinds[:i]) if k is not None), None)
+        right = next((k for k in kinds[i + 1:] if k is not None), None)
+        kinds[i] = "latin" if "latin" in (left, right) else (left or right)
+    groups = []
+    for kind, ch in zip(kinds, token):
+        if groups and groups[-1][0] == kind:
+            groups[-1][1] += ch
+        else:
+            groups.append([kind, ch])
+    return [(kind, chars) for kind, chars in groups]
+
+
+def _script_weld_is_a_defect(text: str, target_scripts) -> bool:
+    """Is a Latin letter WELDED to a letter of the TARGET's own script -- no
+    space, no hyphen, no punctuation, nothing between them -- in a shape that
+    is corruption rather than morphology?
+
+    The Latin-in-lemma discriminator for a target that writes in an ALPHABET
+    other than Latin. Two lemmas of the first Russian wave carried a bare `reg`
+    welded between two Cyrillic syllables: Latin letters dropped inside a
+    Cyrillic word, which nothing was looking at.
+
+    Not every weld is a defect, and this is where the first version of the rule
+    was wrong. Russian inflects a Latin acronym or brand name in place, with no
+    separator at all -- SMS + an instrumental ending, PDF + a diminutive, iPhone,
+    USB, Instagram. Those are ordinary written Russian, none is in the corpus,
+    and BLOCK has no baseline and no tolerance: one of them in a future wave
+    would FatalError the ingest with the money already spent. So exactly ONE
+    shape is exempt, and it is the shape that morphology produces:
+
+        two groups, the LATIN group FIRST, at least two characters long, and
+        carrying at least one capital letter.
+
+    Everything else that mixes the two scripts inside one token is corruption:
+
+      * three or more groups -- an interior Latin island (`reg` between two
+        Cyrillic syllables), which no morphology produces;
+      * a ONE-CHARACTER Latin group anywhere -- the homoglyph family, and the
+        reason this check exists at all: a Latin a, o, c, p, e or x typed into a
+        Cyrillic word is invisible to a reader and fatal to a search;
+      * an all-lowercase Latin group -- a stem, not an acronym or a brand;
+      * a Latin group in the SUFFIX position -- the live corpus defect, a
+        Cyrillic word ending in a Latin e.
+
+    Scoped to Latin-plus-the-TARGET's-script rather than Latin-plus-anything so
+    a Greek letter hugged by Latin letters is reported once, by
+    greek_latin_internal, which already owns that shape in both fields.
+
+    The Han path deliberately does not ask this at all. Han characters are
+    alphabetic too and a Han lemma writes its Latin cross-reference with no
+    separator, so the rule would call that whole population corruption; there
+    the parenthesis is the discriminator instead. See _latin_in_lemma_class.
+    """
+    if not target_scripts:
+        return False
+    i, n = 0, len(text)
+    while i < n:
+        if not (text[i].isalpha() or text[i].isdigit()):
+            i += 1
+            continue
+        j = i
+        while j < n and (text[j].isalpha() or text[j].isdigit()):
+            j += 1
+        groups = _script_groups(text[i:j], target_scripts)
+        i = j
+        kinds = [kind for kind, _ in groups]
+        if "latin" not in kinds or "target" not in kinds:
+            continue
+        if len(groups) != 2 or kinds[0] != "latin":
+            return True
+        latin = groups[0][1]
+        if len(latin) < 2 or not any(ch.isupper() for ch in latin):
+            return True
+    return False
+
+
 def _latin_in_lemma_class(lemma: str) -> str:
-    """Which class a Latin-carrying Han lemma belongs to. Four truthful classes
-    where there used to be two, split on discriminators the corpus supplies:
+    """Which class a Latin-carrying HAN lemma belongs to (Han targets only --
+    two of the three names it returns say "han" or "pinyin", and both would lie
+    about any other script). Four truthful classes where there used to be two,
+    split on discriminators the corpus supplies:
 
       * `pinyin_in_lemma` -- a pinyin TONE MARK is present. Real romanisation,
         the 2025 expression defect, 20 cells, all 20 tone-marked.
@@ -1092,12 +1224,31 @@ def script_profile(pack: dict | None, lang: str | None = None) -> dict:
     by_lang = _SCRIPTS_BY_LANGUAGE.get(str(lang or "").strip().lower(), ())
     forbidden = tuple((name, a, b) for name, a, b in _SCRIPT_BLOCKS
                       if name not in named and name not in by_lang)
+    # The _SCRIPT_BLOCKS names this target's own letters come from -- what the
+    # PACK names as well as what the language table says, because a pack is the
+    # advertised way to add a target and reading only the table meant that
+    # shipping a Hebrew pack switched the Latin-in-lemma family OFF for a Hebrew
+    # target, silently, while the same lemma with no pack was a loud
+    # forbidden_script. Han is deliberately absent from this set: it is not a
+    # _SCRIPT_BLOCKS entry (nor is Greek, which has its own ranges), so a
+    # Han-script or Greek-script target has to be recognised by hand -- Han is,
+    # through `han_allowed`; Greek is not yet a target.
+    target_scripts = (named | set(by_lang)) & _NON_LATIN_SCRIPT_NAMES
+    # Does the TARGET write in something other than Latin letters? THIS, not
+    # `han_allowed`, is what the Latin-in-lemma family is asked on: it was asked
+    # only for Han, so for a Cyrillic target nothing looked at a Latin letter in
+    # a lemma at all and the first Russian wave shipped two garbled lemmas that
+    # only a hand-written post-write scan caught.
+    non_latin_target = han_allowed or bool(target_scripts)
     return {
         "has_pack": bool(pack),
         "han_allowed": han_allowed,
-        # A Han-based lemma charset does not admit Latin letters unless the pack
+        "target_script_is_non_latin": non_latin_target,
+        "target_scripts": tuple(sorted(target_scripts)),
+        # A non-Latin lemma charset does not admit Latin letters unless the pack
         # says so. For a Latin-script language the question does not arise.
-        "latin_in_lemma_allowed": (not han_allowed) or ("latin" in lemma_set),
+        "latin_in_lemma_allowed": ((not non_latin_target)
+                                   or ("latin" in lemma_set)),
         "simplified_required": han_allowed,
         "forbidden_scripts": forbidden,
         "scripts_the_pack_names": tuple(sorted(named)),
@@ -1174,9 +1325,49 @@ def script_findings(cells: dict, *, lang: str, kind: str, pack=None,
                             hit("han_outside_the_target", field, ch)
                     elif profile["simplified_required"] and _is_traditional(ch):
                         hit("traditional_han", field, ch)
-        if profile["han_allowed"] and not profile["latin_in_lemma_allowed"]:
-            if any(_is_latin_letter(ch) for ch in lemma):
+        # Two discriminators, because the two scripts supply different evidence.
+        # A Han lemma writes its Latin cross-reference with no separator, so
+        # there the parenthesis and the pinyin tone mark carry the verdict. An
+        # alphabetic non-Latin lemma writes every legitimate Latin mention as
+        # its own token, or inflects a Latin acronym in place, so there the weld
+        # SHAPE is the verdict. The class NAMES stay apart too:
+        # `latin_in_han_lemma` and `foreign_text_in_lemma` are documented in
+        # registry/gates.json as Han populations (a cross-reference, a
+        # parenthesised Danish word) and would both lie about a welded Cyrillic
+        # cell, which is why the weld gets classes of its own.
+        if profile["han_allowed"]:
+            if (not profile["latin_in_lemma_allowed"]
+                    and any(_is_latin_letter(ch) for ch in lemma)):
                 hit(_latin_in_lemma_class(lemma), "lemma")
+        elif profile["target_scripts"]:
+            welds = profile["target_scripts"]
+            # THE WELD DEPENDS ONLY ON THE TARGET'S SCRIPT, in both fields.
+            # `lemma_allowed_set` is a CHARSET, and no charset can express "not
+            # fused": a pack that permits Latin letters in a lemma has
+            # permitted a Latin TOKEN -- an acronym, a cross-reference, a
+            # brand -- and has said nothing about a Latin letter welded inside
+            # a target-script word. Reading it here switched off all ten defect
+            # shapes, the homoglyph family included, for any target whose pack
+            # names Latin.
+            #
+            # The gloss weld is measured: on the first Russian wave it finds 1
+            # cell in 22,288 and that cell is the live defect, while "any Latin
+            # letter in the gloss" finds 199 that are Danish headwords, Latin
+            # binomials and letter names -- so the gloss gets the weld and
+            # nothing else. REVIEW rather than BLOCK because that one cell
+            # already shipped at gemini: provenance, and a BLOCK class would
+            # FatalError the paid Russian deck at re-gate, which is the
+            # after-the-money failure the tiers exist to prevent. Promote it
+            # once a second wave holds at zero.
+            if _script_weld_is_a_defect(lemma, welds):
+                hit("script_weld_in_lemma", "lemma")
+            elif (not profile["latin_in_lemma_allowed"]
+                    and any(_is_latin_letter(ch) for ch in lemma)):
+                # A Latin run that is NOT welded is a charset question, and
+                # that one the pack does get to answer.
+                hit("latin_in_lemma", "lemma")
+            if _script_weld_is_a_defect(gloss, welds):
+                hit("script_weld_in_gloss", "gloss")
         for cls, slot in hits.items():
             if cls in _REVIEW_CLASSES:
                 tier = REVIEW
@@ -1325,7 +1516,8 @@ def ledger_label_reconciliation(ledger: dict, parsed_counts: dict,
                 "error_sample": errors[:20]}
 
 
-def guid_diff_reconciles(report: dict, n_notes: int, lang: str):
+def guid_diff_reconciles(report: dict, n_notes: int, lang: str,
+                         *, source: str = "", ignored=None):
     """G-REL. tools/guid_diff.py computes kept / new / retired against the
     released .apkg; nothing used to compare those numbers to the deck actually
     being shipped, so the release note's churn figure was an estimate (the
@@ -1334,13 +1526,48 @@ def guid_diff_reconciles(report: dict, n_notes: int, lang: str):
     The assertion is narrow on purpose: the summary row must describe THIS
     language and the same number of cards the exporter is about to write. The
     kept/retired split is a human-review number, not a machine-checkable one.
+
+    An EMPTY report is NOT APPLICABLE, not a failure. There is nothing to
+    reconcile, and the row is still recorded, at ok=True, carrying the marker
+    `row_is_not_applicable` reads. That is what the caller needs: gate rows
+    merge on (id, stage, extra) and are never pruned, so the ONLY thing that can
+    clear a stale FAIL row for a scope is a later row for the SAME scope.
+    Skipping the gate instead left the Russian export's language_mismatch
+    failure on file permanently after the Chinese month's report was moved
+    aside.
+
+    `ignored` is what the caller looked at and did not use. The not-applicable
+    verdict states only what it knows -- "no usable report was READ" plus the
+    candidates and the reason each was rejected -- because the obvious wording,
+    "there is no previous release to reconcile against", is a claim about the
+    disk that this function cannot check and that is FALSE whenever a file was
+    found and skipped.
     """
-    summary = (report or {}).get("summary") or {}
-    counts = (report or {}).get("counts") or {}
+    if not report:
+        skipped = list(ignored or [])
+        why = "no usable guid_diff report for %r was read" % lang
+        if skipped:
+            why += "; candidates seen and rejected: " + "; ".join(
+                "%s (%s)" % (row.get("file"), row.get("why"))
+                for row in skipped)
+        else:
+            why += ("; reports/guid_diff.%s.json is not on disk. That is the "
+                    "expected state for a first release in a language: "
+                    "tools/guid_diff.py reads the GUIDs out of a PREVIOUSLY "
+                    "RELEASED .apkg, and a first release has none" % lang)
+        return True, {
+            NOT_APPLICABLE: True,
+            "why": why + ". This is NOT a verified pass: nothing was checked",
+            "read_from": source,
+            "ignored": skipped,
+            "notes_being_written": n_notes,
+        }
+    summary = report.get("summary") or {}
+    counts = report.get("counts") or {}
     card_count = summary.get("card_count")
     problems = {}
     if card_count is None:
-        problems["no_summary_row"] = ("reports/guid_diff.json predates the "
+        problems["no_summary_row"] = ("the guid_diff report predates the "
                                       "summary row; re-run tools/guid_diff.py")
     elif card_count != n_notes:
         problems["card_count_mismatch"] = {"guid_diff": card_count,
@@ -1349,6 +1576,8 @@ def guid_diff_reconciles(report: dict, n_notes: int, lang: str):
         problems["language_mismatch"] = {"guid_diff": summary.get("language"),
                                          "export": lang}
     return not problems, {"summary": summary, "counts": counts,
+                          "read_from": source,
+                          "ignored": list(ignored or []),
                           "notes_being_written": n_notes,
                           "violations": problems}
 

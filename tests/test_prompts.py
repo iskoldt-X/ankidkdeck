@@ -750,6 +750,50 @@ ZH_TONELESS_PINYIN = "\u7a76\u7adf (jiu jing)"
 ZH_DANISH_IN_PARENS = HAN_PULL + "\uff08lille\uff09"
 
 
+# The seven real Russian cells the Latin-in-lemma family was calibrated on --
+# model output, not DDO source text. Five are legitimate and two are garbage,
+# and the whole discriminator is the token boundary: every legitimate one keeps
+# its Latin as a SEPARATE token (after a space, inside parentheses, joined by a
+# hyphen), while both defects weld `reg` between two Cyrillic syllables.
+RU_LEGIT_LEMMAS = {
+    # a cross-reference to a Danish headword; the Chinese analogue of
+    # this shape is latin_in_han_lemma, also REVIEW
+    "11012508:91001536": "\u0441\u043c. fatte",
+    # a Latin abbreviation as the entry's own subject, parenthesised
+    "11039601:91005020": "\u0444\u0438\u043b\u043e\u0441\u043e\u0444\u0438"
+                         "\u044f (\u0432 \u0441\u0442\u0435\u043f\u0435\u043d"
+                         "\u0438 cand.phil.)",
+    "11039601:91005021": "\u0444\u0438\u043b\u043e\u0441\u043e\u0444\u0438"
+                         "\u044f (\u0432 \u0441\u0442\u0435\u043f\u0435\u043d"
+                         "\u0438 dr.phil.)",
+    # a Latin acronym hyphen-joined to a Cyrillic word
+    "11046071:21072447": "CD-\u0441\u0438\u043d\u0433\u043b",
+    # a key name
+    "30000264:28002509": "\u043a\u043b\u0430\u0432\u0438\u0448\u0430 Alt",
+}
+# Both shipped, and only a hand-written post-write scan caught them:
+# Latin letters INSIDE a Cyrillic word, with no separator of any kind.
+RU_GARBLED_LEMMAS = {
+    "1:1": "\u043b\u0430reg\u0438\u0442\u044c \u0438\u043b\u0438 \u043d\u0435"
+           " \u043b\u0430\u0434\u0438\u0442\u044c \u0441 \u043a\u0435\u043c-"
+           "\u043b\u0438\u0431\u043e",
+    "1:2": "\u043b\u0430reg\u043b\u0430\u0434\u0438\u0442\u044c \u0441 \u043a"
+           "\u0435\u043c-\u043b\u0438\u0431\u043e",
+}
+# A plain Cyrillic gloss, so the lemma is the only thing under test.
+RU_GLOSS = ("\u0441\u043b\u043e\u0432\u043e \u0438 \u0434\u0440\u0443\u0433"
+            "\u043e\u0435.")
+
+
+def _ru_classes(lemmas, prov=None):
+    cells = {k: {"lemma": v, "gloss": RU_GLOSS,
+                 "provenance": prov or "gemini:x@2026"}
+             for k, v in lemmas.items()}
+    return {f["key"]: (f["class"], f["tier"])
+            for f in gates.script_findings(cells, lang="Russian",
+                                           kind="definitions", pack={})}
+
+
 def _zh_cell(lemma, gloss, prov="migrated:2025:x"):
     return {"lemma": lemma, "gloss": gloss, "provenance": prov}
 
@@ -1755,6 +1799,309 @@ def test_a_cyrillic_target_with_no_pack_does_not_block_every_cell():
                  "gloss": CYRILLIC * 4 + ".",
                  "provenance": "gemini:x@2026"}},
         lang="Russian", kind="definitions", pack={})] == ["forbidden_script"]
+
+
+def test_the_latin_in_lemma_family_is_asked_of_every_non_latin_target():
+    """The family was gated on `han_allowed`, so for a Cyrillic target NOTHING
+    looked at a Latin letter in a lemma -- and the first Russian wave shipped
+    two lemmas with Latin letters welded inside a Cyrillic word, caught only by
+    a hand-written post-write scan after the deck was built.
+
+    The question the family is asked on is whether the TARGET's own script is
+    Latin, not whether it is Han.
+    """
+    ru = gates.script_profile(None, lang="Russian")
+    assert ru["target_script_is_non_latin"] is True
+    assert ru["latin_in_lemma_allowed"] is False
+    # ...and it stays OFF for the three Latin-script targets, whose own letters
+    # ARE Latin letters. That is the measured population a per-character
+    # allow-list would have failed: 162 English, 51 German and 70 Spanish cells
+    # name the Danish headword.
+    for lang in ("English", "German", "Spanish"):
+        profile = gates.script_profile(packs.load(lang), lang)
+        assert profile["target_script_is_non_latin"] is False
+        assert profile["latin_in_lemma_allowed"] is True
+        assert not gates.script_findings(
+            {"1:1": {"lemma": "pull",
+                     "gloss": "From the Danish tr\u00e6k.",
+                     "provenance": "gemini:x@2026"}},
+            lang=lang, kind="definitions", pack=packs.load(lang))
+    # Chinese is unchanged: it was already asked, via han_allowed.
+    zh = gates.script_profile(packs.load("Chinese"), "Chinese")
+    assert zh["target_script_is_non_latin"] is True
+    assert zh["latin_in_lemma_allowed"] is False
+
+
+def test_g_script_blocks_latin_welded_into_a_cyrillic_word():
+    """The seven real Russian cells, and the discriminator between them: the
+    TOKEN BOUNDARY.
+
+    Every legitimate one keeps its Latin as a separate token -- a
+    cross-reference after a space, a degree abbreviation inside parentheses, an
+    acronym joined by a hyphen, a key name. Both defects weld `reg` between two
+    Cyrillic syllables, which is not a shape a lexicographer writes.
+    """
+    legit = _ru_classes(RU_LEGIT_LEMMAS)
+    assert len(legit) == len(RU_LEGIT_LEMMAS) == 5
+    for key, verdict in sorted(legit.items()):
+        assert verdict == ("latin_in_lemma", gates.REVIEW), key
+    garbled = _ru_classes(RU_GARBLED_LEMMAS)
+    assert len(garbled) == len(RU_GARBLED_LEMMAS) == 2
+    for key, verdict in sorted(garbled.items()):
+        assert verdict == ("script_weld_in_lemma", gates.BLOCK), key
+    # the BLOCK half is what fails a wave; the REVIEW half never does
+    ok, detail = gates.script_contract(
+        gates.script_findings(
+            {k: {"lemma": v, "gloss": RU_GLOSS, "provenance": "gemini:x@2026"}
+             for k, v in RU_LEGIT_LEMMAS.items()},
+            lang="Russian", kind="definitions", pack={}),
+        {}, lang="Russian", kind="definitions")
+    assert ok and detail["review_tier_counts"] == {"latin_in_lemma": 5}
+
+
+def test_the_weld_test_is_the_discriminator_a_cyrillic_lemma_gets():
+    """Unit-level, both directions, because the whole verdict rests on it.
+
+    A Latin run bounded by a space, a hyphen, a parenthesis or a full stop is a
+    mention. And the Han path must NOT ask this: a Han lemma's Latin
+    cross-reference has no separator at all, so the rule would call the archive
+    cross-reference population corruption.
+    """
+    weld = gates._script_weld_is_a_defect
+    for lemma in RU_GARBLED_LEMMAS.values():
+        assert weld(lemma, ("cyrillic",)), lemma
+    for lemma in RU_LEGIT_LEMMAS.values():
+        assert not weld(lemma, ("cyrillic",)), lemma
+    # Han is not a _SCRIPT_BLOCKS name, so the predicate is structurally unable
+    # to read a Han character as the target script -- and the Han path never
+    # calls it anyway. A Han cross-reference keeps the class it always had.
+    assert not weld("\u89c1afgore", ("han",))
+    assert _zh_classes({"1:4": _zh_cell("\u89c1afgore", HAN_MEANS + FULL_STOP,
+                                        prov=PROV_NEW)})["1:4"] == (
+        "latin_in_han_lemma", gates.REVIEW)
+    # no target scripts named means no weld question can be asked at all
+    assert not weld(list(RU_GARBLED_LEMMAS.values())[0], ())
+
+
+def test_the_weld_tier_separates_corruption_from_inflection():
+    """The shape rule, against every mixed-script lemma shape that was
+    put to it.
+
+    Russian inflects a Latin acronym or brand IN PLACE with no separator, and
+    BLOCK has no baseline and no tolerance: one such lemma in a future wave
+    would FatalError the ingest with the money already spent. So exactly one
+    shape is exempt -- two groups, LATIN FIRST, two or more characters, at
+    least one capital -- and it is the shape morphology produces.
+    """
+    # the morphology family: REVIEW, never BLOCK. SMS/PDF/iPhone/USB/Instagram
+    # plus a Cyrillic inflectional ending.
+    for lemma in ("SMS\u043e\u043c", "PDF\u043a\u0430",
+                  "iPhone\u043e\u043c", "USB\u0448\u043d\u044b\u0439",
+                  "Instagram\u0435"):
+        assert _ru_classes({"1:1": lemma})["1:1"] == ("latin_in_lemma",
+                                                      gates.REVIEW), lemma
+    # a DIGIT no longer splits the token, so one word shape gets one verdict:
+    # MP3 + an ending used to escape to REVIEW while SMS + the same ending
+    # BLOCKed, purely because a digit terminated the alphabetic run.
+    assert _ru_classes({"1:1": "MP3\u043f\u043b\u0435\u0435\u0440"})["1:1"] \
+        == ("latin_in_lemma", gates.REVIEW)
+    # four corruption shapes, each BLOCK for its own reason
+    corrupt = {
+        # an interior Latin island: no morphology produces one
+        "island": "\u043c\u0430reg\u043c\u0430",
+        # a ONE-CHARACTER Latin group -- the homoglyph family, and the reason
+        # this check exists: a Latin o at the head of a Cyrillic word
+        "homoglyph_head": "o\u043a\u043d\u043e",
+        # ...or a Latin e at the tail, which is the live corpus defect
+        "homoglyph_tail": "\u0440\u0430\u0441\u0447\u0435\u0442e",
+        # an all-lowercase Latin group: a stem, not an acronym or a brand
+        "lowercase_stem": "hygg\u0435",
+    }
+    for key, verdict in sorted(_ru_classes(corrupt).items()):
+        assert verdict == ("script_weld_in_lemma", gates.BLOCK), key
+    assert len(_ru_classes(corrupt)) == len(corrupt) == 4
+    # every one of the five classic Cyrillic lookalikes is caught
+    for latin, rest in (("a", "\u043c\u043c\u0430"), ("o", "\u043a\u043d\u043e"),
+                        ("c", "\u0442\u043e\u043b"), ("p", "\u0430\u0431\u043e"),
+                        ("e", "\u0434\u0430"), ("x", "\u043e\u0440")):
+        lemma = latin + rest
+        assert _ru_classes({"1:1": lemma})["1:1"][1] == gates.BLOCK, lemma
+    # the new BLOCK class is declared, and it is NOT the Han one: the registry
+    # note defines foreign_text_in_lemma as a parenthesised Danish word inside
+    # a Chinese lemma, which a Cyrillic weld is not.
+    assert "script_weld_in_lemma" in gates._BLOCK_CLASSES
+    assert "script_weld_in_lemma" in gates.SCRIPT_CLASSES
+
+
+def test_a_greek_latin_weld_is_reported_once_not_twice():
+    """greek_latin_internal already owns a Greek letter hugged by Latin letters,
+    in both fields. A weld predicate that read "Latin plus ANY other script"
+    reported the same defect a second time, at the same tier, which inflates
+    the counts a human triages and would have compounded on the gloss."""
+    findings = gates.script_findings(
+        {"1:1": {"lemma": "\u0435\u0434\u0438\u043d\u0438\u0446\u0430 k\u03a9",
+                 "gloss": RU_GLOSS, "provenance": "gemini:x@2026"}},
+        lang="Russian", kind="definitions", pack={})
+    classes = [f["class"] for f in findings]
+    assert "greek_latin_internal" in classes
+    assert "script_weld_in_lemma" not in classes
+    # the predicate itself is scoped to the target's own script
+    assert not gates._script_weld_is_a_defect("k\u03a9", ("cyrillic",))
+
+
+def test_the_gloss_gets_the_weld_check_and_nothing_else():
+    """The live defect this round measured and did not fix: one Russian gloss
+    ends a Cyrillic word with U+0065 LATIN SMALL LETTER E.
+
+    Only the WELD extends to the gloss. Measured on the first Russian wave, the
+    weld finds 1 cell in 22,288 and it is that defect; "any Latin letter in the
+    gloss" finds 199 and they are Danish headwords, Latin binomials and letter
+    names. REVIEW, not BLOCK: the cell already shipped at gemini: provenance,
+    so a BLOCK class would FatalError the paid deck at re-gate.
+    """
+    cells = {
+        # the live cell, verbatim shape: "...\u043f\u0440\u0438 \u0440\u0430
+        # \u0441\u0447\u0435\u0442" + a LATIN e
+        "live": {"lemma": "\u043e\u0446\u0435\u043d\u0438\u0432\u0430\u0442\u044c",
+                 "gloss": "\u043f\u0440\u0438 \u0440\u0430\u0441\u0447\u0435"
+                          "\u0442e \u043d\u0430\u043b\u043e\u0433\u043e\u0432.",
+                 "provenance": "gemini:x@2026"},
+        # a Danish headword quoted in the gloss: 199 cells look like this and
+        # every one is legitimate
+        "danish": {"lemma": "\u0441\u043b\u043e\u0432\u043e",
+                   "gloss": "\u043e\u0442 afg\u00f8re.",
+                   "provenance": "gemini:x@2026"},
+        # the inflected-acronym shape is not a defect in a gloss either
+        "affix": {"lemma": "\u0441\u043b\u043e\u0432\u043e",
+                  "gloss": "\u043f\u043e SMS\u043e\u043c.",
+                  "provenance": "gemini:x@2026"},
+    }
+    got = {}
+    for f in gates.script_findings(cells, lang="Russian", kind="definitions",
+                                   pack={}):
+        got.setdefault(f["key"], []).append((f["class"], f["tier"],
+                                             tuple(f["fields"])))
+    assert got["live"] == [("script_weld_in_gloss", gates.REVIEW, ("gloss",))]
+    assert "danish" not in got and "affix" not in got
+    assert "script_weld_in_gloss" in gates._REVIEW_CLASSES
+    assert "script_weld_in_gloss" in gates.SCRIPT_CLASSES
+    # REVIEW is what keeps the already-paid deck buildable
+    ok, detail = gates.script_contract(
+        gates.script_findings(cells, lang="Russian", kind="definitions",
+                              pack={}),
+        {}, lang="Russian", kind="definitions")
+    assert ok and detail["review_tier_counts"] == {"script_weld_in_gloss": 1}
+
+
+def test_a_pack_that_permits_latin_letters_cannot_switch_the_weld_OFF():
+    """`lemma_allowed_set` is a CHARSET, and no charset can express "not
+    fused".
+
+    A pack that permits Latin letters in a lemma has permitted a Latin TOKEN --
+    an acronym, a cross-reference, a brand. It has said nothing about a Latin
+    letter welded INSIDE a target-script word, which is the homoglyph defect
+    this check exists for. Reading the charset here switched off all ten defect
+    shapes for any target whose pack named Latin; the gloss weld was already
+    hung off the target's own script for exactly this reason.
+    """
+    permissive = {
+        "allowed_scripts": "Cyrillic letters, Latin letters, and Arabic digits",
+        "lemma_allowed_set": "Cyrillic letters, Latin letters, spaces and "
+                             "hyphens",
+    }
+    profile = gates.script_profile(permissive, "Russian")
+    assert profile["target_scripts"] == ("cyrillic",)
+    # the pack really does permit Latin letters in the lemma...
+    assert profile["latin_in_lemma_allowed"] is True
+
+    def classes(lemmas):
+        cells = {k: {"lemma": v, "gloss": RU_GLOSS,
+                     "provenance": "gemini:x@2026"} for k, v in lemmas.items()}
+        return {f["key"]: (f["class"], f["tier"]) for f in
+                gates.script_findings(cells, lang="Russian",
+                                      kind="definitions", pack=permissive)}
+
+    # ...and the weld is still BLOCK, on the interior island and on both
+    # homoglyph positions
+    welded = dict(RU_GARBLED_LEMMAS)
+    welded["homoglyph_head"] = "o\u043a\u043d\u043e"
+    welded["homoglyph_tail"] = ("\u0440\u0430\u0441\u0447\u0435"
+                                "\u0442e")
+    got = classes(welded)
+    assert len(got) == len(welded) == 4
+    for key, verdict in sorted(got.items()):
+        assert verdict == ("script_weld_in_lemma", gates.BLOCK), key
+    # while the CHARSET question -- an unwelded Latin token -- is the pack's to
+    # answer, and it answered: no finding at all
+    assert classes({"affix": "SMS\u043e\u043c",
+                    "token": "\u0441\u043c. fatte"}) == {}
+    # and the gloss weld is likewise unmoved by the lemma charset
+    assert [(f["class"], f["tier"]) for f in gates.script_findings(
+        {"1:1": {"lemma": "\u043e\u0446\u0435\u043d\u0438\u0432\u0430"
+                           "\u0442\u044c",
+                 "gloss": "\u043f\u0440\u0438 \u0440\u0430\u0441"
+                          "\u0447\u0435\u0442e \u043d\u0430\u043b"
+                          "\u043e\u0433\u043e\u0432.",
+                 "provenance": "gemini:x@2026"}},
+        lang="Russian", kind="definitions", pack=permissive)] == [
+        ("script_weld_in_gloss", gates.REVIEW)]
+
+
+def test_a_pack_that_names_a_non_latin_script_switches_the_family_ON():
+    """A pack is the ADVERTISED way to add a target ("a Japanese or Korean
+    target is a pack away rather than a rewrite away"), and the profile read
+    only `han_allowed` and _SCRIPTS_BY_LANGUAGE -- so shipping a Hebrew pack
+    turned the whole Latin-in-lemma family OFF for a Hebrew target, silently,
+    while the same lemma with NO pack was a loud forbidden_script."""
+    he_pack = {"allowed_scripts": "Hebrew letters and Arabic digits",
+               "lemma_allowed_set": "Hebrew letters only"}
+    profile = gates.script_profile(he_pack, "Hebrew")
+    assert profile["han_allowed"] is False
+    assert profile["scripts_the_language_uses"] == ()      # not in the table
+    assert profile["scripts_the_pack_names"] == ("hebrew",)
+    assert profile["target_script_is_non_latin"] is True
+    assert profile["target_scripts"] == ("hebrew",)
+    # Latin welded into a Hebrew word is now a finding rather than silence
+    assert [(f["class"], f["tier"]) for f in gates.script_findings(
+        {"1:1": {"lemma": "\u05e9\u05dcabc", "gloss": "\u05e9\u05dc\u05d5\u05dd.",
+                 "provenance": "gemini:x@2026"}},
+        lang="Hebrew", kind="definitions", pack=he_pack)] == [
+        ("script_weld_in_lemma", gates.BLOCK)]
+    # Han and Greek sit OUTSIDE _SCRIPT_BLOCKS, so they cannot be reached this
+    # way: Han is recognised through han_allowed, Greek is not a target yet
+    assert "han" not in gates._NON_LATIN_SCRIPT_NAMES
+    assert "greek" not in gates._NON_LATIN_SCRIPT_NAMES
+    assert gates.script_profile(packs.load("Chinese"),
+                                "Chinese")["target_scripts"] == ()
+
+
+def test_a_cyrillic_lemma_is_never_told_it_carries_pinyin_or_a_han_class():
+    """The class NAME is load-bearing twice over.
+
+    `pinyin_in_lemma` and `latin_in_han_lemma` are pinned in
+    registry/gates.json for Chinese and would LIE about a Cyrillic cell -- and
+    the pinyin discriminator is a Mandarin tone mark, which says nothing about
+    Russian. So the Han path keeps its four class names and the non-Han path
+    gets a script-neutral REVIEW class of its own.
+    """
+    assert "latin_in_lemma" in gates._REVIEW_CLASSES
+    assert "latin_in_lemma" in gates.SCRIPT_CLASSES
+    # a tone mark in a Cyrillic lemma is not evidence of romanised Mandarin
+    tone_marked = _ru_classes({"1:1": "CD-\u0441\u0438\u043d\u0433\u043b "
+                                      "(l\u01ceo)"})
+    assert tone_marked["1:1"] == ("latin_in_lemma", gates.REVIEW)
+    # no Han-defined class can reach a non-Han target at all --
+    # foreign_text_in_lemma included, which registry/gates.json defines as a
+    # parenthesised Danish word inside a shipped Chinese lemma
+    for lemmas in (RU_LEGIT_LEMMAS, RU_GARBLED_LEMMAS):
+        classes = {cls for cls, _ in _ru_classes(lemmas).values()}
+        assert not (classes & {"pinyin_in_lemma", "latin_in_han_lemma",
+                               "latin_subject_lemma",
+                               "foreign_text_in_lemma"})
+    # ...while the Chinese fixtures keep every name they had
+    assert _zh_classes(_zh_cells(ZH_SUBJECT_LEMMAS, PROV_NEW)) == {
+        key: ("latin_subject_lemma", gates.REVIEW)
+        for key in ZH_SUBJECT_LEMMAS}
 
 
 def test_the_language_exemption_does_not_change_the_pack_derived_profile():

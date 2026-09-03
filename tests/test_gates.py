@@ -410,6 +410,32 @@ def test_guid_diff_reconciles_against_the_deck_being_written():
     assert ok is False and "no_summary_row" in detail["violations"]
 
 
+def test_g_rel_with_no_report_is_not_applicable_rather_than_skipped():
+    """The Russian month's defect. G-REL was appended to the export's gate list
+    only when a report existed, so the run that should have replaced a stale
+    G-REL[lang=Russian] FAIL wrote no row at all -- and report rows merge on
+    (id, stage, extra) with no prune, so the failure was permanent on a language
+    that can never have a guid_diff report (no previous release to diff).
+
+    ok stays a BOOL: `failed` is a list of ids the release checklist reads. The
+    third state lives in the detail, where the printed view can find it.
+    """
+    ok, detail = G.guid_diff_reconciles({}, 34, "Russian")
+    assert ok is True
+    assert detail[G.NOT_APPLICABLE] is True
+    assert "guid_diff.Russian.json" in detail["why"]
+    assert "NOT a verified pass" in detail["why"]
+    assert G.row_is_not_applicable({"ok": ok, "detail": detail})
+    # a real verdict is never mistaken for one, in either direction
+    assert not G.row_is_not_applicable(
+        {"ok": True, "detail": G.guid_diff_reconciles(
+            {"summary": {"language": "German", "card_count": 34}},
+            34, "German")[1]})
+    assert not G.row_is_not_applicable({"ok": False, "detail":
+                                        {G.NOT_APPLICABLE: True}})
+    assert not G.row_is_not_applicable({"ok": True, "detail": "a string"})
+
+
 def test_g_sep_fails_when_the_fixtures_are_absent(cfg, registry, monkeypatch):
     """"Fixtures unavailable" is a FAILURE, never a silent pass: a release host
     that cannot check the separator table has not checked it."""

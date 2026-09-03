@@ -500,6 +500,115 @@ def test_doctor_blocks_a_thinking_level_above_low(tmp_path, capsys):
     assert doctor(Config(work_dir=cfg.work_dir)) == 0
 
 
+def test_doctor_refuses_a_language_with_no_system_prompt_token_count(
+        tmp_path, capsys):
+    """The Russian month. `doctor` checked five NON-per-language dotted keys and
+    printed "fit to spend" while PROMPT_TOKENS_system_only.Russian was absent;
+    the only hard stop was batch/transport.py at wave-split time, which arrives
+    with the scope frozen and the operator already committed.
+
+    doctor's whole reason to exist is that nothing printed the effective spend
+    configuration before money was placed, so a per-language constant the bill
+    reads has to be printed per language.
+    """
+    from ankidkdeck.cli import doctor
+    cfg = Config(work_dir=tmp_path / "work",
+                 langs=["German", "Russian"])
+    write_json(cfg.probe_stats_path, MEASURED_CONSTANTS)
+    assert S42.system_prompt_tokens(MEASURED_CONSTANTS, "Russian") is None
+
+    assert doctor(cfg) == 1
+    out = capsys.readouterr().out
+    assert "system tokens German    1135 (measured)" in out
+    assert "system tokens Russian   MISSING" in out
+    assert ("BLOCKED: PROMPT_TOKENS_system_only has no usable entry for Russian"
+            in out)
+    # the message names the way OUT, not just the problem
+    assert "--declare-system-tokens Russian=N" in out
+    assert "--declaration-basis" in out
+    # every configured language is named, not just the first, and in the order
+    # the operator configured them -- the same order the lines above print in
+    cfg = Config(work_dir=cfg.work_dir, langs=["Russian", "Italian"])
+    assert doctor(cfg) == 1
+    out = capsys.readouterr().out
+    assert "no usable entry for Russian, Italian" in out
+    assert "--declare-system-tokens Russian=N" in out
+    assert "--declare-system-tokens Italian=N" in out
+
+    # a DECLARED value is fit to spend, and says so rather than passing itself
+    # off as a measurement: the declaration mode writes no structured node, so
+    # the change log is the only record of the difference.
+    stats = json.loads(json.dumps(MEASURED_CONSTANTS))
+    stats["PROMPT_TOKENS_system_only"]["Russian"] = 1135
+    stats["backfilled"] = {"changes": [
+        "PROMPT_TOKENS_system_only.Russian = 1135 (declared, not measured; "
+        "2026-09-03; basis: byte-identical to the Spanish prompt)"]}
+    write_json(cfg.probe_stats_path, stats)
+    assert doctor(Config(work_dir=cfg.work_dir,
+                         langs=["German", "Russian"])) == 0
+    out = capsys.readouterr().out
+    assert "system tokens Russian   1135 (declared, not measured)" in out
+    assert "system tokens German    1135 (measured)" in out
+
+
+def test_doctor_reads_the_declared_marker_as_an_exact_value_not_a_prefix(
+        tmp_path, capsys):
+    """"Declared" vs "measured" is an HONESTY label on the one output a human
+    reads before --confirm-spend, and it was decided by a substring test.
+
+    The real change-log line for a declared 1135 also contains "1", "11" and
+    "113", so a language later RE-MEASURED at any decimal prefix of the declared
+    number was reported as still declared.
+    """
+    from ankidkdeck.cli import doctor
+    cfg = Config(work_dir=tmp_path / "work", langs=["Russian"])
+    declared_1135 = ["PROMPT_TOKENS_system_only.Russian = 1135 (declared, not "
+                     "measured; 2026-09-03; basis: the Spanish prompt)"]
+    for value, expected in ((1135, "declared, not measured"),
+                            (113, "measured"),
+                            (11, "measured"),
+                            (1, "measured")):
+        stats = json.loads(json.dumps(MEASURED_CONSTANTS))
+        stats["PROMPT_TOKENS_system_only"]["Russian"] = value
+        stats["backfilled"] = {"changes": declared_1135}
+        write_json(cfg.probe_stats_path, stats)
+        assert doctor(cfg) == 0
+        assert ("system tokens Russian   %d (%s)" % (value, expected)
+                in capsys.readouterr().out), value
+
+
+def test_doctor_treats_a_zero_or_a_bool_system_token_count_as_missing(
+        tmp_path, capsys):
+    """A present-but-unusable value is worse than an absent one: the wave
+    splitter would subtract nothing and quote the WHOLE prompt as uncached
+    payload, so the bill a human approves is the wrong bill.
+
+    `True` is an int in Python and printed as a one-token system prompt.
+    """
+    from ankidkdeck.cli import doctor
+    cfg = Config(work_dir=tmp_path / "work", langs=["Russian"])
+    for value in (0, -50, True, False):
+        stats = json.loads(json.dumps(MEASURED_CONSTANTS))
+        stats["PROMPT_TOKENS_system_only"]["Russian"] = value
+        write_json(cfg.probe_stats_path, stats)
+        assert doctor(cfg) == 1, value
+        out = capsys.readouterr().out
+        # printed as what it IS -- saying MISSING about a value sitting in the
+        # file is the same species of lie the round is removing -- and refused
+        # with the same remedy
+        assert "system tokens Russian   UNUSABLE (%r)" % (value,) in out, value
+        assert "no usable entry for Russian" in out, value
+        assert "--declare-system-tokens Russian=N" in out, value
+    # a float IS accepted, because that is exactly what the wave splitter
+    # accepts (s42_translate.system_prompt_tokens), and doctor must not refuse
+    # a run the stage would have taken
+    stats = json.loads(json.dumps(MEASURED_CONSTANTS))
+    stats["PROMPT_TOKENS_system_only"]["Russian"] = 1135.7
+    write_json(cfg.probe_stats_path, stats)
+    assert doctor(cfg) == 0
+    assert "system tokens Russian   1135 (measured)" in capsys.readouterr().out
+
+
 def test_doctor_never_prints_an_invented_cache_floor(tmp_path, capsys):
     """MINOR-2. The real stats.json has no IMPLICIT_CACHE_FLOOR key -- the 4096
     was a source constant printed as if it had been measured, in the one output

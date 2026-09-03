@@ -38,6 +38,7 @@ homograph display order.
 """
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -518,6 +519,57 @@ def doctor(cfg) -> int:
         print("  explicit cache floor %s   implicit %s"
               % ((stats.get("wave2") or {}).get("EXPLICIT_CACHE_FLOOR"),
                  stats.get("IMPLICIT_CACHE_FLOOR", "n/a (not in this artifact)")))
+        # PROMPT_TOKENS_system_only is PER LANGUAGE, and REQUIRED_STATS_KEYS
+        # lists only the five keys that are not -- so nothing above this line
+        # looks at the configured languages at all, and doctor printed "fit to
+        # spend" for a Russian run whose entry was absent. The only refusal was
+        # the wave splitter's, which arrives at split time with the scope
+        # already frozen and the operator already committed.
+        system_only = stats.get("PROMPT_TOKENS_system_only") or {}
+        # "measured" vs "declared" is not a field: the declaration mode of
+        # tools/backfill_probe_stats.py deliberately writes no structured node,
+        # only the value plus a change-log line
+        # (tools/backfill_probe_stats.py:1123, "PROMPT_TOKENS_system_only.%s =
+        # %d (declared, not measured; ...)"). So the change log is the only
+        # record of the difference. It fails OPEN, to "measured": a hand-edited
+        # artifact carries no change-log line at all.
+        changes = [str(c) for c in
+                   (stats.get("backfilled") or {}).get("changes") or []]
+        no_system_tokens = []
+        for lang in cfg.langs:
+            value = system_only.get(lang)
+            # bool is an int in Python and `True` would print as 1 token; 0 and
+            # a negative are worse than absent, because the wave splitter would
+            # subtract nothing and quote the whole prompt as uncached payload.
+            if (not isinstance(value, (int, float))
+                    or isinstance(value, bool) or value <= 0):
+                print("  system tokens %-9s %s"
+                      % (lang, "MISSING" if value is None
+                         else "UNUSABLE (%r)" % (value,)))
+                no_system_tokens.append(lang)
+                continue
+            # An EXACT token, not a prefix. The real log line for a declared
+            # 1135 also contains "1", "11" and "113", so a substring test
+            # relabels a later re-MEASURED 113 as declared.
+            token = re.compile(r"PROMPT_TOKENS_system_only\.%s = %d(?![0-9])"
+                               % (re.escape(lang), int(value)))
+            basis = ("declared, not measured"
+                     if any(token.search(c) for c in changes) else "measured")
+            print("  system tokens %-9s %d (%s)" % (lang, int(value), basis))
+        if not cfg.langs:
+            print("  system tokens         (no languages configured)")
+        if no_system_tokens:
+            problems.append(
+                "PROMPT_TOKENS_system_only has no usable entry for %s. The wave "
+                "splitter subtracts the system half from the measured prompt "
+                "fit to get the uncached payload and REFUSES without it, so a "
+                "--confirm-spend on this configuration stops at wave-split "
+                "time. Measure it, or declare it: "
+                "tools/backfill_probe_stats.py %s --declaration-basis "
+                "'<why this number is believed>' --write"
+                % (", ".join(no_system_tokens),
+                   " ".join("--declare-system-tokens %s=N" % lang
+                            for lang in no_system_tokens)))
         # One list of required keys, shared with the spend gate, so doctor's
         # verdict and translate's refusal cannot disagree about what fit means.
         why = dict(REQUIRED_STATS_KEYS)
@@ -620,7 +672,7 @@ def gates_report(cfg) -> int:
     a passing German export overwrote a failing Chinese one and this command
     certified the release all-green.
     """
-    from .gates import row_label
+    from .gates import row_is_not_applicable, row_label
     path = cfg.report_dir / "gates_report.json"
     data = read_json(path, default={})
     if not data:
@@ -633,13 +685,27 @@ def gates_report(cfg) -> int:
         # "unknown" must not print as "carried".
         carried_marker = ("" if row.get("executed_this_run", True)
                           else "   [CARRIED]")
+        # Three verdicts printed, two recorded. `ok` has to stay a bool -- the
+        # release checklist and the tests read `failed`, a list of ids -- but a
+        # row that passed because there was NOTHING TO CHECK must not print the
+        # same word as a row that passed a check. G-REL on a first release is
+        # the case: no previous .apkg exists, so nothing was reconciled.
+        verdict = ("N/A" if row_is_not_applicable(row)
+                   else ("PASS" if row.get("ok") else "FAIL"))
         print("%-4s %-*s %-10s %s%s"
-              % ("PASS" if row.get("ok") else "FAIL", width, row_label(row),
+              % (verdict, width, row_label(row),
                  "stage " + str(row.get("stage") or "?"), row.get("description"),
                  carried_marker))
     bad = [row_label(r) for r in rows if not r.get("ok")]
-    print("%d gate row(s) recorded, %d failing%s"
-          % (len(rows), len(bad), (": " + ", ".join(bad)) if bad else ""))
+    # Read the derived list when the file carries one; fall back to recomputing
+    # it, because this command also has to render reports written before that
+    # key existed.
+    na = data.get("gate_rows_not_applicable")
+    if na is None:
+        na = [row_label(r) for r in rows if row_is_not_applicable(r)]
+    print("%d gate row(s) recorded, %d failing%s, %d not applicable%s"
+          % (len(rows), len(bad), (": " + ", ".join(bad)) if bad else "",
+             len(na), (": " + ", ".join(na)) if na else ""))
     # The row count is NOT a release verdict. Rows accumulate across stages AND
     # across runs, so an all-PASS list can coexist with declared gates that have
     # never executed on this workspace -- and G-SITEMAP, one of them, is what

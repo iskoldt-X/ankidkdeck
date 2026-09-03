@@ -1069,6 +1069,76 @@ def apkg_path(cfg: Config, lang: str) -> Path:
     return Path(cfg.dist_dir) / ("DDO_Danish_Frequency_Deck_%s.apkg" % lang)
 
 
+def guid_diff_language(report) -> str | None:
+    """Which language a guid_diff report says it describes, or None.
+
+    ONE reading of that question, imported by tools/retired_notes.py so the two
+    consumers of this file cannot disagree about it -- and they did: the
+    exporter read `summary.language` while the tool read the top-level
+    `language` key, so a report written before the summary row existed was "not
+    about German" to the exporter and "about German" to the companion builder,
+    on the same bytes.
+
+    `summary.language` first, because that is the row G-REL asserts against.
+    The top-level key second, because every report tools/guid_diff.py has ever
+    written carries it and a pre-summary-row report has nothing else to offer.
+    """
+    if not isinstance(report, dict):
+        return None
+    summary = report.get("summary") or {}
+    for value in (summary.get("language"), report.get("language")):
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def guid_diff_report(cfg: Config, lang: str) -> tuple:
+    """(this language's G-REL report, the file it was read from, what was not).
+
+    reports/guid_diff.<lang>.json is what tools/guid_diff.py writes. The report
+    is per language because one release month ships more than one language and
+    a single guid_diff.json is then a file about whichever language was diffed
+    LAST: the Chinese month's report was still on disk when the Russian export
+    ran, and G-REL failed the Russian deck with language_mismatch.
+
+    The legacy unsuffixed name is still read, but ONLY when the file itself says
+    it describes this language. A legacy file about another language is not this
+    language's report and is IGNORED rather than failed -- ignoring it is the
+    whole point, because failing on it is the defect. A same-language report
+    that disagrees about the card count still fails, on either name.
+
+    The per-language file is trusted by NAME and then verified by CONTENT: it is
+    handed to the gate whatever it says, so a mislabelled or truncated one fails
+    loudly instead of being silently skipped.
+
+    The THIRD return value is why each candidate was NOT used. Without it the
+    not-applicable verdict has to assert something about the disk it has not
+    checked, and "there is no previous release" is false whenever a file was
+    found and rejected.
+    """
+    ignored = []
+    per_lang = cfg.report_dir / ("guid_diff.%s.json" % lang)
+    legacy = cfg.report_dir / "guid_diff.json"
+    for path in (per_lang, legacy):
+        # read_json() treats default=None as "required", so an absent report has
+        # to be an empty dict here.
+        report = read_json(path, default={})
+        if not isinstance(report, dict) or not report:
+            if path.exists():
+                ignored.append({"file": path.name,
+                                "why": "the file is empty or is not a JSON "
+                                       "object"})
+            continue
+        if path == per_lang:
+            return report, path.name, ignored
+        says = guid_diff_language(report)
+        if says == lang:
+            return report, path.name, ignored
+        ignored.append({"file": path.name,
+                        "why": "it describes %r, not %r" % (says, lang)})
+    return {}, "", ignored
+
+
 def run(cfg: Config, registry, lang: str, check_determinism: bool = False) -> dict:
     if not lang:
         raise FatalError("export needs --lang (one of %s)" % ", ".join(cfg.langs))
@@ -1122,9 +1192,7 @@ def run(cfg: Config, registry, lang: str, check_determinism: bool = False) -> di
     # identical for every language by construction. Scoping them wrote four
     # byte-identical rows per release, which reads like four separate checks.
     scope = {"lang": lang}
-    # read_json() treats default=None as "required", so an absent report has to
-    # be an empty dict here.
-    guid_diff = read_json(cfg.report_dir / "guid_diff.json", default={})
+    guid_diff, guid_diff_from, guid_diff_ignored = guid_diff_report(cfg, lang)
     gate_list = [
         Gate(G_EMPTY_C, "no note has an empty Content field",
              lambda: empty_content_gate(notes), stage="70", extra=scope),
@@ -1174,14 +1242,22 @@ def run(cfg: Config, registry, lang: str, check_determinism: bool = False) -> di
              lambda: separator_golden(registry, cfg.work_dir / "fixtures"),
              stage="70", extra=scope),
     ]
-    if guid_diff:
-        # Recorded only when the tool has been run: it needs a released .apkg,
-        # which a fresh checkout does not have.
-        gate_list.append(
-            Gate(G_REL, "reports/guid_diff.json describes this language and the "
-                        "same card count the exporter is about to write",
-                 lambda: guid_diff_reconciles(guid_diff, len(notes), lang),
-                 stage="70", extra=scope))
+    # ALWAYS recorded, even with no report to read. The gate used to be appended
+    # only `if guid_diff:` because the tool needs a released .apkg that a first
+    # release does not have -- but report rows merge on (id, stage, extra) and
+    # are never pruned, so a row that is not written cannot replace one that is.
+    # A G-REL[lang=Russian] FAIL (the Chinese month's file, read as Russian's)
+    # therefore sat in gates_report.json as a permanent carried failure after the
+    # file was moved aside, on a language for which G-REL can never run. The
+    # not-applicable verdict is the replacement row.
+    gate_list.append(
+        Gate(G_REL, "reports/guid_diff.<lang>.json describes this language and "
+                    "the same card count the exporter is about to write, or "
+                    "says so when there is no previous release to diff",
+             lambda: guid_diff_reconciles(guid_diff, len(notes), lang,
+                                          source=guid_diff_from,
+                                          ignored=guid_diff_ignored),
+             stage="70", extra=scope))
     if check_determinism:
         with tempfile.TemporaryDirectory() as tmp:
             a = Path(tmp) / "a.apkg"
