@@ -13,14 +13,21 @@ them** -- see [Study progress](#study-progress).
 
 ## Install
 
+Not on PyPI, and not going there. The wheel is `src/ankidkdeck` and nothing else
+(`pyproject.toml`), while much of what this README tells you to run lives outside
+it: `tools/` holds the GUID diff, the retired-notes companion, the fixture
+builder and the import checklist, and the golden tests need `tests/`. A clone is
+the install.
+
 ```bash
-uvx ankidkdeck --help                      # run without installing
-pip install "ankidkdeck[llm]"              # or install it, with the Gemini extra
-git clone https://github.com/iskoldt-X/ankidkdeck && pip install -e ".[llm,dev]"
+git clone https://github.com/iskoldt-X/ankidkdeck
+cd ankidkdeck && pip install -e ".[llm,dev]"
 ```
 
-Python 3.11+. The `llm` extra is only needed for the translation stages; crawling
-and exporting work without it.
+Python 3.11+. There are two extras: `llm` (`google-genai`) and `dev` (`pytest`).
+`llm` is only needed for the translation stages -- the crawl and the build must
+work with no Gemini dependency present at all, which is why it is optional in the
+first place.
 
 ## The four commands
 
@@ -175,10 +182,27 @@ ankidkdeck translate --lang German --mode batch --confirm-spend     # both at on
 The submit creates the explicit cache, writes one JSONL file per job, uploads it,
 opens the job and waits for it to drain -- **one job in flight at a time** --
 downloading each result file the moment its job reaches a terminal state. It
-writes no translation row. The ingest reconciles those files **by position**,
-checks the count lock locally, writes the cells, and opens bounded retry waves
-(at most three, counted per cell) for whatever failed. Retries stay on batch. The
-drift ledger is consumed on the ingest only.
+writes no translation row. The ingest reconciles those files **by key** -- the
+`key` echoed on each result line, never the line's position -- checks the count
+lock locally, writes the cells, and opens bounded retry waves (at most three,
+counted per cell) for whatever failed. Retries stay on batch. The drift ledger is
+consumed on the ingest only.
+
+The documented "responses will be written in the same order as the input
+requests" is untrue, and untrue in the one way no probe could catch: the service
+completes a job in ~1,000-row shards and concatenates the shards out of order,
+each shard internally in input order. Every probe wave was 32 rows or fewer, i.e.
+a single shard, where the order does hold -- so the guarantee was unfalsified
+rather than confirmed. The first real wave broke it. The Chinese definition job
+agreed on positions 0-999 and diverged at exactly row 1000; the Russian
+definition wave agreed on 0 of 3,644 positions across 3 shards, its expression
+wave on 0 of 1,923 across 2. Where the permutation happens to start is
+incidental, which is the point: it is not a prefix you can rely on. So the key
+bijection is the guard, and it is absolute -- a duplicate key, a key that is not
+in the plan, or a planned key with no result is FATAL, with no partial-credit
+reading -- while the position is still computed and reported as a cross-check
+nothing is gated on. A positional write under a shard permutation shifts glosses
+onto the wrong senses, which is both catastrophic and invisible.
 
 `--mode batch` is also what `cache_enabled` needs: the explicit cache is the only
 discount path there is (batch has no implicit caching at all), and its lifecycle
@@ -261,6 +285,93 @@ and reused, and you pay for the gap only.
 
 The card's target-language text is machine-translated and marked as such.
 
+## Adding a target language
+
+A target language is one word in `langs` in `ankidkdeck.toml`. The packaged
+default is the four v2.0 languages; the run host that shipped Russian reads
+`langs = ["Chinese", "English", "German", "Spanish", "Russian"]`. `--lang` must
+then name a configured language **exactly**, case included, and `check_lang`
+refuses anything else before a stage runs: none of the migrated cells are visible
+under a lowercase key, so `translate --lang german --confirm-spend` would quietly
+pay the full from-scratch price and write to `translations/german/`. Export is
+protected by `G-COV`; the money is not.
+
+Nothing else is a hand-prepared file, for a Latin-script target. A language with
+no prompt pack under `src/ankidkdeck/registry/prompt_packs/` still runs: the
+builder serves the frozen LEAN prompt, and the POS labels
+`registry/pos_translations.json` does not cover are translated by one paid call
+(see [Data policy](#data-policy)). Caching, the JSONL and the wave splitting are
+unaffected. A missing pack is a normal state, never an error. A non-Latin target
+is the one exception, and it needs its script known to the gate -- see below.
+
+That LEAN prompt is `v4-frozen`, the default for every language, and it is the
+default on purpose rather than because RICH is unfinished: a blind pairwise
+comparison of 233 Chinese senses, judged twice and independently (2026-08-30),
+went to LEAN, and every fatal mistranslation it found was on the RICH side.
+Changing `prompt_id` also refuses every `--confirm-spend` on its own, until the
+thinking constant has been re-measured on the prompt you mean to spend on: the
+constant that prices a wave is only valid for the prompt it was measured on.
+
+**The one number you have to supply is the prompt size.**
+`PROMPT_TOKENS_system_only.<lang>` in `work/probes/stats.json` is what the wave
+splitter subtracts to size the uncached payload, and what the cached half of the
+bill is priced from. Nothing in the package has a default for it and the call
+ledger cannot recompute it, so `ankidkdeck doctor` exits non-zero when a
+configured language has no usable entry. It used to print "fit to spend" and
+leave the refusal to the wave splitter, which arrives with the scope frozen and
+the operator already committed. Measure it with the probe tooling, or DECLARE it:
+
+```bash
+python tools/backfill_probe_stats.py --probes work/probes \
+    --declare-system-tokens Russian=1135 \
+    --declaration-basis "why this number is believed" --write
+```
+
+A declaration may only fill a gap -- an existing value is refused, measured or
+declared, whoever wrote it -- it needs a basis in your own words, it changes
+nothing without `--write`, and it lands in the artifact's change log with the
+words "declared, not measured". That was acceptable for Russian on two grounds:
+its definition prompt is byte-identical to the Spanish one once the language name
+is substituted (both 5,160 characters), and Spanish, Chinese and German each
+measure 1,135; and the number is not what the cache is checked against. `G-CACHE`
+compares every row's `cachedContentTokenCount` to the size the live
+`caches.create` response reported, per row, so a declared figure only sizes the
+wave and quotes the bill. Do not generalise that to "the language name is the
+only variable": English measures 1,092, because its core carries no CRITICAL RULE
+block.
+
+**A non-Latin target needs its own script known to the gate.** `G-SCRIPT` derives
+its forbidden set from the pack plus `_SCRIPTS_BY_LANGUAGE` in
+`src/ankidkdeck/gates.py` (today: `russian -> cyrillic`). With neither an entry
+there nor a pack naming the script, Cyrillic is simply the first block in the
+table and every cell of the first wave is a BLOCK-tier `forbidden_script` at
+ingest, with the money already spent. Above that the classes split by tier: a
+Latin letter welded inside a target-script word (`script_weld_in_lemma`) is
+BLOCK, because that is the homoglyph and dropped-stem family and two such lemmas
+came back from the first Russian wave; separated Latin -- cross-references,
+acronyms (`latin_in_lemma`) -- is REVIEW, and so is the one weld shape the rule
+exempts, a Latin acronym or brand carrying the target's own ending (SMS plus an
+instrumental ending, PDF plus a diminutive, iPhone, USB: two groups, the Latin
+one first, two characters or more, at least one capital). Glosses get the weld
+check at REVIEW (`script_weld_in_gloss`), because the alternative -- any Latin
+letter in a gloss -- flagged 199 cells that are Danish headwords, Latin binomials
+and letter names, against the one that is a real defect.
+
+For a first release there is nothing to migrate and `G-REL` records `N/A` (see
+[Study progress](#study-progress)). Note that the deck id and the notetype id are
+derived from the language name -- `0x10000000 + adler32(lang)` and
+`0x20000000 + adler32(lang)`, the Chinese deck id being a legacy override -- so a
+new name mints a brand-new deck rather than upgrading anything, and a typo mints
+one too. The deck name, description and footer use the English template for every
+language except Chinese.
+
+What it cost in practice, measured on one run: Russian, 22,288 cells, 5,568
+requests quoted and 5,578 placed (the extra ten were one retry wave for the
+definition rows that finished on the output cap), about 54 minutes from ignition
+to drained, and $3.09 against a $3.45 quote at the conservative cached-input rate
+-- that figure being the month's whole ledger, two sub-cent correction calls
+included. One run is not a rate card.
+
 ## Study progress
 
 Anki matches an imported note to an existing one by its GUID. v3 keeps every
@@ -272,13 +383,35 @@ differ only by case (`Er` the erbium symbol vs `er` the verb form, at rank 1).
 
 v3 also merges inflections into one card per family (~2,900 cards instead of
 ~4,400 notes), so some old cards become duplicates. `tools/guid_diff.py` prints
-exactly which GUIDs are kept, new and retired, and `tools/retired_notes.py`
-writes a companion package that tags the retired ones so you can delete them
-with one search.
+exactly which GUIDs are kept, new and retired, and writes
+`reports/guid_diff.<lang>.json`; `tools/retired_notes.py` reads that same
+per-language file and writes a companion package that tags the retired ones so
+you can delete them with one search. The report is per language because one
+release month ships more than one, and a single `guid_diff.json` is then a file
+about whichever language was diffed last: the Chinese month's copy was still on
+disk when the Russian export ran, and `G-REL` failed the Russian deck with
+`language_mismatch`.
 
-**Not yet verified:** the deck's behaviour on import is checked by a human
-against a real Anki, following `tools/import_smoke_test.md`. Until that
-checklist is signed for a build, treat "progress is preserved" as untested.
+`G-REL` reads that file at export time and asserts it describes this language and
+the same card count the exporter is about to write. When no usable report for
+this language was read -- none on disk, or only one that describes another
+language -- the row is recorded as NOT APPLICABLE, printed `N/A` by `ankidkdeck
+gates`, carrying "nothing was checked" in its own detail and never printed as a
+pass. It says only that, and not "there is no previous release", because a
+function that has skipped a candidate file cannot make a claim about the disk.
+Recorded rather than skipped, because gate rows merge on `(id, stage, scope)` and
+are never pruned: a row that is not written cannot replace a stale failure for
+the same scope, and that is exactly how a `G-REL[lang=Russian]` failure sat on
+file for a language the gate can never run against.
+
+**Verified for the Chinese v3 build, 2026-08-29.** The deck's import behaviour is
+checked by a human against a real Anki, following `tools/import_smoke_test.md`,
+and that run signed it: 2,921 notes found = 2 new (the two families `guid_diff`
+lists as new) + 2,919 updated in place, with a 300-card review queue still due
+afterwards. The checklist is what a human signs per build, not once for the
+project. A brand-new language does not raise the question at all -- Russian's
+first release, 2026-09-03, had no existing cards to preserve, every note was new,
+and `G-REL` recorded `N/A`.
 
 ## Data policy
 
@@ -291,10 +424,15 @@ This repository contains **code only**.
   hand-curated rules (which lemma a form belongs to, which parts of speech are
   demoted, gate baselines, the part-of-speech label table). No DDO text.
   `pos_translations.json` is what makes an `.apkg` buildable with no LLM call at
-  all: the ~20 `data-pos-key` values in four languages are hand-written
+  all: the 25 `data-pos-key` values in four languages are hand-written
   grammatical vocabulary, not machine output. A `pos_key` no source covers fails
   `G-COV` loudly instead of shipping an unlabelled group, and
-  `work/json/translations/<lang>/pos.json` still overrides any row.
+  `work/json/translations/<lang>/pos.json` still overrides any row. A language
+  the table does not cover is not blocked by that: stage 42 asks for its labels
+  in one paid call, writes them to `work/json/translations/<lang>/pos.json`, and
+  `G-COV` accepts them from there -- which is what keeps adding a language a
+  no-registry-edit operation. A `pos_key` the checked-in table already covers is
+  never billed.
 - The decks you build are for your own study. Do not redistribute them. You are
   responsible for complying with DDO's
   [terms of use](https://ordnet.dk/copyright), and the frequency list comes from
