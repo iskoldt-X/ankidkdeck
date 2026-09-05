@@ -1,0 +1,278 @@
+{
+  "aah": {
+    "correct": "åh",
+    "reason": "ocr",
+    "rule": "transliteration: ae -> ae-ligature, oe -> o-slash, aa -> a-ring"
+  },
+  "aidrig": {
+    "correct": "aldrig",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "aiie": {
+    "correct": "alle",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "ait": {
+    "correct": "alt",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "aitid": {
+    "correct": "altid",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "biev": {
+    "correct": "blev",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "biive": {
+    "correct": "blive",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "biiver": {
+    "correct": "bliver",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "eiier": {
+    "correct": "eller",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "fbl": {
+    "correct": "fbi",
+    "note": "fbi(882) is itself a DDO nohit, so this row's correction ships no card either; both rows are non-Danish and invalidating fbl loses nothing",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "fortæi": {
+    "correct": "fortæl",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "fã": {
+    "correct": "få",
+    "reason": "ocr",
+    "rule": "OCR bad byte: a-tilde / a-circumflex / a-umlaut where the source has a-ring, ae-ligature or o-slash"
+  },
+  "fãr": {
+    "also_possible": [
+      "før"
+    ],
+    "correct": "får",
+    "reason": "ocr",
+    "rule": "OCR bad byte: a-tilde / a-circumflex / a-umlaut where the source has a-ring, ae-ligature or o-slash"
+  },
+  "gã": {
+    "correct": "gå",
+    "reason": "ocr",
+    "rule": "OCR bad byte: a-tilde / a-circumflex / a-umlaut where the source has a-ring, ae-ligature or o-slash"
+  },
+  "gãr": {
+    "also_possible": [
+      "går"
+    ],
+    "correct": "gør",
+    "reason": "ocr",
+    "rule": "OCR bad byte: a-tilde / a-circumflex / a-umlaut where the source has a-ring, ae-ligature or o-slash"
+  },
+  "gãre": {
+    "correct": "gøre",
+    "reason": "ocr",
+    "rule": "OCR bad byte: a-tilde / a-circumflex / a-umlaut where the source has a-ring, ae-ligature or o-slash"
+  },
+  "heie": {
+    "correct": "hele",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "heit": {
+    "correct": "helt",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "hjæip": {
+    "correct": "hjælp",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "hjæipe": {
+    "correct": "hjælpe",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "hoid": {
+    "correct": "hold",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "iaver": {
+    "correct": "laver",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "iidt": {
+    "correct": "lidt",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "iige": {
+    "correct": "lige",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "iiiie": {
+    "correct": "lille",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "kiar": {
+    "correct": "klar",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "lfølge": {
+    "correct": "ifølge",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "lkke": {
+    "correct": "ikke",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "lngen": {
+    "correct": "ingen",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "lntet": {
+    "correct": "intet",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "mã": {
+    "correct": "må",
+    "reason": "ocr",
+    "rule": "OCR bad byte: a-tilde / a-circumflex / a-umlaut where the source has a-ring, ae-ligature or o-slash"
+  },
+  "nogie": {
+    "correct": "nogle",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "pâ": {
+    "correct": "på",
+    "reason": "ocr",
+    "rule": "OCR bad byte: a-tilde / a-circumflex / a-umlaut where the source has a-ring, ae-ligature or o-slash"
+  },
+  "pã": {
+    "correct": "på",
+    "reason": "ocr",
+    "rule": "OCR bad byte: a-tilde / a-circumflex / a-umlaut where the source has a-ring, ae-ligature or o-slash"
+  },
+  "pä": {
+    "correct": "på",
+    "reason": "ocr",
+    "rule": "OCR bad byte: a-tilde / a-circumflex / a-umlaut where the source has a-ring, ae-ligature or o-slash"
+  },
+  "seiv": {
+    "correct": "selv",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "selvføigelig": {
+    "correct": "selvfølgelig",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "skai": {
+    "correct": "skal",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "skuiie": {
+    "correct": "skulle",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "spørgsmåi": {
+    "correct": "spørgsmål",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "sã": {
+    "correct": "så",
+    "reason": "ocr",
+    "rule": "OCR bad byte: a-tilde / a-circumflex / a-umlaut where the source has a-ring, ae-ligature or o-slash"
+  },
+  "sä": {
+    "correct": "så",
+    "reason": "ocr",
+    "rule": "OCR bad byte: a-tilde / a-circumflex / a-umlaut where the source has a-ring, ae-ligature or o-slash"
+  },
+  "taie": {
+    "correct": "tale",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "tii": {
+    "correct": "til",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "tiibage": {
+    "correct": "tilbage",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "undskyid": {
+    "correct": "undskyld",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "vaek": {
+    "correct": "væk",
+    "reason": "ocr",
+    "rule": "transliteration: ae -> ae-ligature, oe -> o-slash, aa -> a-ring"
+  },
+  "vaere": {
+    "correct": "være",
+    "reason": "ocr",
+    "rule": "transliteration: ae -> ae-ligature, oe -> o-slash, aa -> a-ring"
+  },
+  "vaeret": {
+    "correct": "været",
+    "reason": "ocr",
+    "rule": "transliteration: ae -> ae-ligature, oe -> o-slash, aa -> a-ring"
+  },
+  "vei": {
+    "also_possible": [
+      "vej"
+    ],
+    "correct": "vel",
+    "note": "vej is equally plausible but needs i->j, which is outside the three mechanical rules; vel(188) is what the i/l/1 rule proves",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "vii": {
+    "correct": "vil",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "viiie": {
+    "correct": "ville",
+    "reason": "ocr",
+    "rule": "i/l/1 OCR confusion"
+  },
+  "vãre": {
+    "correct": "være",
+    "reason": "ocr",
+    "rule": "OCR bad byte: a-tilde / a-circumflex / a-umlaut where the source has a-ring, ae-ligature or o-slash"
+  }
+}

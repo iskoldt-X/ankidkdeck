@@ -39,9 +39,23 @@ AFTER the anchor. Reviewers: this is the one place where the guide and the
 launch instruction disagree.
 
 Unranked entries go last -- 09:534-537's fallback, kept because it is safe.
+
+TWO THINGS ABOUT THIS STAGE THAT ARE EASY TO GET WRONG:
+
+  * THE DRY PATH WRITES words.json. `priority` without --confirm-spend places no
+    call, but it does rewrite work/json/words.json (every family's entry_ids),
+    priority_orders.json, priority_conflicts.json and ranking_queue.json. That is
+    also why the runbook order is build -> priority -> translate: s30_merge and
+    this stage write the same field, so a build after a priority run silently
+    restores every homograph order and G-ORDER, which only runs here, never
+    says a word.
+  * THE RANKING ALWAYS RUNS ON THE STANDARD SURFACE. 621 requests at most,
+    language-independent, one short permutation each; it is not worth a batch
+    wave, a cache or a JSONL file, and it must not inherit mode=batch from the
+    config. This is a deliberate exception to "three modes everywhere", stated
+    here so nobody ports it later by symmetry.
 """
 
-import datetime
 import json
 import time
 
@@ -49,9 +63,92 @@ from ..config import Config
 from ..gates import G_ORDER, Gate, run_gates
 from ..util import FatalError, read_json, write_json
 
-# One family per call, as in 03_rank_homographs.py; 1.6s keeps the free tier's
-# 30 RPM with margin.
-RANK_REQUEST_INTERVAL = 1.6
+# The permutation lock gets the same ladder as stage 42's count lock: a bad
+# permutation is the classic transient, and FatalError on the first one threw
+# away every ranking already paid for in the run.
+MAX_PERMUTATION_ATTEMPTS = 5
+# The ranking never leaves the interactive surface (see the module docstring).
+RANK_MODE = "standard"
+
+
+def ranking_bill(cfg, stats, entries: dict, families: dict, queue: list) -> dict:
+    """A forecast-shaped quote for the ranking wave, so G-BUDGET has a number.
+
+    Shaped as {lang: {"dollars": {scenario: usd}}} because that is what
+    billing.forecast reads and pre_spend_gates is the only consumer. Filed under
+    "-" for the same reason the CallContext is: the ranking is
+    language-independent (a permutation of entry ids), so pretending it belongs
+    to a language would double-count it across four.
+
+    Every term is measured or estimated with its own label, and a MISSING
+    constant yields None rather than a plausible number -- G-BUDGET then refuses,
+    which is the correct answer to "will this fit under the cap" when the answer
+    is unknown. The ranking is the one non-definition prompt family anybody has
+    probed (236 and 275 thought tokens at LOW, field present, finishReason STOP),
+    so its thinking term is a real measurement rather than a prior.
+    """
+    from .. import billing, prices                     # noqa: PLC0415
+    from .s42_translate import (expected_output_tokens, output_fit,
+                                unmeasured_thinking_prior)
+    requests = len(queue)
+    system = rank_prompt()
+    thinking, thinking_basis = unmeasured_thinking_prior(stats, "other")
+    out = {"requests": requests, "mode": RANK_MODE,
+           "thinking_per_request": thinking,
+           "thinking_basis": thinking_basis,
+           "basis": ("input is ESTIMATED from the rank prompt plus each family's "
+                     "payload at the measured chars/token; output is the measured "
+                     "EXPECTED_OUTPUT fit; the ranking is priced at the STANDARD "
+                     "rate because that is the surface it runs on")}
+    if not requests:
+        out["dollars"] = {"cache_works": 0.0, "lean_uncached": 0.0,
+                          "rich_uncached": 0.0}
+        return {"-": out}
+    system_tokens = billing.estimated_prompt_tokens(system, stats)
+    try:
+        fit = output_fit(stats=stats)
+    except FatalError as exc:
+        out["dollars"] = {"why": str(exc)}
+        return {"-": out}
+    if system_tokens is None:
+        out["dollars"] = {"why": ("missing measured constant(s): "
+                                  "CHARS_PER_TOKEN -- the rank prompt's size "
+                                  "cannot be estimated offline")}
+        return {"-": out}
+    uncached = output = think_total = 0
+    for row in queue:
+        fam = families.get(row.get("family_id")) or {}
+        ids = list(fam.get("entry_ids") or [])
+        payload = _rank_payload(entries, ids) if ids else []
+        text = json.dumps(payload, ensure_ascii=False)
+        uncached += int(system_tokens) \
+            + int(billing.estimated_prompt_tokens(text, stats) or 0)
+        output += expected_output_tokens(max(1, len(ids)), fit)
+        think_total += int(thinking)
+    try:
+        rates = prices.rate_card(cfg.expressions_model, RANK_MODE)
+    except Exception as exc:                           # noqa: BLE001
+        out["dollars"] = {"why": str(exc)[:200]}
+        return {"-": out}
+    try:
+        value = billing.usd_for_tokens(uncached_input=uncached, cached_input=0,
+                                       output=output + think_total, rates=rates)
+    except FatalError as exc:
+        out["dollars"] = {"why": str(exc)[:300]}
+        return {"-": out}
+    out.update({"uncached_input_tokens": uncached, "output_tokens": output,
+                "thinking_tokens": think_total,
+                # The same figure under all three scenario names: the ranking
+                # prompt is 1,503 characters, far under the measured 1,024-TOKEN
+                # explicit-cache floor, so there is no cached scenario for it and
+                # no enriched one either.
+                "dollars": {"cache_works": value, "lean_uncached": value,
+                            "rich_uncached": value,
+                            "note": ("the ranking prompt cannot be cached "
+                                     "(under the measured explicit-cache floor) "
+                                     "and is never enriched, so the three "
+                                     "scenarios are one number")}})
+    return {"-": out}
 
 
 def dedupe_keep_first(seq) -> list:
@@ -104,13 +201,23 @@ def _order_gate(rows: list):
     return not bad, {"families": len(rows), "violations": bad[:20]}
 
 
-def _rank_schema(n_ids: int) -> dict:
+def _rank_schema(n_ids: int, ids=None) -> dict:
     """03: the permutation lock -- exactly the input ids, no extras, no
-    omissions."""
+    omissions.
+
+    The `enum` on the items is measured, not hopeful: with and without it, every
+    response was a legal permutation and zero ids fell outside the enum. It
+    turns "the array is the right length" into "the array is made of these
+    exact strings", which is most of what the client-side check was for -- the
+    check stays, because a schema is a request and not a guarantee.
+    """
+    items: dict = {"type": "string"}
+    if ids:
+        items["enum"] = list(ids)
     return {"type": "object",
             "properties": {"sorted_ids": {"type": "array", "minItems": n_ids,
                                           "maxItems": n_ids,
-                                          "items": {"type": "string"}}},
+                                          "items": items}},
             "required": ["sorted_ids"]}
 
 
@@ -324,22 +431,61 @@ def run(cfg: Config, registry=None, confirm: bool = False) -> dict:
           % len(queue))
     print("  %d two-source contradictions logged to reports/priority_conflicts.json"
           % len(conflicts))
+    report["dry_path_wrote"] = ["json/words.json (entry_ids)",
+                                "json/priority_orders.json",
+                                "reports/priority_conflicts.json",
+                                "reports/ranking_queue.json"]
     if not confirm:
-        print("  nothing has been sent. Re-run with --confirm-spend to place calls.")
+        print("  nothing has been sent, but words.json / priority_orders.json / "
+              "ranking_queue.json HAVE been written: the queue is a computed "
+              "artifact, not a preview.")
         report["note"] = ("queue only: no LLM module was imported and no request "
                           "was made.")
         write_json(cfg.report_dir / "priority_report.json", report)
         return report
 
     # ---------------- past this line, money is spent ----------------
-    from .s42_translate import _generate, _pool_from_env
+    from .s42_translate import (CallContext, UsageLog, _pool_from_env,
+                                _pre_spend, _provenance, output_fit,
+                                probe_stats, spend_gate, transport_guard)
 
-    pool = _pool_from_env()
+    cfg.validate()
+    # The same gate stage 42 has, so `doctor` and this stage cannot disagree
+    # about whether a configuration may place calls. Its batch branch is gone
+    # now that the transport exists (mode=batch is a legitimate configuration
+    # and this stage simply stays on the standard surface, filing its ledger
+    # rows as RANK_MODE); what is left refuses cache_enabled on a transport
+    # where nothing creates a cache.
+    transport_guard(cfg)
+    stats = probe_stats(cfg)
+    cfg.validate(spending=True, stats=stats)
+    # CROSS-OWNER EDIT (this module does not own billing.py): the N-09 consumption rules had
+    # no production caller. Same call as stage 42's paid path, for the same
+    # reason -- doctor and the spend gate must not disagree about whether a
+    # configuration may place calls.
+    report["consumption_rules"] = spend_gate(cfg, stats, list(cfg.langs))
+    # CROSS-OWNER EDIT (this module does not own gates.py): `pre_spend_gates` had no
+    # production call site anywhere, so G-SCOPE-FROZEN and G-BUDGET could not
+    # refuse anything on any path. This stage places up to 621 paid requests and
+    # draws on the same monthly cap as a translate wave, so it is quoted (see
+    # ranking_bill) and adjudicated here, next to the N-09 rules.
+    report["bill"] = ranking_bill(cfg, stats, entries, families, queue)
+    report["pre_spend_gates"] = _pre_spend(cfg, report["bill"], families)
     # The ranking is a short permutation, not prose: it shares the expressions
-    # model rather than the definition model (config.expressions_model).
+    # model rather than the definition model (config.expressions_model), and it
+    # always runs on the standard surface (see the module docstring).
     model = cfg.expressions_model
-    prov = "gemini:%s@%s" % (model, datetime.date.today().isoformat())
+    fit = output_fit(stats=stats)
+    pool = _pool_from_env(cfg)
+    # Per-call, fsync'd: an interrupted ranking wave leaves its own token
+    # record on disk, not only in the report it never got to write.
+    usage = UsageLog(path=cfg.report_dir / "priority_usage.jsonl")
+    ctx = CallContext(cfg=cfg, pool=pool, fit=fit, lang="-", usage=usage,
+                      prompt_id=cfg.prompt_id, mode=RANK_MODE)
+    prov = _provenance(model, cfg.prompt_id, cfg.thinking_level)
+    report["mode"] = RANK_MODE
     ranked = 0
+    violations: list = []
     for row in queue:
         fid = row["family_id"]
         fam = families[fid]
@@ -348,15 +494,40 @@ def run(cfg: Config, registry=None, confirm: bool = False) -> dict:
         user = ('--- YOUR TURN ---\nInput headword: "%s"\nEntries:\n%s'
                 % (fam.get("lemma"), json.dumps(payload, ensure_ascii=False,
                                                 indent=2)))
-        time.sleep(RANK_REQUEST_INTERVAL)
-        parsed = _generate(pool, model, rank_prompt(), user,
-                           _rank_schema(len(eids)), 0.1, "ranking %s" % fid)
-        sorted_ids = parsed.get("sorted_ids")
-        if not isinstance(sorted_ids, list) or set(sorted_ids) != set(eids) \
-                or len(sorted_ids) != len(eids):
+        sorted_ids = None
+        # The ladder stage 42 has and this stage did not: the first malformed
+        # permutation used to abort the run outright, discarding every ranking
+        # already paid for, and the log could not say whether the model had
+        # improvised or the response had been truncated.
+        for attempt in range(1, MAX_PERMUTATION_ATTEMPTS + 1):
+            time.sleep(cfg.rank_request_interval)
+            req = ctx.request("rank", "ranking %s" % fid, user,
+                              _rank_schema(len(eids), eids), len(eids),
+                              rank_prompt())
+            comp = ctx.call(model, req)
+            candidate = comp.parsed.get("sorted_ids")
+            if isinstance(candidate, list) and len(candidate) == len(eids) \
+                    and set(candidate) == set(eids):
+                sorted_ids = candidate
+                break
+            violations.append({"family_id": fid, "attempt": attempt,
+                               "returned": candidate,
+                               "expected_ids": eids,
+                               "finish_reason": comp.finish_reason,
+                               "max_output_tokens": req.max_output_tokens})
+            print("  permutation lock: family %s returned %s, expected a "
+                  "permutation of %d ids, finishReason=%s (attempt %d/%d)"
+                  % (fid, candidate, len(eids), comp.finish_reason, attempt,
+                     MAX_PERMUTATION_ATTEMPTS))
+        if sorted_ids is None:
+            write_json(cfg.review_dir / "ranking_violations.json", violations)
+            write_json(cfg.report_dir / "priority_usage.json", usage.rows)
             raise FatalError(
-                "ranking for family %s returned %s, which is not a permutation "
-                "of %s" % (fid, sorted_ids, eids))
+                "ranking for family %s never returned a permutation of %s after "
+                "%d attempts; the families ranked before it are checkpointed. "
+                "Violations (with finishReason) are in "
+                "review/ranking_violations.json"
+                % (fid, eids, MAX_PERMUTATION_ATTEMPTS))
         new_order = anchor_first(fam["anchor_entry_id"], sorted_ids)
         fam["entry_ids"] = new_order
         fam["priority_source"] = "gemini"
@@ -383,5 +554,10 @@ def run(cfg: Config, registry=None, confirm: bool = False) -> dict:
                                         if r.get("status") != "ranked")
     report["api"] = {"requests": pool.total_requests,
                      "key_rotations": pool.rotations}
+    report["usage"] = usage.totals()
+    report["permutation_violations"] = len(violations)
+    if violations:
+        write_json(cfg.review_dir / "ranking_violations.json", violations)
+    write_json(cfg.report_dir / "priority_usage.json", usage.rows)
     write_json(cfg.report_dir / "priority_report.json", report)
     return report

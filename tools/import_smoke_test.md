@@ -17,7 +17,7 @@ best cases: they have the largest carried set).
 | the previously released deck | `DDO_Danish_Frequency_Deck_<LANG>.apkg` (v2.0/v2.1 release asset) |
 | the new deck | `dist/DDO_Danish_Frequency_Deck_<LANG>.apkg` |
 | the companion | `dist/DDO_Danish_v3_Retired_<LANG>.apkg` (`tools/retired_notes.py`) |
-| the numbers to check against | `work/reports/registry_freeze_report.json`, `work/reports/guid_diff.json` |
+| the numbers to check against | `work/reports/registry_freeze_report.json`, `work/reports/guid_diff.<LANG>.json` |
 
 Use a **fresh Anki profile** (File > Switch Profile > Add). Never run this on the
 profile you study with.
@@ -32,9 +32,9 @@ profile you study with.
      `FrequencyRank`).
 
 2. **Study something.** Pick 5 cards whose `QueryWord` appears in the `kept`
-   table of `guid_diff.json`. Prefer at least one case-sensitive one (`er`, `at`,
-   `de`, `var`) because 55 pairs differ only by case and that is where a GUID
-   change hides. Answer each card (Good / Hard, does not matter).
+   table of `guid_diff.<LANG>.json`. Prefer at least one case-sensitive one
+   (`er`, `at`, `de`, `var`) because 55 pairs differ only by case and that is
+   where a GUID change hides. Answer each card (Good / Hard, does not matter).
    - Record for each: QueryWord, due date, interval, reps.
 
 3. **Import the new deck.** File > Import > the v3 `.apkg`. Read the import
@@ -51,12 +51,12 @@ profile you study with.
          interval, same reps as recorded in step 2, and their revlog still shows
          the review (Browse > select the card > Card Info).
    - [ ] **Carried note count matches.** Notes that existed before and still
-         exist == `kept` in `guid_diff.json` == `carried` in
+         exist == `kept` in `guid_diff.<LANG>.json` == `carried` in
          `registry_freeze_report.json`. Off-by-anything means the seed registry
          and the released deck disagree.
    - [ ] **Total note count matches.** `old_notes + new - retired` from
-         `guid_diff.json` (retired notes are *updated*, not removed, so they are
-         still counted).
+         `guid_diff.<LANG>.json` (retired notes are *updated*, not
+         removed, so they are still counted).
    - [ ] **The new template is live.** Open a merged family card (a lemma with
          several homographs): the front shows the POS-grouped IPA with audio, the
          back shows numbered senses with translations, the `Variants` line shows
@@ -70,7 +70,7 @@ profile you study with.
 5. **Import the companion.** File > Import > `DDO_Danish_v3_Retired_<LANG>.apkg`.
 
    - [ ] Search `tag:ankidkdeck::merged-into-lemma` returns exactly the
-         `retired` count from `guid_diff.json`.
+         `retired` count from `guid_diff.<LANG>.json`.
    - [ ] One of those notes reads `This card was merged into <lemma>.` and the
          lemma is a real card in the deck.
    - [ ] Select all > Notes > Delete leaves the studied cards untouched

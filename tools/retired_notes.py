@@ -46,27 +46,41 @@ def main(argv=None) -> int:
 
     from ankidkdeck.config import load_config
     from ankidkdeck.stages.s70_export import (FIELD_NAMES, build_model,
-                                              deck_meta, lang_hash)
+                                              deck_meta, guid_diff_language,
+                                              lang_hash)
 
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--lang", required=True)
     ap.add_argument("--work", default="work")
-    ap.add_argument("--diff", help="guid_diff.json (default: <work>/reports/)")
+    ap.add_argument("--diff", help="guid_diff.<lang>.json (default: "
+                                   "<work>/reports/)")
     ap.add_argument("--out", help="output .apkg path")
     ap.add_argument("--config", help="ankidkdeck.toml")
     args = ap.parse_args(argv)
 
     cfg = load_config(Path(args.config) if args.config else None,
                       work_dir=Path(args.work))
+    reports = Path(args.work) / "reports"
+    per_lang = reports / ("guid_diff.%s.json" % args.lang)
+    # The per-language name tools/guid_diff.py writes, then the unsuffixed name
+    # it used to write. The language check below is what makes reading the
+    # legacy file safe: a report for another language is refused, not used --
+    # and it is s70_export's check, imported rather than restated, because the
+    # two tools reading one file used to disagree about which language it was
+    # about (this one read the top-level key, the exporter read summary.language).
     diff_path = (Path(args.diff) if args.diff
-                 else Path(args.work) / "reports" / "guid_diff.json")
+                 else (per_lang if per_lang.exists()
+                       else reports / "guid_diff.json"))
+    remedy = ("run tools/guid_diff.py --apkg <released>.apkg --lang %s --work "
+              "%s, which writes %s" % (args.lang, args.work, per_lang))
     if not diff_path.exists():
-        raise SystemExit("no %s -- run tools/guid_diff.py first" % diff_path)
+        raise SystemExit("no %s -- %s" % (diff_path, remedy))
     diff = json.loads(diff_path.read_text(encoding="utf-8"))
-    if diff.get("language") != args.lang:
-        raise SystemExit("guid_diff.json is for %r, not %r"
-                         % (diff.get("language"), args.lang))
+    says = guid_diff_language(diff)
+    if says != args.lang:
+        raise SystemExit("%s describes %r, not %r -- %s"
+                         % (diff_path.name, says, args.lang, remedy))
     retired = diff.get("retired") or []
     if not retired:
         print("nothing retired for %s; no companion package needed" % args.lang)

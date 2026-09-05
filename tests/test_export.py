@@ -423,6 +423,267 @@ def test_a_second_language_adds_rows_only_for_the_per_language_gates(cfg):
         assert per_id[gid] == [{}], (gid, per_id[gid])
 
 
+def _g_rel_row(cfg, reg, lang):
+    return next(r for r in _stage_70_rows(cfg, reg, lang) if r["id"] == "G-REL")
+
+
+def test_the_guid_diff_tool_writes_one_report_per_language(cfg, tmp_path):
+    """The tool wrote one reports/guid_diff.json whatever --lang said,
+    so a release month that ships two languages ends with a file about whichever
+    was diffed LAST -- and the exporter reads it as the other one's."""
+    import importlib.util
+
+    reg = _tiny_workspace(cfg)
+    built = S70.build_all(cfg, reg, "German")
+    released = tmp_path / "old.apkg"
+    S70.write_package(cfg, "German", built["notes"], [], released)
+
+    spec = importlib.util.spec_from_file_location(
+        "guid_diff", Path(__file__).resolve().parents[1] / "tools"
+        / "guid_diff.py")
+    guid_diff = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guid_diff)
+    assert guid_diff.main(["--apkg", str(released), "--lang", "German",
+                           "--work", str(cfg.work_dir)]) == 0
+    assert not (cfg.report_dir / "guid_diff.json").exists()
+    written = read_json(cfg.report_dir / "guid_diff.German.json")
+    assert written["summary"]["language"] == "German"
+    # --out still overrides the name; it is the only way to write a second
+    # report for one language without clobbering the first.
+    assert guid_diff.main(["--apkg", str(released), "--lang", "German",
+                           "--work", str(cfg.work_dir),
+                           "--out", str(tmp_path / "elsewhere.json")]) == 0
+    assert (tmp_path / "elsewhere.json").exists()
+
+
+def test_g_rel_reads_the_report_named_for_this_language(cfg):
+    """The Russian month: reports/guid_diff.json still described the
+    Chinese deck, so the Russian export failed with language_mismatch on a file
+    that was never about Russian."""
+    reg = _tiny_workspace(cfg)
+    n_notes = len(S70.build_all(cfg, reg, "German")["notes"])
+    write_json(cfg.report_dir / "guid_diff.German.json",
+               {"summary": {"language": "German", "card_count": n_notes}})
+    # a legacy report about ANOTHER language is not this language's report: it
+    # is ignored, not failed. Failing on it is the defect.
+    write_json(cfg.report_dir / "guid_diff.json",
+               {"summary": {"language": "Chinese", "card_count": 4242}})
+    row = _g_rel_row(cfg, reg, "German")
+    assert row["ok"] is True
+    assert row["detail"]["read_from"] == "guid_diff.German.json"
+    assert row["detail"]["violations"] == {}
+
+
+def test_g_rel_still_honours_a_legacy_report_about_this_language(cfg):
+    """Backward compatibility, and no further: the unsuffixed name is read when
+    the file itself says it describes THIS language."""
+    reg = _tiny_workspace(cfg)
+    n_notes = len(S70.build_all(cfg, reg, "German")["notes"])
+    write_json(cfg.report_dir / "guid_diff.json",
+               {"summary": {"language": "German", "card_count": n_notes}})
+    row = _g_rel_row(cfg, reg, "German")
+    assert row["ok"] is True and row["detail"]["read_from"] == "guid_diff.json"
+    # ...and it FAILS on that name too when the count disagrees. Per-language
+    # naming must not turn the legacy path into a soft one.
+    write_json(cfg.report_dir / "guid_diff.json",
+               {"summary": {"language": "German", "card_count": 4242}})
+    row = _g_rel_row(cfg, reg, "German")
+    assert row["ok"] is False
+    assert row["detail"]["read_from"] == "guid_diff.json"
+    assert "card_count_mismatch" in row["detail"]["violations"]
+
+
+def test_one_reading_of_which_language_a_guid_diff_report_describes(cfg):
+    """The exporter read `summary.language` and tools/retired_notes.py read the
+    top-level `language` key, so a report written BEFORE the summary row existed
+    was "not about German" to the exporter and "about German" to the companion
+    builder -- one file, two answers. Now there is one function.
+    """
+    reg = _tiny_workspace(cfg)
+    assert S70.guid_diff_language({"summary": {"language": "German"}}) \
+        == "German"
+    assert S70.guid_diff_language({"language": "German"}) == "German"
+    # the summary wins, because that is the row G-REL asserts against
+    assert S70.guid_diff_language(
+        {"language": "Chinese", "summary": {"language": "German"}}) == "German"
+    for junk in ({}, None, [], {"language": ""}, {"language": 7}):
+        assert S70.guid_diff_language(junk) is None
+    # a pre-summary-row legacy file is therefore READ, and fails honestly on
+    # the missing row rather than being silently declared irrelevant
+    write_json(cfg.report_dir / "guid_diff.json",
+               {"language": "German", "retired": [], "kept": []})
+    row = _g_rel_row(cfg, reg, "German")
+    assert row["ok"] is False
+    assert row["detail"]["read_from"] == "guid_diff.json"
+    assert "no_summary_row" in row["detail"]["violations"]
+
+
+def test_the_not_applicable_row_names_what_it_looked_at_and_skipped(cfg):
+    """A gate row whose prose does not describe what happened is the species of
+    defect this whole round exists to remove.
+
+    `guid_diff_report` reaches "no report" from more than one state, and the
+    obvious wording -- "there is no previous release to reconcile against" --
+    is a claim about the disk that is FALSE when a file was found and rejected.
+    """
+    reg = _tiny_workspace(cfg)
+    # a legacy report about another language: found, rejected, and SAID SO
+    write_json(cfg.report_dir / "guid_diff.json",
+               {"summary": {"language": "Chinese", "card_count": 4242}})
+    detail = _g_rel_row(cfg, reg, "German")["detail"]
+    assert detail["ignored"] == [{"file": "guid_diff.json",
+                                  "why": "it describes 'Chinese', not "
+                                         "'German'"}]
+    assert "guid_diff.json" in detail["why"] and "Chinese" in detail["why"]
+    assert "is not on disk" not in detail["why"]
+    # a per-language file that EXISTS but is empty: the old message said the
+    # file did not exist, to an operator staring at it
+    write_json(cfg.report_dir / "guid_diff.German.json", {})
+    detail = _g_rel_row(cfg, reg, "German")["detail"]
+    assert [row["file"] for row in detail["ignored"]] == [
+        "guid_diff.German.json", "guid_diff.json"]
+    assert "empty" in detail["ignored"][0]["why"]
+    # and with nothing on disk at all, the release-shaped explanation is the
+    # honest one
+    (cfg.report_dir / "guid_diff.German.json").unlink()
+    (cfg.report_dir / "guid_diff.json").unlink()
+    detail = _g_rel_row(cfg, reg, "German")["detail"]
+    assert detail["ignored"] == []
+    assert "is not on disk" in detail["why"]
+    assert "a first release has none" in detail["why"]
+
+
+def test_g_rel_still_fails_a_same_language_card_count_mismatch(cfg):
+    """What the gate is FOR. Per-language naming must not soften it: the churn
+    numbers in the release note have to be about the deck being written."""
+    reg = _tiny_workspace(cfg)
+    write_json(cfg.report_dir / "guid_diff.German.json",
+               {"summary": {"language": "German", "card_count": 4242}})
+    row = _g_rel_row(cfg, reg, "German")
+    assert row["ok"] is False
+    assert "card_count_mismatch" in row["detail"]["violations"]
+    # ...and a report that is named for this language but describes another one
+    # is a mislabelled file, not an absent one: trusted by NAME, verified by
+    # CONTENT.
+    write_json(cfg.report_dir / "guid_diff.German.json",
+               {"summary": {"language": "Chinese", "card_count": 4242}})
+    assert "language_mismatch" in _g_rel_row(cfg, reg, "German")[
+        "detail"]["violations"]
+
+
+def test_g_rel_records_a_not_applicable_row_when_no_report_exists(cfg):
+    """Why a not-applicable ROW exists at all, rather than no row.
+
+    Rows merge on (id, stage, extra) and are never pruned, so the ONLY thing
+    that can clear a stale FAIL is a later row for the SAME scope. G-REL used to
+    be appended only when a report was on disk, so a first release in a language
+    -- which can never have one -- wrote nothing, and the Russian month's
+    language_mismatch FAIL stayed in gates_report.json for good.
+    """
+    from ankidkdeck import gates as G
+
+    reg = _tiny_workspace(cfg)
+    row = _g_rel_row(cfg, reg, "German")
+    assert row["ok"] is True and row["extra"] == {"lang": "German"}
+    assert G.row_is_not_applicable(row)
+    assert "is not on disk" in row["detail"]["why"]
+    assert "NOT a verified pass" in row["detail"]["why"]
+
+    # G-SEP fails here (no fixture set), so the assertions are about G-REL's own
+    # row, not about an all-green report.
+    def report():
+        return read_json(cfg.report_dir / "gates_report.json")
+
+    assert "G-REL[lang=German]" not in report()["failed_rows"]
+    # the third verdict gets a derived top-level list of its own, alongside the
+    # other four, so nothing has to walk `results` to find it
+    assert report()["gate_rows_not_applicable"] == ["G-REL[lang=German]"]
+    # the whole mechanism: a stale FAIL for this scope is REPLACED by the
+    # not-applicable row on the next run, with no prune step anywhere
+    write_json(cfg.report_dir / "guid_diff.German.json",
+               {"summary": {"language": "German", "card_count": 4242}})
+    assert _g_rel_row(cfg, reg, "German")["ok"] is False
+    assert "G-REL[lang=German]" in report()["failed_rows"]
+    assert report()["gate_rows_not_applicable"] == []
+    (cfg.report_dir / "guid_diff.German.json").unlink()
+    assert G.row_is_not_applicable(_g_rel_row(cfg, reg, "German"))
+    assert "G-REL[lang=German]" not in report()["failed_rows"]
+    assert report()["gate_rows_not_applicable"] == ["G-REL[lang=German]"]
+
+
+def test_the_printed_gate_report_never_calls_a_non_check_a_pass(cfg, capsys):
+    """A human reading N/A as PASS is the reader this project cannot afford: it
+    is the difference between "the churn numbers were reconciled" and "there was
+    nothing to reconcile them against"."""
+    from ankidkdeck.cli import gates_report
+
+    reg = _tiny_workspace(cfg)
+    _stage_70_rows(cfg, reg, "German")
+    gates_report(cfg)
+    lines = capsys.readouterr().out.splitlines()
+    rel = next(l for l in lines if l.split()[1:2] == ["G-REL[lang=German]"])
+    assert rel.startswith("N/A ")
+    assert any(l.startswith("PASS") for l in lines)
+    assert any(l.startswith("FAIL") for l in lines)     # G-SEP, no fixtures
+    summary = next(l for l in lines if "gate row(s) recorded" in l)
+    assert "1 not applicable: G-REL[lang=German]" in summary
+
+
+def _retired_notes_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "retired_notes", Path(__file__).resolve().parents[1] / "tools"
+        / "retired_notes.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_retired_companion_prefers_the_per_language_report(cfg, tmp_path):
+    """The exact disk state Fix 1 exists for -- a stale unsuffixed report plus a
+    fresh per-language one -- read by the OTHER consumer of that file.
+
+    The companion package is built from the `retired` list, so reading the wrong
+    file tags the wrong notes: the operator's release note then says "search the
+    tag, select all, delete" over another language's GUIDs.
+    """
+    retired_notes = _retired_notes_module()
+    fresh = S70.guid_for("huse", "German")
+    stale = S70.guid_for("hus", "German")
+    write_json(cfg.report_dir / "guid_diff.German.json",
+               {"language": "German",
+                "retired": [{"guid": fresh, "query_word": "huse",
+                             "merged_into": "hus"}]})
+    write_json(cfg.report_dir / "guid_diff.json",
+               {"language": "German",
+                "retired": [{"guid": stale, "query_word": "STALE",
+                             "merged_into": "hus"}]})
+    out = tmp_path / "retired.apkg"
+    assert retired_notes.main(["--lang", "German", "--work", str(cfg.work_dir),
+                              "--out", str(out)]) == 0
+    assert [g for g, _, _ in S70.read_package(out)["notes"]] == [fresh]
+
+    # the legacy name is still the FALLBACK when the per-language file is absent
+    (cfg.report_dir / "guid_diff.German.json").unlink()
+    out2 = tmp_path / "retired_legacy.apkg"
+    assert retired_notes.main(["--lang", "German", "--work", str(cfg.work_dir),
+                              "--out", str(out2)]) == 0
+    assert [g for g, _, _ in S70.read_package(out2)["notes"]] == [stale]
+
+    # ...and a report for ANOTHER language is refused, naming the remedy rather
+    # than the file to go and edit
+    write_json(cfg.report_dir / "guid_diff.json",
+               {"language": "Chinese", "retired": [{"guid": stale,
+                                                    "query_word": "x",
+                                                    "merged_into": "y"}]})
+    with pytest.raises(SystemExit) as exc:
+        retired_notes.main(["--lang", "German", "--work", str(cfg.work_dir),
+                            "--out", str(tmp_path / "never.apkg")])
+    assert "guid_diff.json describes 'Chinese', not 'German'" in str(exc.value)
+    assert "tools/guid_diff.py" in str(exc.value)
+    assert "guid_diff.German.json" in str(exc.value)
+
+
 def test_the_retired_companion_fills_the_sort_field(cfg, tmp_path):
     """R4 m9: every retired note left sfld empty, so the 4,410 of them scattered
     through the browser's frequency ordering instead of collecting in one block

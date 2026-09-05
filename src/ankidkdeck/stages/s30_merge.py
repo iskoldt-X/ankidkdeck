@@ -26,7 +26,7 @@ from ..gates import (G_ANCHOR, G_ASSIGN, G_CASE, G_RANK, G_REGKEY, G_SEED, Gate,
                      dense_unique_ranks, registry_family_ids,
                      registry_seed_bytes, run_gates, unique_assignment)
 from ..util import NFC, FatalError, nk, read_json, sha256_str, write_json
-from .s22_classify import BUCKET_ORDER, squash
+from .s22_classify import BUCKET_ORDER, is_variant, squash
 
 
 class UnionFind:
@@ -86,12 +86,26 @@ def best_member(word: str, members: list, entries: dict) -> tuple:
 
 
 def _relation(word: str, bucket: str, fam: dict) -> str:
+    """How this member word relates to the family's headword.
+
+    `abbreviation` is its own relation and not a fall-through to `alias`, because
+    the fall-through is what s70.alt_forms_html renders on the card's Variants
+    line: `hr` would then print as a variant spelling on a card already headlined
+    `hr.`, which tells the reader nothing and costs a line. It is neither an
+    inflection (the dotless spelling is not a paradigm cell of the dotted
+    headword; DDO abbreviation entries have no flex table at all) nor a variant
+    spelling (the period is the abbreviation mark, not an orthographic choice).
+    It still enters searchable_forms, which is what makes typing `hr` in Anki
+    find the card -- the same treatment the curated-override imperatives get.
+    """
     if nk(word) == nk(fam["lemma"]):
         return "anchor"
     if bucket == "form":
         return "inflection"
     if bucket == "variant":
         return "variant"
+    if bucket == "abbreviation":
+        return "abbreviation"
     return "alias"
 
 
@@ -151,13 +165,63 @@ def run(cfg: Config, registry) -> dict:
     # statements agree: it names those words as content that must ship AND
     # claims 0 multi-headword components post-classifier. `hav`/`have` and
     # `kunne`/`khan` still squash apart and are still refused.
+    # ...and squash() is only the FIRST of the classifier's three variant
+    # branches. The other two -- DDO's OFFICIAL alternative spellings and the
+    # curated alias registry -- admit members whose squash keys differ, and this
+    # loop then called that component "two dictionary words" and split it back
+    # apart. Measured cost: all three registered alias pairs were refused.
+    # `check`(11007687) and `tjek`(12001518) shipped as two cards of one word,
+    # and `naeh`(udraabsord, 4 senses) and `o.k.`(1 sense + 1 fixed expression)
+    # shipped on NO card, their halves landing in dropped_components. Heads are
+    # therefore grouped by is_variant(), the classifier's own relation, which is
+    # what squash()'s docstring always claimed. The grouping is COMPONENT-LOCAL:
+    # an alias union is never allowed to chain two lemmas together across the
+    # corpus.
+    # BOTH sides are nk()-normalised before the set difference. The quarantine
+    # list is the only switch on a decision that retires a frozen v2.1 GUID, and
+    # comparing nk()'d keys against the registry's raw strings failed OPEN: an
+    # alias pair spelled with any uppercase or NFD character would not match its
+    # own quarantine row, the merge would land, and a GUID would retire with no
+    # error and no report line. Normalising both sides also makes such a pair
+    # work at all -- is_variant() builds its lookup key with nk(), so a raw
+    # cased pair was inert everywhere.
+    quarantined = {tuple(nk(x) for x in p)
+                   for p in (registry.alias_merge_pending or [])}
+    merge_aliases = {p for p in (tuple(nk(x) for x in pair)
+                                 for pair in registry.alias_pairs)
+                     if p not in quarantined and (p[1], p[0]) not in quarantined}
+    report["alias_pairs_quarantined_from_merge"] = sorted(
+        list(p) for p in quarantined)
+
+    def group_heads(eids: list[str]) -> dict[str, list]:
+        """Non-demoted entries grouped by orthographic identity. The key is the
+        lowest squash key in the group, so it is stable and comparable."""
+        live = [e for e in eids if not demoted(e)]
+        rep = {squash(entries[e]["lemma"]): squash(entries[e]["lemma"])
+               for e in live}
+
+        def find(k: str) -> str:
+            while rep[k] != k:
+                k = rep[k]
+            return k
+
+        for i, a in enumerate(live):
+            for b in live[i + 1:]:
+                if not is_variant(entries[a]["lemma"], entries[b], merge_aliases):
+                    continue
+                ra = find(squash(entries[a]["lemma"]))
+                rb = find(squash(entries[b]["lemma"]))
+                if ra != rb:
+                    lo, hi = sorted((ra, rb))
+                    rep[hi] = lo
+        out: dict[str, list] = {}
+        for e in live:
+            out.setdefault(find(squash(entries[e]["lemma"])), []).append(e)
+        return out
+
     comps, refused = [], []
     for words, eids in uf.components():
-        by_head_key: dict[str, list] = {}
-        for e in eids:
-            if demoted(e):
-                continue
-            by_head_key.setdefault(squash(entries[e]["lemma"]), []).append(e)
+        by_head_key = group_heads(eids)
         if len(by_head_key) > 1:
             # Refuse, never guess: a component holding two real lemmas would
             # merge two dictionary words onto one card.
@@ -179,17 +243,14 @@ def run(cfg: Config, registry) -> dict:
     # two fallback families can never share an anchor and family_id stays a bare
     # entry_id. Demoted entries are left out and become GC orphans.
     for r in refused:
-        by_head: dict[str, list] = {}
-        left_out = []
-        for e in r["entry_ids"]:
-            if demoted(e):
-                left_out.append(e)
-                continue
-            # Same head key as the refusal test, so a head can never be split
-            # from an article the classifier called a variant of it.
-            by_head.setdefault(squash(entries[e]["lemma"]), []).append(e)
+        # The SAME grouping function as the refusal test, so a head can never be
+        # split from an article the classifier called a variant of it. It used to
+        # be a second, hand-copied squash() loop -- which is how the two could
+        # disagree for the alias branch in the first place.
+        by_head = group_heads(r["entry_ids"])
+        left_out = sorted(e for e in r["entry_ids"] if demoted(e))
         r["fallback_heads"] = sorted(by_head)
-        r["entries_left_out"] = sorted(left_out)
+        r["entries_left_out"] = left_out
         for head in sorted(by_head):
             eids = sorted(by_head[head])
             own = set(eids)
@@ -356,14 +417,19 @@ def run(cfg: Config, registry) -> dict:
     # guide's pseudocode puts freeze at step 3 and members at step 4; that
     # ordering cannot execute.)
     new_rows = {}
+    seed_today = {}
     for fid, fam in families.items():
-        if fid in registry.card_keys:
-            continue
         carried = [m["word"] for m in fam["members"] if m["word"] in v2_querywords]
         seed = (min(carried, key=lambda x: (v2_querywords[x], x)) if carried
                 else fam["lemma"])
         if NFC(seed) != seed:
             raise FatalError(f"guid_seed for family {fid} is not NFC: {seed!r}")
+        # Computed for EVERY family, frozen ones included: this is the number the
+        # re-freeze decision needs, and it used to be unobservable because the
+        # loop skipped a frozen family before choosing a seed at all.
+        seed_today[fid] = seed
+        if fid in registry.card_keys:
+            continue
         # `since` is a RELEASE label from config, never __version__: the rows are
         # immutable once frozen, so a dev pre-release stamp ("3.0.0a0") would
         # brand every v3.0 family forever in the file whose human-reviewed diff
@@ -521,10 +587,36 @@ def run(cfg: Config, registry) -> dict:
     ], cfg, stage="30")
 
     # ---- 9. FREEZE the registry, then write the outputs -------------------
-    counts = registry.freeze_card_keys(new_rows, cfg.registry_local / "card_keys.json")
+    counts = registry.freeze_card_keys(new_rows,
+                                       cfg.registry_local / "card_keys.json",
+                                       proposed_seeds=seed_today)
+    # The families whose FROZEN seed is no longer the one today's data would
+    # choose. Not a gate and not an error: card_keys.json is append-only because
+    # those bytes are the users' study progress, so the pipeline must never
+    # rewrite them. It must not hide them either -- a seed frozen before the
+    # unresolved list was curated picked from a smaller member set, and the
+    # remedy (re-freeze once, before the first release) is an owner decision with
+    # a deadline, not a build step.
+    write_json(cfg.review_dir / "stale_guid_seeds.json", counts["stale_seeds"])
     freeze_report = {
         "added": counts["added"],
         "total": counts["total"],
+        # The rerun-stable answer to "what has this workspace frozen". `added`
+        # is 0 on every rerun -- correct, since append-only means an earlier run
+        # already wrote those rows -- which is how a build that appended 4 rows
+        # ended up reporting `added: 0` to the owner who opened the file.
+        "rows_not_in_the_committed_registry":
+            counts["not_in_the_committed_registry"],
+        "counts_note": "`added` is what THIS run appended (0 on a rerun: "
+                       "append-only). `rows_not_in_the_committed_registry` is "
+                       "the rerun-stable size of the overlay diff still to be "
+                       "reviewed and committed. `carried`/`new` split THIS "
+                       "build's families by carried_from_v2, they are not "
+                       "counts of rows written by this run.",
+        "stale_seeds": len(counts["stale_seeds"]),
+        "stale_seeds_note": "frozen seed != the seed this build would choose; "
+                            "append-only means it stays frozen. See "
+                            "review/stale_guid_seeds.json",
         "carried": sum(1 for f in families
                        if registry.card_keys[f].get("carried_from_v2")),
         "new": sum(1 for f in families

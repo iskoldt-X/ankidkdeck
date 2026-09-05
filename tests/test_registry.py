@@ -28,25 +28,30 @@ def test_defaults_are_the_measured_ones(registry):
     assert "førsteled" in registry.demoted_pos_keys
     gates = registry.gates
     assert gates["note_count_range"] == [2800, 3100]
-    assert gates["empty_rate_baseline_pct"]["Collocations"] == pytest.approx(33.86)
+    # 39.20, not the v2.1 33.86: commit 504afa6 re-baselined G-RATE onto the v3
+    # release's own measurement (registry/gates.json carries the full
+    # rationale) and did not touch this file, so the literal was left stale.
+    assert gates["empty_rate_baseline_pct"]["Collocations"] == \
+        pytest.approx(39.20)
 
 
-def test_freeze_adds_new_families_and_writes_the_overlay(cfg, registry):
+def test_freeze_adds_new_families_and_writes_the_overlay(
+        cfg, registry_empty_card_keys):
     path = cfg.registry_local / "card_keys.json"
-    counts = registry.freeze_card_keys(
+    counts = registry_empty_card_keys.freeze_card_keys(
         {"11021722": {"guid_seed": "hus", "lemma_at_freeze": "hus",
                       "since": "3.0.0a0", "carried_from_v2": True}}, path)
     assert counts["added"] == 1
     assert read_json(path)["11021722"]["guid_seed"] == "hus"
-    assert registry.card_keys["11021722"]["guid_seed"] == "hus"
+    assert registry_empty_card_keys.card_keys["11021722"]["guid_seed"] == "hus"
 
 
-def test_freeze_is_idempotent(cfg, registry):
+def test_freeze_is_idempotent(cfg, registry_empty_card_keys):
     path = cfg.registry_local / "card_keys.json"
     row = {"11021722": {"guid_seed": "hus", "lemma_at_freeze": "hus",
                         "since": "3.0.0a0", "carried_from_v2": True}}
-    registry.freeze_card_keys(row, path)
-    counts = registry.freeze_card_keys(row, path)
+    registry_empty_card_keys.freeze_card_keys(row, path)
+    counts = registry_empty_card_keys.freeze_card_keys(row, path)
     assert counts["added"] == 0
     assert counts["total"] == 1
 
@@ -116,6 +121,43 @@ def test_the_shipped_registry_carries_no_pre_release_since(registry):
         assert not PRE_RELEASE.search(str(row.get("since", ""))), (fid, row)
 
 
+def test_the_upstream_dead_audio_registry_is_reviewable_and_baselined(registry):
+    """known_missing_audio.json excuses a declared audio slot from the only gate
+    that adjudicates it (both halves of G-MEDIA), so every row has to be
+    reviewable BY A HUMAN and the population has to be pinned.
+
+    Row count == baseline is the bump-in-the-same-commit rule, in the suite: a
+    fifth row with the number untouched fails here as well as at the gate. The
+    evidence fields are the etag DDO serves (nginx's "<mtime-hex>-0", the -0
+    being the size, byte-identical on all four URLs -- one shared zero-byte
+    placeholder) and the date a human verified it. `entry_keeps_slots` is the
+    precondition that made accepting these rows acceptable at all: every affected
+    card keeps at least one working pronunciation, so none goes silent.
+    """
+    rows = registry.known_missing_audio
+    assert len(rows) == 4
+    assert registry.gates["known_missing_audio_max"] == 4
+    # file-level documentation is not a URL, and code must never read it as one
+    assert "_note" in registry.data["known_missing_audio"]
+    assert not any(k.startswith("_") for k in rows)
+    for url, row in sorted(rows.items()):
+        assert url.startswith("https://static.ordnet.dk/mp3/"), url
+        assert row["url_slot"] in url, url
+        assert row["entry_id"] in url and row["lemma"], url
+        assert row["reason"] == "upstream_zero_byte", url
+        assert row["verified_by"], url
+        assert row["entry_keeps_slots"], url
+        ev = row["evidence"]
+        assert ev["http_status"] == 200 and ev["content_length"] == 0, url
+        assert ev["content_type"] == "text/html", url
+        assert ev["etag"] == '"5b06c6d8-0"', url
+        assert ev["verified_on"] == "2026-08-27", url
+        assert ev["attempts"] >= 2, url        # one attempt is not a verdict
+    # the four etags are the SAME string: that is the evidence it is one
+    # placeholder file upstream, not four coincidences
+    assert len({r["evidence"]["etag"] for r in rows.values()}) == 1
+
+
 def test_paradigm_labels_only_for_recognised_shapes(registry):
     assert registry.paradigm_labels("sb.", (3,)) == [
         "definite singular", "indefinite plural", "definite plural"]
@@ -149,7 +191,9 @@ def test_a_nested_overlay_dict_is_merged_not_replaced(cfg):
     reg = Registry(cfg)
     base = reg.gates["empty_rate_baseline_pct"]
     assert base["Content"] == 5.0
-    assert base["Collocations"] == pytest.approx(33.86)   # NOT dropped
+    # NOT dropped. 39.20 since the commit-504afa6 G-RATE re-baseline; what this
+    # test is about is the merge, not the value.
+    assert base["Collocations"] == pytest.approx(39.20)
     assert len(base) == 5
 
 
@@ -247,3 +291,55 @@ def test_a_settable_field_still_loads(tmp_path):
     assert cfg.langs == ["German"] and cfg.copyright_year == 2027
     assert "gemini_model_expressions" in settable_fields()
     assert "json_dir" not in settable_fields()
+
+
+def test_freeze_reports_a_stale_seed_without_touching_the_row(
+        cfg, registry_empty_card_keys):
+    """`proposed_seeds` is what today's data WOULD choose for every family,
+    already-frozen ones included. Without it this method never saw them: stage
+    30 filtered existing family_ids out before calling, so the guard above was
+    dead code and the append-only rule had no voice -- which is how 22 families
+    locked in the less frequent of two spellings silently."""
+    path = cfg.registry_local / "card_keys.json"
+    registry_empty_card_keys.freeze_card_keys(
+        {"11021722": {"guid_seed": "huse", "lemma_at_freeze": "hus",
+                      "since": "3.0", "carried_from_v2": True}}, path)
+    counts = registry_empty_card_keys.freeze_card_keys({}, path,
+                                       proposed_seeds={"11021722": "hus"})
+    assert counts["added"] == 0
+    assert counts["stale_seeds"] == [{"family_id": "11021722",
+                                      "frozen_seed": "huse",
+                                      "seed_today": "hus",
+                                      "frozen_since": "3.0",
+                                      "lemma_at_freeze": "hus"}]
+    # REPORTED, not rewritten
+    assert read_json(path)["11021722"]["guid_seed"] == "huse"
+
+
+def test_freeze_reports_no_stale_seed_when_the_choice_still_agrees(
+        cfg, registry_empty_card_keys):
+    path = cfg.registry_local / "card_keys.json"
+    registry_empty_card_keys.freeze_card_keys(
+        {"11021722": {"guid_seed": "hus", "lemma_at_freeze": "hus",
+                      "since": "3.0", "carried_from_v2": True}}, path)
+    counts = registry_empty_card_keys.freeze_card_keys({}, path,
+                                       proposed_seeds={"11021722": "hus"})
+    assert counts["stale_seeds"] == []
+    assert counts["unchanged"] == 1
+
+
+def test_the_alias_merge_quarantine_is_empty_after_the_release_refreeze(
+        registry):
+    """The quarantine held ok/o.k., nae/naeh and check/tjek -- the three pairs
+    where BOTH sides own a DDO article AND an already-frozen card_keys row, so
+    merging them retires a frozen guid_seed. Emptying this file was the single
+    switch that landed those merges at the once-only release refreeze, and it
+    has been thrown: check (11007687) is merged into tjek and no longer holds a
+    row. Refilling it now would split a family the shipped registry has already
+    frozen as one, so the shipped state is EMPTY."""
+    pairs = {tuple(p) for p in registry.alias_merge_pending}
+    assert pairs == set()
+    # The mechanism still has to work, because a future alias pair between two
+    # frozen heads has to be parkable: anything listed must BE an alias pair,
+    # or quarantining it is a silent no-op.
+    assert pairs <= registry.alias_pairs

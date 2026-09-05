@@ -17,8 +17,14 @@ docstring used to promise every seed while the code checked the first 50 -- in a
 tool whose entire value is trustworthiness. ~2,900 sha256 calls is nothing.)
 
 The report carries a `summary` row so the export gate can assert against it:
-G-REL fails the build when reports/guid_diff.json describes a different language
-or a different card count from the deck being written.
+G-REL fails the build when reports/guid_diff.<lang>.json describes a different
+language or a different card count from the deck being written.
+
+The report is written PER LANGUAGE -- reports/guid_diff.<lang>.json -- because
+one release month can ship more than one language and the file is read by
+language, not by recency. Under the old single guid_diff.json, the Chinese
+month's file was still on disk when the Russian export ran and G-REL failed it
+with language_mismatch.
 """
 
 import argparse
@@ -97,7 +103,8 @@ def main(argv=None) -> int:
     ap.add_argument("--apkg", required=True, help="the previously released .apkg")
     ap.add_argument("--lang", required=True, help="target language of that deck")
     ap.add_argument("--work", default="work", help="workspace directory")
-    ap.add_argument("--out", help="output json (default: <work>/reports/guid_diff.json)")
+    ap.add_argument("--out", help="output json (default: "
+                                  "<work>/reports/guid_diff.<lang>.json)")
     args = ap.parse_args(argv)
 
     work = Path(args.work)
@@ -170,7 +177,11 @@ def main(argv=None) -> int:
                      "instead of ~1,400"),
         },
     }
-    out = Path(args.out) if args.out else work / "reports" / "guid_diff.json"
+    # Per language, and the exporter reads the same name. --out overrides it for
+    # the one case a name cannot serve: writing a second report for the same
+    # language without clobbering the first.
+    out = (Path(args.out) if args.out
+           else work / "reports" / ("guid_diff.%s.json" % args.lang))
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, ensure_ascii=False, indent=1),
                    encoding="utf-8")

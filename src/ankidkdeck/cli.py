@@ -12,21 +12,38 @@ Two rules are enforced here rather than inside the stages:
   * Spending money needs a flag. `translate` and `priority` print a bill and
     stop; --confirm-spend is the only way past it.
 
+"PRINTS A BILL AND STOPS" IS NOT "READ-ONLY", and the confusion has cost real
+work: without --confirm-spend, `translate` still runs gc() and rewrites
+definitions.json / expressions.json / archive.json and two reports, and runs
+G-ORPH (which can FatalError before a human sees the bill); `priority` still
+rewrites words.json, priority_orders.json and ranking_queue.json. Nothing is
+SENT. Something is CHANGED. Snapshot work/ before the first dry run of either:
+
+    cp -a work work.before-translate        # or: tar -C work -cf ../work.tar .
+
 Usage sketch:
 
     ankidkdeck --work work crawl --pilot
     ankidkdeck build
+    ankidkdeck priority                           # writes the queue, no calls
+    ankidkdeck doctor                             # what a spend would use
     ankidkdeck translate --lang German            # prints the bill, exits
     ankidkdeck translate --lang German --confirm-spend
     ankidkdeck export --lang German --check-determinism
+
+The runbook order is build -> priority -> translate -> audio -> export, and the
+`priority` step is not optional bookkeeping: s30_merge and s50_priority write the
+same words.json field, so a build after a priority run silently restores every
+homograph display order.
 """
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
 from . import __version__
-from .config import load_config
+from .config import MODES, load_config
 from .util import FatalError, read_json
 
 
@@ -130,12 +147,30 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("priority", help="homograph display order (stage 50)")
     s.add_argument("--confirm-spend", action="store_true",
-                   help="place the Gemini ranking calls for the queued families")
+                   help="place the Gemini ranking calls for the queued families. "
+                        "The ranking always runs on the standard surface, never "
+                        "batch. NOTE: even without this flag the stage REWRITES "
+                        "words.json, priority_orders.json and ranking_queue.json "
+                        "-- it places no call, but it is not read-only.")
 
     s = sub.add_parser("translate", help="incremental LLM top-up (stage 42)")
     s.add_argument("--lang", help="one target language; default: all configured")
     s.add_argument("--confirm-spend", action="store_true",
                    help="place the Gemini calls the bill just quoted")
+    s.add_argument("--mode", choices=MODES,
+                   help="transport for this run (default: the configured mode). "
+                        "batch is half price and asynchronous; flex is standard "
+                        "plus serviceTier=flex. Nothing downgrades by itself.")
+    s.add_argument("--phase", choices=("all", "submit", "ingest"), default="all",
+                   help="batch only: submit a wave, or ingest a finished one. "
+                        "The drift ledger is consumed on the ingest.")
+    s.add_argument("--retranslate-all", action="store_true",
+                   help="CLEAN RETRANSLATION: bill every cell in scope, not only "
+                        "the missing and changed ones. With --confirm-spend the "
+                        "existing rows are moved into archive.json with "
+                        "reason=clean_redo and the archive is NOT read back, so "
+                        "they are really regenerated. Without --confirm-spend it "
+                        "only quotes the bill and touches nothing.")
     s.add_argument("--no-gc", action="store_true",
                    help="skip archiving translation rows with no live sense")
     s.add_argument("--include-unused", action="store_true",
@@ -143,6 +178,18 @@ def build_parser() -> argparse.ArgumentParser:
                         "including the articles the classifier rejected "
                         "(measured 3.4x the cells). Normally you run the merge "
                         "stage first instead.")
+
+    s = sub.add_parser("review", help="hand-run correction pass (stage 42). "
+                                      "NEVER triggered automatically.")
+    s.add_argument("--lang", required=True, help="target language")
+    s.add_argument("--fix", metavar="KEYS",
+                   help="comma-separated cell keys to redo; default: every cell "
+                        "flagged in work/review/script_violations_<lang>.json")
+    s.add_argument("--confirm-spend", action="store_true",
+                   help="place the correction calls")
+
+    sub.add_parser("doctor", help="print the EFFECTIVE spend configuration and "
+                                  "the state of the measured constants")
 
     s = sub.add_parser("audio", help="audio cache and delta download (stage 60)")
     s.add_argument("--seed-legacy", action="store_true",
@@ -268,15 +315,30 @@ def run_command(args, cfg) -> int:
     if cmd == "translate":
         from .stages import s42_translate
         check_lang(cfg, args.lang)
+        if args.mode:
+            cfg.mode = args.mode
+            cfg.validate()
         print_report("translate", s42_translate.run(
             cfg, _registry(cfg), lang=args.lang, confirm=args.confirm_spend,
-            do_gc=not args.no_gc, include_unused=args.include_unused))
+            do_gc=not args.no_gc, include_unused=args.include_unused,
+            retranslate_all=args.retranslate_all, phase=args.phase))
         return 0
+    if cmd == "review":
+        from .stages import s42_translate
+        check_lang(cfg, args.lang)
+        keys = [k.strip() for k in (args.fix or "").split(",") if k.strip()]
+        print_report("review", s42_translate.review(
+            cfg, _registry(cfg), lang=args.lang, keys=keys or None,
+            confirm=args.confirm_spend))
+        return 0
+    if cmd == "doctor":
+        return doctor(cfg)
     if cmd == "audio":
         from .stages import s60_audio
         print_report("audio", s60_audio.run(cfg, _net(cfg),
                                             seed_legacy=args.seed_legacy,
-                                            sweep_orphans=args.sweep_orphans))
+                                            sweep_orphans=args.sweep_orphans,
+                                            registry=_registry(cfg)))
         return 0
     if cmd == "export":
         from .stages import s70_export
@@ -323,6 +385,284 @@ def status(cfg) -> dict:
     return out
 
 
+def doctor(cfg) -> int:
+    """Print the configuration that will ACTUALLY be used, and where it came from.
+
+    This command exists because of a specific near miss: the run host's
+    ankidkdeck.toml carried four lines, none of them about the model, so the
+    effective model there was the source default -- and a --confirm-spend would
+    have paid for a model nothing had been measured on and welded its name into
+    every cell's provenance. Nothing in the pipeline printed the effective spend
+    configuration before money was placed. Now one command does, and it exits
+    non-zero when the run is not fit to spend.
+    """
+    from .config import VERIFIED_MODELS
+    from .gates import read_refreeze_stamp
+    from .stages.s42_translate import (CACHEABLE_KINDS, REQUIRED_STATS_KEYS,
+                                       missing_stats_keys, prompt_shas,
+                                       rate_card_for, thinking_per_request,
+                                       unmeasured_thinking_prior)
+    problems = []
+    print("--- effective spend configuration ---")
+    print("  work_dir            %s" % cfg.work_dir)
+    print("  model               %s%s"
+          % (cfg.gemini_model,
+             "" if cfg.model_is_verified() else "   <-- NOT VERIFIED"))
+    print("  model (expr/pos)    %s" % cfg.expressions_model)
+    if not cfg.model_is_verified():
+        problems.append("model %s is not on the verified list (%s)"
+                        % (cfg.gemini_model, ", ".join(sorted(VERIFIED_MODELS))))
+    else:
+        meta = VERIFIED_MODELS[cfg.gemini_model]
+        print("  constants measured  %s   rate card read %s"
+              % (meta["constants_measured_at"], meta["rate_card_read_at"]))
+    print("  mode                %s   (service tier: %s)"
+          % (cfg.mode, cfg.effective_service_tier or "-"))
+    print("  thinking level      %s%s"
+          % (cfg.thinking_level,
+             "" if cfg.thinking_level == "LOW"
+             else "   <-- NOT LOW: the derived output cap has no thinking term"))
+    print("  temperature         not sent (deprecated on this model generation)")
+    print("  max output tokens   %s"
+          % ("derived per request for definitions (floor %d), flat %d for the "
+             "kinds nobody measured" % (cfg.max_output_floor,
+                                       cfg.max_output_unmeasured)
+             if not cfg.max_output_tokens else cfg.max_output_tokens))
+    # Print the shas of the prompts THIS config would send, not the shas of
+    # the default prompt: cfg.prompt_id selects the variant, and a doctor that
+    # printed the frozen shas under a rich prompt_id would certify the wrong
+    # text right above the line that names the id.
+    from . import prompts as _prompts
+    _prompts.activate(cfg)
+    print("  prompt_id           %s   (variant %s, packs %s)"
+          % (cfg.prompt_id, _prompts.variant_for(cfg.prompt_id),
+             ", ".join("%s=%s" % (lang, _prompts.pack_version(lang))
+                       for lang in cfg.langs) or "-"))
+    for lang in cfg.langs:
+        shas = prompt_shas(lang)
+        print("    %-9s def %s  expr %s"
+              % (lang, shas["definition"][:12], shas["expression"][:12]))
+    print("  explicit cache      %s (ttl factor %s, key index %d)"
+          % ("on" if cfg.cache_enabled else "off", cfg.cache_ttl_factor,
+             cfg.cache_key_index))
+    print("  spend cap           $%s per %s" % (cfg.spend_cap_usd,
+                                                cfg.spend_cap_period))
+    print("  retranslate_all     %s (reason %r)"
+          % (cfg.retranslate_all, cfg.retranslate_reason))
+    print("  throttle            def %ss / expr %ss / pos %ss / rank %ss, "
+          "%d requests per key"
+          % (cfg.def_request_interval, cfg.expr_request_interval,
+             cfg.pos_request_interval, cfg.rank_request_interval,
+             cfg.max_per_api_key))
+    print("  measured RPM/RPD    %s / %s (read %s)"
+          % (cfg.rpm_limit if cfg.rpm_limit is not None else "UNMEASURED",
+             cfg.rpd_limit if cfg.rpd_limit is not None else "UNMEASURED",
+             cfg.rate_limits_measured_at or "never"))
+    if cfg.rpm_limit is None or cfg.rpd_limit is None:
+        print("    (free tier is a hard 20 requests/model/day and a 503 counts; "
+              "the paid tier's per-minute limit has never been measured)")
+
+    print("--- measured constants ---")
+    path = cfg.probe_stats_path
+    if not path.exists():
+        print("  %s   MISSING" % path)
+        problems.append("no measured constants at %s: the output cap, the "
+                        "thinking constant and the cache floor have no defaults"
+                        % path)
+    else:
+        stats = read_json(path, default={})
+        print("  file                %s" % path)
+        print("  measured_at         %s" % stats.get("measured_at"))
+        print("  model               %s%s"
+              % (stats.get("model"),
+                 "" if stats.get("model") == cfg.gemini_model
+                 else "   <-- DOES NOT MATCH THE CONFIGURED MODEL"))
+        if stats.get("model") != cfg.gemini_model:
+            problems.append("the measured constants were produced on %r, the "
+                            "configured model is %r"
+                            % (stats.get("model"), cfg.gemini_model))
+        guard = stats.get("CONSUMPTION_GUARD")
+        if guard:
+            print("  CONSUMPTION_GUARD   %s" % guard)
+            problems.append("the constants file still declares a "
+                            "CONSUMPTION_GUARD: %s" % guard)
+        fit = stats.get("EXPECTED_OUTPUT") or {}
+        print("  output fit          a=%s b=%s (R2 %s over %s points)"
+              % (fit.get("a"), fit.get("b"), fit.get("r2"), fit.get("points")))
+        print("  fit measured on     definition requests only; every other kind "
+              "uses the flat cap")
+        low = thinking_per_request(stats, "LOW", "p95")
+        print("  thinking @ LOW      %s (p95)"
+              % ("MISSING" if low is None else low))
+        # The measured zero is PROMPT-scoped, not level-scoped: the ranking
+        # prompt produced 236-275 thought tokens at the same LOW. So the bill
+        # books an unmeasured kind at a labelled prior, and the one output a
+        # human reads before --confirm-spend has to say which of the two numbers
+        # on that line is a measurement.
+        prior, prior_source = unmeasured_thinking_prior(stats)
+        print("  thinking @ LOW      %s/request on kinds NOBODY MEASURED "
+              "(expression, pos) -- a PRIOR, not a measurement" % prior)
+        print("    source            %s" % prior_source)
+        print("    scope of the 0    %s"
+              % ((stats.get("thinking") or {})
+                 .get("THINKING_PER_REQUEST_LOW_scope")
+                 or "NOT RECORDED -- the artifact states a bare zero"))
+        print("  cached input rate   applies to %s only (the measured "
+              "explicit-cache minimum is %s tokens; every other kind pays the "
+              "uncached rate in every scenario)"
+              % (", ".join(CACHEABLE_KINDS),
+                 (stats.get("wave2") or {}).get("EXPLICIT_CACHE_FLOOR")))
+        # No fallback for the implicit floor: it is a DIFFERENT number from the
+        # explicit one and the real artifact does not carry it, so printing a
+        # source constant here would put an invented 4096 in the one output a
+        # human reads before pressing --confirm-spend.
+        print("  explicit cache floor %s   implicit %s"
+              % ((stats.get("wave2") or {}).get("EXPLICIT_CACHE_FLOOR"),
+                 stats.get("IMPLICIT_CACHE_FLOOR", "n/a (not in this artifact)")))
+        # PROMPT_TOKENS_system_only is PER LANGUAGE, and REQUIRED_STATS_KEYS
+        # lists only the five keys that are not -- so nothing above this line
+        # looks at the configured languages at all, and doctor printed "fit to
+        # spend" for a Russian run whose entry was absent. The only refusal was
+        # the wave splitter's, which arrives at split time with the scope
+        # already frozen and the operator already committed.
+        system_only = stats.get("PROMPT_TOKENS_system_only") or {}
+        # "measured" vs "declared" is not a field: the declaration mode of
+        # tools/backfill_probe_stats.py deliberately writes no structured node,
+        # only the value plus a change-log line
+        # (tools/backfill_probe_stats.py:1123, "PROMPT_TOKENS_system_only.%s =
+        # %d (declared, not measured; ...)"). So the change log is the only
+        # record of the difference. It fails OPEN, to "measured": a hand-edited
+        # artifact carries no change-log line at all.
+        changes = [str(c) for c in
+                   (stats.get("backfilled") or {}).get("changes") or []]
+        no_system_tokens = []
+        for lang in cfg.langs:
+            value = system_only.get(lang)
+            # bool is an int in Python and `True` would print as 1 token; 0 and
+            # a negative are worse than absent, because the wave splitter would
+            # subtract nothing and quote the whole prompt as uncached payload.
+            if (not isinstance(value, (int, float))
+                    or isinstance(value, bool) or value <= 0):
+                print("  system tokens %-9s %s"
+                      % (lang, "MISSING" if value is None
+                         else "UNUSABLE (%r)" % (value,)))
+                no_system_tokens.append(lang)
+                continue
+            # An EXACT token, not a prefix. The real log line for a declared
+            # 1135 also contains "1", "11" and "113", so a substring test
+            # relabels a later re-MEASURED 113 as declared.
+            token = re.compile(r"PROMPT_TOKENS_system_only\.%s = %d(?![0-9])"
+                               % (re.escape(lang), int(value)))
+            basis = ("declared, not measured"
+                     if any(token.search(c) for c in changes) else "measured")
+            print("  system tokens %-9s %d (%s)" % (lang, int(value), basis))
+        if not cfg.langs:
+            print("  system tokens         (no languages configured)")
+        if no_system_tokens:
+            problems.append(
+                "PROMPT_TOKENS_system_only has no usable entry for %s. The wave "
+                "splitter subtracts the system half from the measured prompt "
+                "fit to get the uncached payload and REFUSES without it, so a "
+                "--confirm-spend on this configuration stops at wave-split "
+                "time. Measure it, or declare it: "
+                "tools/backfill_probe_stats.py %s --declaration-basis "
+                "'<why this number is believed>' --write"
+                % (", ".join(no_system_tokens),
+                   " ".join("--declare-system-tokens %s=N" % lang
+                            for lang in no_system_tokens)))
+        # One list of required keys, shared with the spend gate, so doctor's
+        # verdict and translate's refusal cannot disagree about what fit means.
+        why = dict(REQUIRED_STATS_KEYS)
+        for key in missing_stats_keys(stats):
+            problems.append("missing measured constant %s (%s)"
+                            % (key, why[key]))
+        if cfg.thinking_level != "LOW":
+            level = thinking_per_request(stats, cfg.thinking_level, "p95")
+            print("  thinking @ %-8s %s (p95)   override ack: %s"
+                  % (cfg.thinking_level, "MISSING" if level is None else level,
+                     cfg.thinking_level_override_ack))
+            # Spending above LOW takes the measurement AND the acknowledgement.
+            # The message says which half is missing and why the pin exists, in
+            # the one output a human reads before pressing --confirm-spend.
+            pinned = ("thinkingLevel is pinned to LOW for this program "
+                      "(decision record: gemini-docs-verification.md) because "
+                      "maxOutputTokens is ONE budget shared by thoughts and "
+                      "candidates while the derived cap "
+                      "(ceil(a*n + b) * 1.5) has NO thinking term. At MEDIUM "
+                      "the measured p95 is 1,042 thought tokens against an "
+                      "n=20 batch's entire 1,115-token cap, and both "
+                      "MAX_TOKENS finishes in the probe set came from MEDIUM")
+            if level is None:
+                problems.append(
+                    "thinking_level = %s has no measured thinking cost in %s, "
+                    "so a paid run at this level would be sized by a constant "
+                    "measured on another one. %s"
+                    % (cfg.thinking_level, path, pinned))
+            elif not cfg.thinking_level_override_ack:
+                problems.append(
+                    "thinking_level = %s is measured (p95 %s) but "
+                    "thinking_level_override_ack is false. A measured thinking "
+                    "cost the cap formula never reads is a number nobody is "
+                    "using, so the measurement alone does not license the "
+                    "spend. %s. Set thinking_level_override_ack = true to "
+                    "spend anyway -- it means \"I know the output-cap math "
+                    "ignores thinking\"" % (cfg.thinking_level, level, pinned))
+
+    # The one state left where the configuration promises something the code
+    # cannot deliver. translate refuses it outright (s42.transport_guard); doctor
+    # has to say so, or its verdict would contradict the stage's. The two other
+    # entries that used to be here -- mode = batch and cache_enabled -- are gone
+    # because the transport and the cache lifecycle exist now.
+    if cfg.cache_enabled and cfg.mode != "batch":
+        problems.append("cache_enabled = true with mode = %s: the "
+                        "explicit-cache lifecycle is driven by the batch wave, "
+                        "so on this transport nothing would create the cache "
+                        "and the run would pay the full uncached rate while the "
+                        "bill quoted the cached one" % cfg.mode)
+    if cfg.mode == "batch":
+        print("  batch transport       jobs and results under %s; one job in "
+              "flight (across invocations too), results downloaded on "
+              "completion, a drain that dies is resumed and never resubmitted"
+              % (cfg.work_dir / "batch"))
+
+    # The two pre-spend gates. Reported rather than adjudicated: this command
+    # places no call, so it must not absorb a refusal that belongs to the run.
+    # But G-SCOPE-FROZEN refuses every --confirm-spend until the refreeze has
+    # happened, and finding that out by being refused is worse than being told.
+    stamp, where = read_refreeze_stamp(cfg)
+    if isinstance(stamp, dict):
+        print("  refreeze stamp        %s (%s families, %s card_keys rows, by "
+              "%s)" % (stamp.get("refrozen_at"), stamp.get("families"),
+                       stamp.get("card_keys_rows"), stamp.get("by")))
+    else:
+        print("  refreeze stamp        NOT PRESENT (%s). G-SCOPE-FROZEN will "
+              "refuse every --confirm-spend until the release refreeze is done "
+              "and signed: paying to translate a scope that is about to change "
+              "is paying twice." % where)
+    print("  spend cap             $%s/month, checked by G-BUDGET against "
+          "month-to-date PLUS this run's forecast SUMMED over the languages in "
+          "the run" % cfg.spend_cap_usd)
+
+    print("--- prices ---")
+    rates, rates_note = rate_card_for(cfg)
+    print("  %s" % rates_note)
+    if rates:
+        print("  %s" % rates)
+
+    print("--- verdict ---")
+    if problems:
+        for p in problems:
+            print("  BLOCKED: %s" % p)
+        print("  this configuration is NOT fit to spend on.")
+        return 1
+    print("  fit to spend, as far as this command can see. It REPORTS the "
+          "refreeze stamp and the cap above but adjudicates neither: this "
+          "command places no call, so G-SCOPE-FROZEN and G-BUDGET stay with the "
+          "run that would spend, and a missing stamp above means the next "
+          "--confirm-spend is refused.")
+    return 0
+
+
 def gates_report(cfg) -> int:
     """Print the accumulated gate report and AGGREGATE it: exit non-zero if any
     recorded row fails.
@@ -332,7 +672,7 @@ def gates_report(cfg) -> int:
     a passing German export overwrote a failing Chinese one and this command
     certified the release all-green.
     """
-    from .gates import row_label
+    from .gates import row_is_not_applicable, row_label
     path = cfg.report_dir / "gates_report.json"
     data = read_json(path, default={})
     if not data:
@@ -341,12 +681,58 @@ def gates_report(cfg) -> int:
     rows = data.get("results", [])
     width = max((len(row_label(r)) for r in rows), default=12)
     for row in rows:
-        print("%-4s %-*s %-10s %s"
-              % ("PASS" if row.get("ok") else "FAIL", width, row_label(row),
-                 "stage " + str(row.get("stage") or "?"), row.get("description")))
+        # No marker at all on a report written before this accounting existed:
+        # "unknown" must not print as "carried".
+        carried_marker = ("" if row.get("executed_this_run", True)
+                          else "   [CARRIED]")
+        # Three verdicts printed, two recorded. `ok` has to stay a bool -- the
+        # release checklist and the tests read `failed`, a list of ids -- but a
+        # row that passed because there was NOTHING TO CHECK must not print the
+        # same word as a row that passed a check. G-REL on a first release is
+        # the case: no previous .apkg exists, so nothing was reconciled.
+        verdict = ("N/A" if row_is_not_applicable(row)
+                   else ("PASS" if row.get("ok") else "FAIL"))
+        print("%-4s %-*s %-10s %s%s"
+              % (verdict, width, row_label(row),
+                 "stage " + str(row.get("stage") or "?"), row.get("description"),
+                 carried_marker))
     bad = [row_label(r) for r in rows if not r.get("ok")]
-    print("%d gate row(s) recorded, %d failing%s"
-          % (len(rows), len(bad), (": " + ", ".join(bad)) if bad else ""))
+    # Read the derived list when the file carries one; fall back to recomputing
+    # it, because this command also has to render reports written before that
+    # key existed.
+    na = data.get("gate_rows_not_applicable")
+    if na is None:
+        na = [row_label(r) for r in rows if row_is_not_applicable(r)]
+    print("%d gate row(s) recorded, %d failing%s, %d not applicable%s"
+          % (len(rows), len(bad), (": " + ", ".join(bad)) if bad else "",
+             len(na), (": " + ", ".join(na)) if na else ""))
+    # The row count is NOT a release verdict. Rows accumulate across stages AND
+    # across runs, so an all-PASS list can coexist with declared gates that have
+    # never executed on this workspace -- and G-SITEMAP, one of them, is what
+    # adjudicates merge_report.sitemap_shortfall_families.
+    never = data.get("gate_ids_never_run") or []
+    print("stages represented: %s ; %d of %d declared gates have a verdict here"
+          % (", ".join(data.get("stages_reported") or ["?"]),
+             len(data.get("gate_ids_with_a_verdict") or []),
+             data.get("gates_declared") or 0))
+    # `gates` READS the report, it does not run gates -- so from its own point of
+    # view every row is carried. The distinction that matters is inside the file:
+    # which rows the run that produced it actually executed. 12 recorded rows
+    # were 10 executed plus 2 left by an earlier run at stages that build never
+    # touches.
+    carried = data.get("gate_rows_carried_from_an_earlier_run")
+    if carried is None:
+        print("(this report predates the executed-here accounting: it cannot say "
+              "which rows the run that wrote it actually executed)")
+    else:
+        fresh = data.get("gate_rows_executed_this_run") or []
+        print("%d row(s) were executed by the run that wrote this report "
+              "(stages %s); %d carried from an earlier run%s"
+              % (len(fresh), ", ".join(data.get("stages_executed_this_run")
+                                       or ["-"]),
+                 len(carried), (": " + ", ".join(carried)) if carried else ""))
+    if never:
+        print("NOT RUN on this workspace (%d): %s" % (len(never), ", ".join(never)))
     print("manual gates are never recorded here: G-IMPORT (the Anki smoke test, "
           "tools/import_smoke_test.md) and G-REVIEW (a human reading "
           "review/rejected.json) need a signature, not a script.")

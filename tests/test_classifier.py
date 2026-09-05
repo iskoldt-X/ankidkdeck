@@ -239,3 +239,61 @@ def test_the_form_bucket_tests_paradigm_cells_not_the_lemma_key():
                        "reject:case_only_demoted_pos", "reject:affix",
                        "reject:abbreviation", "reject:multiword_neighbour",
                        "reject:unrelated"}
+
+
+# --------------------------------------------------------------------------
+# The abbreviation relation (owner policy B, 2026-08-26)
+# --------------------------------------------------------------------------
+
+def test_the_abbreviation_rule_is_case_insensitive():
+    """reviewer B N-1, round 2. The rule compared NFC bytes, so DDO's lower-case
+    `dr.` did not match the wordlist's `Dr`(rank 358) or `mrs.` the wordlist's
+    `Mrs`(598): both landed in `unrelated`, the classifier's "no opinion"
+    fallback, while a rule for exactly that shape sat two lines above. Measured
+    effect of the fix: 2 reason codes in review/rejected.json, 0 verdicts."""
+    from ankidkdeck.stages.s22_classify import is_dotted_abbreviation
+    dr = make_entry("11009566", "dr.", pos_key="fork.")
+    mrs = make_entry("11034528", "mrs.", pos_key="fork.")
+    assert classify_one("Dr", dr, DEMOTED, ALIASES) == ("reject", "abbreviation")
+    assert classify_one("Mrs", mrs, DEMOTED, ALIASES) == ("reject", "abbreviation")
+    assert is_dotted_abbreviation("Dr", dr)
+    assert is_dotted_abbreviation("dr", dr)
+
+
+def test_is_dotted_abbreviation_admits_only_the_query_plus_periods():
+    """The guard that lets stage 21 drop the demoted filter safely.
+
+    The element-symbol articles that put `symbol` in demoted_pos_keys are
+    CASE-ONLY matches and carry no period, so none of them can pass -- which is
+    what keeps `th`/`no`/`ca`/`kr`/`ma` from adopting thorium, nobelium, calcium,
+    krypton and the milliampere while they adopt `th.`, `no.`, `ca.`, `kr.` and
+    `ma.`. `o.k.` cannot pass either: nk("o.k.").rstrip(".") is "o.k".
+    """
+    from ankidkdeck.stages.s22_classify import is_dotted_abbreviation
+    yes = [("th", "th."), ("no", "no."), ("ca", "ca."), ("kr", "kr."),
+           ("ma", "ma."), ("hr", "hr."), ("st", "st."), ("Dr", "dr.")]
+    no = [("th", "Th"), ("no", "No"), ("ca", "Ca"), ("kr", "Kr"), ("ma", "mA"),
+          ("ok", "o.k."), ("min", "min"), ("hr", "herre"), ("no", "no-go"),
+          ("on", "on the rocks"), ("nr", "nummer")]
+    for word, lemma in yes:
+        assert is_dotted_abbreviation(word, make_entry("1", lemma)), (word, lemma)
+    for word, lemma in no:
+        assert not is_dotted_abbreviation(word, make_entry("1", lemma)), (word, lemma)
+
+
+def test_the_forward_page_still_rejects_an_abbreviation_entry():
+    """Policy B is a stage-21 LAST-RESORT layer, not a relaxation here.
+
+    22 words in the corpus already own a card through an exact match AND reach a
+    dotted article on their own page (min/min., med/med., to/to., ti, tv, par,
+    port, red, art, da, den, do, eks, el, fa, man, pr, sen, net, soe, soen,
+    aarh). Accepting the abbreviation in the classifier would staple a second
+    dictionary word's meaning block onto all 22 -- `min.` is `minut` -- so the
+    forward verdict must stay a rejection and exclusive exactness must keep
+    being protected by the LAYER ORDER, which no later edit to a filter can
+    weaken.
+    """
+    assert classify_one("min", make_entry("11033713", "min.", pos_key="fork."),
+                        DEMOTED, ALIASES) == ("reject", "abbreviation")
+    assert classify_one("min", make_entry("11033715", "min", pos_key="pron."),
+                        DEMOTED, ALIASES) == ("exact_cs", "exact")

@@ -16,6 +16,44 @@ class FatalError(RuntimeError):
     """
 
 
+class AudioUnavailable(Exception):
+    """One audio slot the host answered without giving us audio.
+
+    NOT a FatalError, and that is the whole point: DDO answers four declared
+    audio URLs with HTTP 200, content-length 0 and content-type text/html (one
+    shared zero-byte placeholder, same etag on all four). A FatalError would kill
+    a 5,893-file stage over an upstream defect in 4 of them; a returned response
+    would let a zero-byte or text/html body be written to disk as an mp3, which
+    imports into Anki as a silent card. So net.get_audio raises this instead:
+    nothing reaches disk, and stage 60 classifies the slot against
+    registry/known_missing_audio.json.
+
+    It carries what the classification needs -- status, content_type, n_bytes and
+    whether the retry was spent -- because "the host served no audio" and "the
+    host served the wrong thing" are different findings and the report must be
+    able to tell them apart.
+    """
+
+    def __init__(self, url: str, *, status: int = 0, content_type: str = "",
+                 n_bytes: int = 0, retried: bool = False, why: str = ""):
+        self.url = url
+        self.status = status
+        self.content_type = content_type
+        self.n_bytes = n_bytes
+        self.retried = retried
+        self.why = why
+        super().__init__(
+            "audio host served no audio: %s -> HTTP %s, %d byte(s), "
+            "content-type %r (%s%s)"
+            % (url, status, n_bytes, content_type, why,
+               ", retried once" if retried else ", not retried"))
+
+    def as_row(self) -> dict:
+        return {"url": self.url, "http_status": self.status,
+                "content_type": self.content_type, "bytes": self.n_bytes,
+                "retried": self.retried, "why": self.why}
+
+
 def NFC(s: str) -> str:
     return unicodedata.normalize("NFC", s)
 

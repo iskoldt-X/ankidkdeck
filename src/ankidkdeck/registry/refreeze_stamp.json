@@ -1,0 +1,9 @@
+{
+  "refrozen_at": "2026-08-27",
+  "families": 2927,
+  "card_keys_rows": 2927,
+  "by": "Binghan",
+  "note": "22 guid_seed reselections + three alias merges; the scope is closed.",
+  "signed_on": "the decision recorded in observations/v3-refreeze-proposal.md: (a) 22 seeds re-selected to the more frequent v2.1 spelling, (b) all three alias merges landed by emptying registry/alias_merge_pending.json, (c-2) the six abbreviation content-morphs keep their carried seeds. Both numbers above were read off disk at signing time -- words.json for families, this package's card_keys.json for the rows -- never copied from a document.",
+  "landed_by": "the refreeze executor, on the owner-approved manual; the numbers and the decision are Binghan's"
+}

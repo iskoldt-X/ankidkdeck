@@ -24,7 +24,9 @@ from pathlib import Path
 
 from ..config import Config
 from ..gates import G_MEDIA, Gate, run_gates
-from ..util import FatalError, read_json, sha256_bytes, write_json
+from ..registry import Registry
+from ..util import (AudioUnavailable, FatalError, read_json, sha256_bytes,
+                    write_json)
 
 # G_MEDIA comes from gates.py. Stage 70 re-runs the same gate over the notes
 # that were actually written; this run covers the cache itself and the merged
@@ -111,18 +113,82 @@ def _sha_of(path: Path) -> str:
     return sha256_bytes(path.read_bytes())
 
 
-def _media_gate(missing: list, zero_byte: list, n_want: int):
-    """G-MEDIA (cache half). Every non-null audio_url must resolve to a
-    non-empty file; a zero-byte mp3 imports into Anki as a silent card, which no
-    later gate would notice."""
-    ok = not missing and not zero_byte
-    return ok, {"urls_wanted": n_want, "missing": missing[:20],
-                "n_missing": len(missing), "zero_byte": zero_byte[:20],
-                "n_zero_byte": len(zero_byte)}
+def known_missing_audio_status(known: dict, want: dict, audio_dir: Path) -> dict:
+    """Every row of registry/known_missing_audio.json, checked against THIS
+    workspace: still dead upstream, recovered, or no longer declared.
+
+    Read off the DISK, not out of the download loop: a slot also "recovers" by
+    being seeded from the legacy workspace or by already sitting in the cache
+    from an earlier run, and neither of those goes through net.get_audio. A row
+    whose URL the corpus no longer declares at all (DDO dropped the slot, or the
+    entry left the scope) is reported too -- it is a row the registry should stop
+    carrying, and nothing else in the pipeline would ever mention it.
+    """
+    still_missing, recovered, not_declared = [], [], []
+    for url in sorted(known):
+        if url not in want:
+            not_declared.append(url)
+            continue
+        eid, n = want[url]
+        dest = audio_dir / audio_filename(eid, n)
+        if dest.exists() and dest.stat().st_size > 0:
+            recovered.append(url)
+        else:
+            still_missing.append(url)
+    return {"registry_rows": len(known), "still_missing": still_missing,
+            "recovered": recovered, "no_longer_declared": not_declared}
+
+
+def _media_gate(missing: list, zero_byte: list, n_want: int,
+                known: dict | None = None, known_max: int | None = None):
+    """G-MEDIA (cache half), BASELINED against registry/known_missing_audio.json.
+
+    Every non-null audio_url must resolve to a non-empty file; a zero-byte mp3
+    imports into Anki as a silent card, which no later gate would notice.
+
+    Four of the 5,893 declared slots cannot be made to resolve by anything on
+    this side of the wire: DDO answers them with HTTP 200, content-length 0 and
+    content-type text/html -- one shared zero-byte placeholder, same etag on all
+    four -- while sibling slots of the same entries serve real mp3 bodies. So the
+    gate is baselined the way G-SUPPRESS and G-ADMIT are, rather than switched
+    off or hidden behind a nulled audio_url:
+
+      * a slot the registry names, and only while it is STILL dead, is reported
+        as known_missing_upstream instead of counted as a failure;
+      * a missing or zero-byte slot the registry does NOT name still fails, which
+        is the whole population this gate was written for -- a lost cache, a
+        failed download, a skipped seed;
+      * the registry's own size is checked against gates.json:
+        known_missing_audio_max, so a row cannot be added without a human
+        editing that number in the same commit. Fail-closed on a missing key,
+        exactly like G-SUPPRESS: no baseline means every row is over it;
+      * a row that RECOVERED, or that the corpus no longer declares, is reported
+        and never fails. That asymmetry is deliberate (G-ADMIT has the same one):
+        the day DDO repairs the file is the mechanism working, and the report is
+        how the release notes find out the row should be deleted.
+    """
+    known = known or {"registry_rows": 0, "still_missing": [], "recovered": [],
+                      "no_longer_declared": []}
+    excused = set(known["still_missing"])
+    unexpected_missing = [u for u in missing if u not in excused]
+    unexpected_zero = [u for u in zero_byte if u not in excused]
+    over = known_max is not None and known["registry_rows"] > known_max
+    ok = not unexpected_missing and not unexpected_zero and not over
+    return ok, {"urls_wanted": n_want, "missing": unexpected_missing[:20],
+                "n_missing": len(unexpected_missing),
+                "zero_byte": unexpected_zero[:20],
+                "n_zero_byte": len(unexpected_zero),
+                "known_missing_upstream": {
+                    "registry_rows": known["registry_rows"], "max": known_max,
+                    "over_baseline": bool(over),
+                    "n_still_missing": len(known["still_missing"]),
+                    "still_missing": known["still_missing"][:20],
+                    "recovered": known["recovered"][:20],
+                    "no_longer_declared": known["no_longer_declared"][:20]}}
 
 
 def run(cfg: Config, net=None, seed_legacy: bool = False,
-        sweep_orphans: bool = False) -> dict:
+        sweep_orphans: bool = False, registry=None) -> dict:
     entries = read_json(cfg.json_dir / "entries.json")
     audio_dir = Path(cfg.audio_dir)
     audio_dir.mkdir(parents=True, exist_ok=True)
@@ -130,10 +196,16 @@ def run(cfg: Config, net=None, seed_legacy: bool = False,
     known_before = set(manifest)
     want = want_set(entries)
     legacy = _legacy_index(cfg) if seed_legacy else {}
+    registry = registry if registry is not None else Registry(cfg)
+    known_missing = registry.known_missing_audio
 
     stats = {"wanted": len(want), "already_cached": 0, "rehashed": 0,
              "seeded_from_legacy": 0, "downloaded": 0, "legacy_index": len(legacy)}
     missing, zero_byte = [], []
+    # The host's own answer, per slot it refused to serve. `missing` says a file
+    # is absent; this says WHY, which is the difference between an upstream
+    # defect and a download this run got wrong.
+    no_audio_from_host = []
 
     for url in sorted(want):
         eid, n = want[url]
@@ -186,9 +258,20 @@ def run(cfg: Config, net=None, seed_legacy: bool = False,
         if net is None:
             missing.append(url)
             continue
-        r = net.get_audio(url)  # 1s sleep, no WAF on this host
-        if not r.content:
-            zero_byte.append(url)
+        # A slot already recorded upstream-dead is still RE-PROBED, once, with
+        # the retry and the circuit-breaker record suppressed: that probe is the
+        # only thing in the pipeline that can notice DDO repairing the file, and
+        # four known-dead failures in a row would otherwise trip the breaker on
+        # an otherwise fully cached rerun.
+        try:
+            r = net.get_audio(url,  # 1s sleep, no WAF on this host
+                              expected_missing=url in known_missing)
+        except AudioUnavailable as exc:
+            # Nothing was returned, so nothing can be written: a text/html
+            # placeholder or an empty body never becomes an mp3 on a card. The
+            # slot is left absent and classified after the loop, against the
+            # registry -- known rows are reported, unknown ones fail G-MEDIA.
+            no_audio_from_host.append(exc.as_row())
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(r.content)
@@ -234,11 +317,21 @@ def run(cfg: Config, net=None, seed_legacy: bool = False,
         elif dest.stat().st_size == 0 and url not in zero_byte:
             zero_byte.append(url)
 
+    known_status = known_missing_audio_status(known_missing, want, audio_dir)
+    stats["known_missing_upstream"] = len(known_status["still_missing"])
+    stats["recovered_upstream"] = len(known_status["recovered"])
+    # The hint is about OUR gaps: "pass --seed-legacy" is no advice at all for a
+    # slot the upstream host serves empty.
+    unexplained_missing = [u for u in missing
+                           if u not in set(known_status["still_missing"])]
     report = {**stats,
               "new_vs_known": {"known_urls_before": len(known_before),
                                "new_urls_this_run": len(set(want) - known_before),
                                "known_urls_now": len(manifest),
                                "gone_from_ddo": len(known_before - set(want))},
+              "known_missing_audio": known_status,
+              "no_audio_from_host": no_audio_from_host[:20],
+              "n_no_audio_from_host": len(no_audio_from_host),
               "orphans_sample": orphans[:20],
               "unreferenced_sample": unreferenced[:20],
               "sweep_hint": (
@@ -246,12 +339,23 @@ def run(cfg: Config, net=None, seed_legacy: bool = False,
                   "--sweep-orphans to quarantine them into %s once you are sure "
                   "the parse is complete" % (len(unreferenced), ORPHAN_DIR)
                   if unreferenced and not sweep_orphans else None),
+              "recovered_hint": (
+                  "%d slot(s) in registry/known_missing_audio.json now serve real "
+                  "audio; delete those rows and bump gates.json:"
+                  "known_missing_audio_max down in the same commit"
+                  % len(known_status["recovered"])
+                  if known_status["recovered"] else None),
               "hint": ("run with --seed-legacy --legacy-workspace <path> to "
                        "hardlink the 2025 files instead of downloading them"
-                       if missing and not seed_legacy else None)}
+                       if unexplained_missing and not seed_legacy else None)}
     write_json(cfg.report_dir / "audio_report.json", report)
     run_gates([Gate(G_MEDIA, "every non-null audio_url resolves to a non-empty "
-                             "file in the audio cache",
-                    lambda: _media_gate(missing, zero_byte, len(want)),
+                             "file in the audio cache, except the slots "
+                             "registry/known_missing_audio.json declares dead "
+                             "upstream -- and that registry is inside its "
+                             "baseline",
+                    lambda: _media_gate(
+                        missing, zero_byte, len(want), known_status,
+                        int(registry.gates.get("known_missing_audio_max", 0))),
                     stage="60")], cfg, stage="60")
     return report

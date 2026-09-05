@@ -13,7 +13,7 @@ separator can express this rule, and guide 4.14 lists it as its own module.
 
 import pytest
 
-from ankidkdeck.extract import cell_alternatives, xt
+from ankidkdeck.extract import cell_alternatives, expand_elision, xt
 
 bs4 = pytest.importorskip("bs4", reason="beautifulsoup4 is a runtime dependency")
 
@@ -106,6 +106,137 @@ def test_three_alternatives_in_one_cell():
 def test_whitespace_inside_a_form_is_collapsed_not_dropped():
     cell = td('<td>dag   til\n dag-servicer</td>')
     assert cell_alternatives(cell) == ["dag til dag-servicer"]
+
+
+# --------------------------------------------------------------------------
+# DDO's own ".." prefix elision (19 articles, 31 cells)
+# --------------------------------------------------------------------------
+
+# Every distinct shape in the corpus, taken from the real cells. The literal ".."
+# is DDO's; the raw HTML is <span class="mark-flex">..mænd</span>.
+ELIDED_CELLS = [
+    ("julemand", "..mænd", "julemænd"),
+    ("julemand", "..mændene", "julemændene"),
+    ("politimand", "..mænd", "politimænd"),
+    ("ægtemand", "..mændene", "ægtemændene"),
+    ("troldmand", "..mænd", "troldmænd"),
+    ("bedstefar", "..fædre", "bedstefædre"),
+    ("bedstemor", "..mødre", "bedstemødre"),
+    ("oversætte", "..satte", "oversatte"),
+    ("oversætte", "..sat", "oversat"),
+    ("værdsætte", "..satte", "værdsatte"),
+    ("værdsætte", "..sat", "værdsat"),
+    ("efterlade", "..lod", "efterlod"),
+    ("overgive", "..gav", "overgav"),
+    ("overtage", "..tog", "overtog"),
+    ("foretage", "..tog", "foretog"),
+    ("foregå", "..gik", "foregik"),
+    ("gennemgå", "..gik", "gennemgik"),
+    ("bortse", "..så", "bortså"),
+    ("tilintetgøre", "..gjorde", "tilintetgjorde"),
+    ("tilintetgøre", "..gjort", "tilintetgjort"),
+    # the hyphenated compounds: the prefix ends inside the hyphen segment
+    ("gør det selv-bog", "..bøger", "gør det selv-bøger"),
+    ("gør det selv-bog", "..bøgerne", "gør det selv-bøgerne"),
+    ("gør det selv-mand", "..mænd", "gør det selv-mænd"),
+    ("pop op-bog", "..bøger", "pop op-bøger"),
+]
+
+
+@pytest.mark.parametrize("lemma,cell,want", ELIDED_CELLS)
+def test_expand_elision_restores_the_elided_prefix(lemma, cell, want):
+    assert expand_elision(cell, lemma) == want
+
+
+def test_expand_elision_leaves_an_ordinary_cell_alone():
+    for cell in ("huset", "julemanden", "", "-en", "..", ".."):
+        assert expand_elision(cell, "julemand") == cell
+
+
+def test_expand_elision_refuses_to_guess_when_the_prefix_is_not_there():
+    """No shared prefix means the rule has no answer; a visible ".." a human can
+    report is better than an invented Danish word."""
+    assert expand_elision("..xyz", "julemand") == "..xyz"
+    # first character only at position 0 => no prefix to keep
+    assert expand_elision("..jul", "julemand") == "..jul"
+
+
+def test_the_parser_expands_the_elided_cell_and_indexes_the_real_form(registry):
+    """End-to-end: the expansion has to reach paradigm.rows (what stage 70
+    prints) AND paradigm_index (bucket 2's only evidence), or the card shows
+    "..mænd" and julemænd stays unmatchable."""
+    from ankidkdeck.stages.s20_parse import parse_article, slice_articles
+    html = """
+    <article><div id="11024753"><div class="artikel">
+      <div class="modern-top-row"><h1 class="modern-match">julemand</h1>
+        <span class="text-large">substantiv</span></div>
+      <div data-pos-key="sb."></div>
+      <div class="modern-row" id="id-boj">
+        <button class="kilde">-en, ..mænd, ..mændene</button>
+        <table class="flex-table"><tbody>
+          <tr><td>julemand<span class="mark-flex">en</span></td></tr>
+          <tr><td><span class="mark-flex">..mænd</span></td></tr>
+          <tr><td><span class="mark-flex">..mændene</span></td></tr>
+        </tbody></table>
+      </div>
+      <div id="content-betydninger">
+        <div><div class="modern-definition-box" id="betydning-1" dannetid="21990001">
+          <span class="modern-definition">figur der bringer julegaver</span>
+        </div></div>
+      </div>
+    </div></div></article>
+    """
+    s = soup(html)
+    eid, scope, art = next(iter(slice_articles(s)))
+    report = {}
+    e = parse_article(eid, scope, art, registry, report)
+    assert [r["cells"] for r in e["paradigm"]["rows"]] == [
+        ["julemanden"], ["julemænd"], ["julemændene"]]
+    assert e["paradigm_index"] == ["julemanden", "julemænd", "julemændene"]
+    assert not any(".." in c for c in e["paradigm_index"])
+    # the short notation keeps DDO's own ".." -- it is not a form, it is notation
+    assert e["paradigm"]["short"] == "-en, ..mænd, ..mændene"
+    assert "unexpanded_elided_cells" not in report
+    assert "short_form_missing_from_cells" not in report
+
+
+def test_an_upstream_truncated_cell_is_reported_never_patched(registry):
+    """planlaegge (11039990): DDO's own past-tense cell is
+    <td>p<span>lagde</span></td>, i.e. "plagde" -- the page truncated the stem,
+    while its short notation "-r, ..lagde, ..lagt" is correct. We must not
+    invent the missing letters into a content field article_sha treats as DDO's;
+    the run has to survive it and the owner has to see it."""
+    from ankidkdeck.stages.s20_parse import parse_article, slice_articles
+    html = """
+    <article><div id="11039990"><div class="artikel">
+      <div class="modern-top-row"><h1 class="modern-match">planlægge</h1>
+        <span class="text-large">verbum</span></div>
+      <div data-pos-key="vb."></div>
+      <div class="modern-row" id="id-boj">
+        <button class="kilde">-r, ..lagde, ..lagt</button>
+        <table class="flex-table"><tbody>
+          <tr><td>planlægge<span class="mark-flex">r</span></td></tr>
+          <tr><td>p<span class="mark-flex">lagde</span></td></tr>
+          <tr><td>p<span class="mark-flex">lagt</span></td></tr>
+        </tbody></table>
+      </div>
+      <div id="content-betydninger">
+        <div><div class="modern-definition-box" id="betydning-1" dannetid="21990001">
+          <span class="modern-definition">lægge en plan for</span>
+        </div></div>
+      </div>
+    </div></div></article>
+    """
+    s = soup(html)
+    eid, scope, art = next(iter(slice_articles(s)))
+    report = {}
+    e = parse_article(eid, scope, art, registry, report)
+    # transcribed faithfully, NOT corrected
+    assert [r["cells"] for r in e["paradigm"]["rows"]] == [
+        ["planlægger"], ["plagde"], ["plagt"]]
+    rows = report["short_form_missing_from_cells"]
+    assert [r["expected_form"] for r in rows] == ["planlagde", "planlagt"]
+    assert rows[0]["entry_id"] == "11039990"
 
 
 def test_the_parser_stores_the_split_cells_and_indexes_them(registry):

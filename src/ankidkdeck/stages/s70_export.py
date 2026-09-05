@@ -340,13 +340,33 @@ class Media:
     An entry that declares audio we do not have on disk is recorded as a miss
     and fails G-MEDIA; the tag is never emitted for a file that is absent,
     because a dead [sound:] tag is a silent card in Anki.
+
+    The one exception is a slot registry/known_missing_audio.json declares dead
+    UPSTREAM -- DDO's own article links it and DDO's own host answers 200 with a
+    zero-byte text/html placeholder. Those misses are split off into
+    `known_missing_upstream` so G-MEDIA can pass honestly on a defect that is not
+    ours, and a slot the registry names which now HAS a file is recorded in
+    `recovered_upstream` so the repair surfaces instead of passing unnoticed.
+    Every other miss stays in `unexpected_missing`, which is what the gate reads.
     """
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, known_missing=None):
         self.dir = Path(cfg.audio_dir)
         self.manifest = read_json(self.dir / "manifest.json", default={})
         self.used: dict[str, Path] = {}
+        # Every miss, unsplit: the evidence, kept whole. The two lists below are
+        # the verdicts drawn from it.
         self.missing: list = []
+        self.unexpected_missing: list = []
+        self.known_missing_upstream: list = []
+        self.recovered_upstream: list = []
+        if known_missing is None:
+            # A Media that does not know the registry would fail G-MEDIA on the
+            # four upstream-dead slots, so the default reads it rather than
+            # defaulting to "no excuses exist".
+            from ..registry import Registry              # noqa: PLC0415 - cycle
+            known_missing = Registry(cfg).known_missing_audio
+        self.known_missing = dict(known_missing or {})
 
     def _filename(self, url: str, entry_id: str, slot_n) -> str:
         row = self.manifest.get(url)
@@ -360,9 +380,16 @@ class Media:
         name = self._filename(url, entry_id, slot_n)
         path = self.dir / name
         if not path.exists() or path.stat().st_size == 0:
-            self.missing.append({"url": url, "entry_id": entry_id,
-                                 "expected_file": name})
+            row = {"url": url, "entry_id": entry_id, "expected_file": name}
+            self.missing.append(row)
+            if url in self.known_missing:
+                self.known_missing_upstream.append(row)
+            else:
+                self.unexpected_missing.append(row)
             return ""
+        if url in self.known_missing:
+            self.recovered_upstream.append({"url": url, "entry_id": entry_id,
+                                            "file": name})
         self.used[name] = path
         return "[sound:%s]" % name
 
@@ -793,7 +820,7 @@ def build_all(cfg: Config, registry, lang: str) -> dict:
     tr = {"definitions": read_json(tdir / "definitions.json", default={}),
           "expressions": read_json(tdir / "expressions.json", default={}),
           "pos": pos}
-    media = Media(cfg)
+    media = Media(cfg, known_missing=registry.known_missing_audio)
     misses: list = []
     stats: dict = {}
     report: dict = {}
@@ -891,19 +918,53 @@ def guid_gate(notes: list):
                                      "duplicates": dupes[:20]}
 
 
-def media_gate(media: Media, floor: int, sound_names: list):
+def media_gate(media: Media, floor: int, sound_names: list,
+               known_missing_max: int | None = None):
     """G-MEDIA. Every [sound:] resolves, the list is SORTED, and the count
-    clears the floor (4,629 files existed in 2025)."""
+    clears the floor (4,629 files existed in 2025).
+
+    BASELINED against registry/known_missing_audio.json, the same way stage 60's
+    half is: a declared slot DDO answers with a zero-byte text/html placeholder
+    is an upstream defect that no export can fix, so it is reported rather than
+    counted absent -- while every other absent file still fails, which is the
+    population this gate exists for. The registry's size is checked against
+    gates.json:known_missing_audio_max so a row cannot be added without a human
+    editing that number in the same commit, and it is fail-closed: no baseline
+    means every row is over it.
+
+    `recovered_upstream` and `no_longer_declared` are REPORTED and never fail --
+    a repaired file is the mechanism working, and the report is how the release
+    notes learn the row should be deleted. Note that the slots in this registry
+    emit no [sound:] tag either way, so they can never appear in `dangling`:
+    Media.sound_tag returns "" for an absent file.
+    """
     paths = media.sorted_paths()
     basenames = {Path(p).name for p in paths}
     dangling = sorted({s for s in sound_names if s not in basenames})
-    ok = (not media.missing and not dangling and paths == sorted(paths)
-          and len(paths) >= floor)
+    seen = {m["url"] for m in media.known_missing_upstream}
+    seen |= {r["url"] for r in media.recovered_upstream}
+    not_declared = sorted(u for u in media.known_missing if u not in seen)
+    over = (known_missing_max is not None
+            and len(media.known_missing) > known_missing_max)
+    ok = (not media.unexpected_missing and not dangling and not over
+          and paths == sorted(paths) and len(paths) >= floor)
     return ok, {"media_files": len(paths), "floor": floor,
-                "declared_but_absent": len(media.missing),
-                "declared_but_absent_sample": media.missing[:20],
+                "declared_but_absent": len(media.unexpected_missing),
+                "declared_but_absent_sample": media.unexpected_missing[:20],
+                # Excused rows included, so the report still says how many
+                # declared slots this build could not render at all.
+                "declared_but_absent_total": len(media.missing),
                 "dangling_sound_tags": dangling[:20],
-                "sorted": paths == sorted(paths)}
+                "sorted": paths == sorted(paths),
+                "known_missing_upstream": {
+                    "registry_rows": len(media.known_missing),
+                    "max": known_missing_max, "over_baseline": bool(over),
+                    "n_still_missing": len(media.known_missing_upstream),
+                    "still_missing": [m["url"]
+                                      for m in media.known_missing_upstream][:20],
+                    "recovered": [r["url"]
+                                  for r in media.recovered_upstream][:20],
+                    "no_longer_declared": not_declared[:20]}}
 
 
 def note_count_gate(notes: list, rng):
@@ -1008,6 +1069,76 @@ def apkg_path(cfg: Config, lang: str) -> Path:
     return Path(cfg.dist_dir) / ("DDO_Danish_Frequency_Deck_%s.apkg" % lang)
 
 
+def guid_diff_language(report) -> str | None:
+    """Which language a guid_diff report says it describes, or None.
+
+    ONE reading of that question, imported by tools/retired_notes.py so the two
+    consumers of this file cannot disagree about it -- and they did: the
+    exporter read `summary.language` while the tool read the top-level
+    `language` key, so a report written before the summary row existed was "not
+    about German" to the exporter and "about German" to the companion builder,
+    on the same bytes.
+
+    `summary.language` first, because that is the row G-REL asserts against.
+    The top-level key second, because every report tools/guid_diff.py has ever
+    written carries it and a pre-summary-row report has nothing else to offer.
+    """
+    if not isinstance(report, dict):
+        return None
+    summary = report.get("summary") or {}
+    for value in (summary.get("language"), report.get("language")):
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def guid_diff_report(cfg: Config, lang: str) -> tuple:
+    """(this language's G-REL report, the file it was read from, what was not).
+
+    reports/guid_diff.<lang>.json is what tools/guid_diff.py writes. The report
+    is per language because one release month ships more than one language and
+    a single guid_diff.json is then a file about whichever language was diffed
+    LAST: the Chinese month's report was still on disk when the Russian export
+    ran, and G-REL failed the Russian deck with language_mismatch.
+
+    The legacy unsuffixed name is still read, but ONLY when the file itself says
+    it describes this language. A legacy file about another language is not this
+    language's report and is IGNORED rather than failed -- ignoring it is the
+    whole point, because failing on it is the defect. A same-language report
+    that disagrees about the card count still fails, on either name.
+
+    The per-language file is trusted by NAME and then verified by CONTENT: it is
+    handed to the gate whatever it says, so a mislabelled or truncated one fails
+    loudly instead of being silently skipped.
+
+    The THIRD return value is why each candidate was NOT used. Without it the
+    not-applicable verdict has to assert something about the disk it has not
+    checked, and "there is no previous release" is false whenever a file was
+    found and rejected.
+    """
+    ignored = []
+    per_lang = cfg.report_dir / ("guid_diff.%s.json" % lang)
+    legacy = cfg.report_dir / "guid_diff.json"
+    for path in (per_lang, legacy):
+        # read_json() treats default=None as "required", so an absent report has
+        # to be an empty dict here.
+        report = read_json(path, default={})
+        if not isinstance(report, dict) or not report:
+            if path.exists():
+                ignored.append({"file": path.name,
+                                "why": "the file is empty or is not a JSON "
+                                       "object"})
+            continue
+        if path == per_lang:
+            return report, path.name, ignored
+        says = guid_diff_language(report)
+        if says == lang:
+            return report, path.name, ignored
+        ignored.append({"file": path.name,
+                        "why": "it describes %r, not %r" % (says, lang)})
+    return {}, "", ignored
+
+
 def run(cfg: Config, registry, lang: str, check_determinism: bool = False) -> dict:
     if not lang:
         raise FatalError("export needs --lang (one of %s)" % ", ".join(cfg.langs))
@@ -1061,9 +1192,7 @@ def run(cfg: Config, registry, lang: str, check_determinism: bool = False) -> di
     # identical for every language by construction. Scoping them wrote four
     # byte-identical rows per release, which reads like four separate checks.
     scope = {"lang": lang}
-    # read_json() treats default=None as "required", so an absent report has to
-    # be an empty dict here.
-    guid_diff = read_json(cfg.report_dir / "guid_diff.json", default={})
+    guid_diff, guid_diff_from, guid_diff_ignored = guid_diff_report(cfg, lang)
     gate_list = [
         Gate(G_EMPTY_C, "no note has an empty Content field",
              lambda: empty_content_gate(notes), stage="70", extra=scope),
@@ -1087,9 +1216,12 @@ def run(cfg: Config, registry, lang: str, check_determinism: bool = False) -> di
              lambda: dense_unique_ranks([int(n["fields"][7]) for n in notes],
                                         len(notes)), stage="70"),
         Gate(G_MEDIA, "every [sound:] tag resolves, media_files is a sorted "
-                      "list, and the count clears the floor",
-             lambda: media_gate(media, int(gates_cfg.get("media_floor", 0)),
-                                sound_names), stage="70", extra=scope),
+                      "list, the count clears the floor, and the "
+                      "upstream-dead audio registry is inside its baseline",
+             lambda: media_gate(
+                 media, int(gates_cfg.get("media_floor", 0)), sound_names,
+                 int(gates_cfg.get("known_missing_audio_max", 0))),
+             stage="70", extra=scope),
         Gate(G_NOTE, "the note count is inside the declared range",
              lambda: note_count_gate(notes, gates_cfg.get("note_count_range")),
              stage="70", extra=scope),
@@ -1110,14 +1242,22 @@ def run(cfg: Config, registry, lang: str, check_determinism: bool = False) -> di
              lambda: separator_golden(registry, cfg.work_dir / "fixtures"),
              stage="70", extra=scope),
     ]
-    if guid_diff:
-        # Recorded only when the tool has been run: it needs a released .apkg,
-        # which a fresh checkout does not have.
-        gate_list.append(
-            Gate(G_REL, "reports/guid_diff.json describes this language and the "
-                        "same card count the exporter is about to write",
-                 lambda: guid_diff_reconciles(guid_diff, len(notes), lang),
-                 stage="70", extra=scope))
+    # ALWAYS recorded, even with no report to read. The gate used to be appended
+    # only `if guid_diff:` because the tool needs a released .apkg that a first
+    # release does not have -- but report rows merge on (id, stage, extra) and
+    # are never pruned, so a row that is not written cannot replace one that is.
+    # A G-REL[lang=Russian] FAIL (the Chinese month's file, read as Russian's)
+    # therefore sat in gates_report.json as a permanent carried failure after the
+    # file was moved aside, on a language for which G-REL can never run. The
+    # not-applicable verdict is the replacement row.
+    gate_list.append(
+        Gate(G_REL, "reports/guid_diff.<lang>.json describes this language and "
+                    "the same card count the exporter is about to write, or "
+                    "says so when there is no previous release to diff",
+             lambda: guid_diff_reconciles(guid_diff, len(notes), lang,
+                                          source=guid_diff_from,
+                                          ignored=guid_diff_ignored),
+             stage="70", extra=scope))
     if check_determinism:
         with tempfile.TemporaryDirectory() as tmp:
             a = Path(tmp) / "a.apkg"

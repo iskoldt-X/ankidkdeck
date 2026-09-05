@@ -13,7 +13,8 @@ from bs4 import BeautifulSoup
 
 from .. import extract
 from ..config import Config
-from ..extract import ARTICLE_SHA_SCHEMA, cell_alternatives, is_tag
+from ..extract import (ARTICLE_SHA_SCHEMA, ELISION, cell_alternatives,
+                       expand_elision, is_tag)
 from ..gates import G_LABEL, Gate, ledger_label_reconciliation, run_gates
 from ..util import (FatalError, NFC, canonical_json, collapse_ws, nk,
                     read_json, sha256_str, write_json)
@@ -58,6 +59,13 @@ KNOWN_POS_KEYS = {
     "sb. pl.", "fork.", "symbol", "talord (mængdetal)", "talord (ordenstal)",
     "førsteled", "sidsteled", "suffiks", "præfiks", "formelt subjekt",
     "udråbsord", "lydord", "infinitivens", "num.",
+    # These three reached us through the "log and continue" path below: they
+    # were the whole of report["new_pos_keys"] on the 2026 corpus (egennavn 8
+    # entries, adj. pl. 3, infinitivpartikel 1). They are now hand-translated
+    # in all four languages, so they are known, not new. infinitivpartikel is
+    # the spelling this corpus serves for what `infinitivens` names; both stay,
+    # and pos_translations.json gives them the same term per language.
+    "adj. pl.", "egennavn", "infinitivpartikel",
 }
 
 DIGITS_TRAIL_RE = re.compile(r"\d+$")
@@ -271,8 +279,20 @@ def parse_article(eid: str, scope, art, registry, report: dict) -> dict:
             for r_i, tr in enumerate(tbl.select("tbody tr")):
                 cells = [NFC(c) for td in tr.select("td")
                          for c in cell_alternatives(td)]
+                # DDO's own ".." prefix elision, expanded here so that the ONE
+                # stored form is the real one: paradigm.rows[].cells is both what
+                # stage 70 prints on the card and what paradigm_index (bucket 2's
+                # only evidence) is derived from. Leaving it raw printed
+                # "..maend" on 14 cards and made julemaend/oversat/efterlod
+                # unmatchable. article_sha hashes these cells, hence schema 3.
+                cells = [expand_elision(c, e["lemma"]) for c in cells]
                 cells = list(dict.fromkeys(cells))
                 if cells:
+                    if any(ELISION in c for c in cells):
+                        bad = {"entry_id": eid, "lemma": e["lemma"], "cells": cells}
+                        rows = report.setdefault("unexpanded_elided_cells", [])
+                        if bad not in rows:      # parsed once per source page
+                            rows.append(bad)
                     e["paradigm"]["rows"].append({"table": t, "row": r_i, "cells": cells})
     e["alt_spellings"] = _parse_alt_spellings(art)
     # TWO indexes, and the difference is the whole classifier:
@@ -295,6 +315,30 @@ def parse_article(eid: str, scope, art, registry, report: dict) -> dict:
         | {nk(e["lemma"])}
         | {nk(a["form"]) for a in e["alt_spellings"] if a.get("official")}
     )
+    # UPSTREAM-DIRTY CELLS, recorded and never patched. paradigm.short is DDO's
+    # own short notation for the same slots ("-r, ..lagde, ..lagt"), so an
+    # elided token in it whose expansion is absent from the flex table means the
+    # page's two renderings of one inflection disagree. Measured: 15 articles
+    # carry ".." in `short`, 14 spell the same form out in the cell, and exactly
+    # one -- planlaegge (11039990), whose past-tense cell is the truncated
+    # "<td>p<span>lagde</span></td>" -> plagde -- does not. That is DDO's data,
+    # not ours: a registry hand-patch would put invented text in a content field
+    # article_sha treats as DDO's, so it is REPORTED for the owner instead.
+    for tok in (e["paradigm"]["short"] or "").split(","):
+        tok = tok.strip()
+        if not tok.startswith(ELISION):
+            continue
+        want = expand_elision(tok, e["lemma"])
+        if want == tok or nk(want) in e["paradigm_index"]:
+            continue
+        row = {"entry_id": eid, "lemma": e["lemma"],
+               "short": e["paradigm"]["short"], "expected_form": want}
+        # An article reached through two query words is parsed twice (11039990
+        # comes from both /planlagt and /planlaegger), so a bare append reported
+        # one defect as four. This file is a count a human acts on.
+        rows = report.setdefault("short_form_missing_from_cells", [])
+        if row not in rows:
+            rows.append(row)
     shape = tuple(
         sum(1 for r in e["paradigm"]["rows"] if r["table"] == t)
         for t in sorted({r["table"] for r in e["paradigm"]["rows"]})
